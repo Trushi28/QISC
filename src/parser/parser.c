@@ -1,0 +1,1162 @@
+/*
+ * QISC Parser - Recursive Descent Parser Implementation
+ */
+
+#define _POSIX_C_SOURCE 200809L
+#include "parser.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ======== Helper Functions ======== */
+
+static void advance(Parser *parser) {
+  parser->previous = parser->current;
+
+  for (;;) {
+    parser->current = lexer_scan_token(parser->lexer);
+    if (parser->current.type != TOK_ERROR)
+      break;
+
+    parser_error_at_current(parser, parser->current.start);
+  }
+}
+
+static bool check(Parser *parser, TokenType type) {
+  return parser->current.type == type;
+}
+
+static bool match(Parser *parser, TokenType type) {
+  if (!check(parser, type))
+    return false;
+  advance(parser);
+  return true;
+}
+
+static void consume(Parser *parser, TokenType type, const char *message) {
+  if (parser->current.type == type) {
+    advance(parser);
+    return;
+  }
+  parser_error_at_current(parser, message);
+}
+
+static char *token_string(Token *token) {
+  char *str = malloc(token->length + 1);
+  memcpy(str, token->start, token->length);
+  str[token->length] = '\0';
+  return str;
+}
+
+/* ======== Error Handling ======== */
+
+void parser_error(Parser *parser, const char *message) {
+  if (parser->panic_mode)
+    return;
+  parser->panic_mode = true;
+  parser->had_error = true;
+
+  fprintf(stderr, "[line %d] Error at '%.*s': %s\n", parser->previous.line,
+          parser->previous.length, parser->previous.start, message);
+
+  strncpy(parser->error_message, message, sizeof(parser->error_message) - 1);
+}
+
+void parser_error_at_current(Parser *parser, const char *message) {
+  if (parser->panic_mode)
+    return;
+  parser->panic_mode = true;
+  parser->had_error = true;
+
+  fprintf(stderr, "[line %d] Error at '%.*s': %s\n", parser->current.line,
+          parser->current.length, parser->current.start, message);
+
+  strncpy(parser->error_message, message, sizeof(parser->error_message) - 1);
+}
+
+static void synchronize(Parser *parser) {
+  parser->panic_mode = false;
+
+  while (parser->current.type != TOK_EOF) {
+    if (parser->previous.type == TOK_SEMICOLON)
+      return;
+
+    switch (parser->current.type) {
+    case TOK_PROC:
+    case TOK_STRUCT:
+    case TOK_IF:
+    case TOK_WHILE:
+    case TOK_FOR:
+    case TOK_GIVE:
+      return;
+    default:
+      break;
+    }
+    advance(parser);
+  }
+}
+
+/* ======== Forward Declarations ======== */
+
+static AstNode *expression(Parser *parser);
+static AstNode *assignment(Parser *parser);
+static AstNode *statement(Parser *parser);
+static AstNode *declaration(Parser *parser);
+static AstNode *block(Parser *parser);
+static AstNode *ast_alloc_member(AstNode *obj, char *member, int line, int col);
+static AstNode *parse_interpolated_string(Parser *parser, const char *str,
+                                          int len, int line, int col);
+static TypeInfo *parse_type(Parser *parser);
+
+/* ======== Expression Parsing ======== */
+
+/* primary → INT | FLOAT | STRING | TRUE | FALSE | NONE | IDENT | '(' expr ')'
+ */
+static AstNode *primary(Parser *parser) {
+  int line = parser->current.line;
+  int col = parser->current.column;
+
+  if (match(parser, TOK_INT_LIT)) {
+    return ast_new_int(parser->previous.literal.int_value, line, col);
+  }
+
+  if (match(parser, TOK_FLOAT_LIT)) {
+    return ast_new_float(parser->previous.literal.float_value, line, col);
+  }
+
+  if (match(parser, TOK_STRING_LIT)) {
+    /* Remove quotes and handle string interpolation */
+    const char *str = parser->previous.start + 1;
+    int len = parser->previous.length - 2;
+    return parse_interpolated_string(parser, str, len, line, col);
+  }
+
+  if (match(parser, TOK_TRUE)) {
+    return ast_new_bool(true, line, col);
+  }
+
+  if (match(parser, TOK_FALSE)) {
+    return ast_new_bool(false, line, col);
+  }
+
+  if (match(parser, TOK_NONE)) {
+    return ast_new_none(line, col);
+  }
+
+  if (match(parser, TOK_IDENT)) {
+    char *name = token_string(&parser->previous);
+
+    /* Check for lambda: ident => expr */
+    if (check(parser, TOK_FATARROW)) {
+      advance(parser); /* consume => */
+      AstNode *body = expression(parser);
+      AstNode *lambda = calloc(1, sizeof(AstNode));
+      lambda->type = AST_LAMBDA;
+      lambda->line = line;
+      lambda->column = col;
+      ast_array_init(&lambda->as.lambda.params);
+      /* Create param node */
+      AstNode *param = calloc(1, sizeof(AstNode));
+      param->type = AST_VAR_DECL;
+      param->as.var_decl.name = name;
+      param->as.var_decl.type_info = NULL;
+      ast_array_push(&lambda->as.lambda.params, param);
+      lambda->as.lambda.body = body;
+      return lambda;
+    }
+
+    /* Check for struct literal: Name { field: value, ... } */
+    if (check(parser, TOK_LBRACE)) {
+      advance(parser); /* consume { */
+      AstNode *lit = calloc(1, sizeof(AstNode));
+      lit->type = AST_STRUCT_LITERAL;
+      lit->line = line;
+      lit->column = col;
+      /* Store struct name - we'll need a field for this */
+      /* For now, store the name and parse fields */
+      lit->as.struct_decl.name = name; /* Reuse struct_decl temporarily */
+      ast_array_init(&lit->as.struct_decl.fields);
+
+      if (!check(parser, TOK_RBRACE)) {
+        do {
+          /* Parse field: name ':' value */
+          consume(parser, TOK_IDENT, "Expected field name");
+          char *field_name = token_string(&parser->previous);
+          consume(parser, TOK_COLON, "Expected ':' after field name");
+          AstNode *field_val = expression(parser);
+
+          /* Store as assign node temporarily */
+          AstNode *field = ast_new_assign(
+              ast_new_identifier(field_name, line, col), field_val, line, col);
+          ast_array_push(&lit->as.struct_decl.fields, field);
+        } while (match(parser, TOK_COMMA));
+      }
+      consume(parser, TOK_RBRACE, "Expected '}' after struct literal");
+      return lit;
+    }
+
+    return ast_new_identifier(name, line, col);
+  }
+
+  /* Lambda with parens: (x, y) => expr */
+  if (match(parser, TOK_LPAREN)) {
+    /* Could be grouped expr or lambda params */
+    AstNode *first = expression(parser);
+
+    /* Check if this is a lambda with multiple params */
+    if (match(parser, TOK_COMMA)) {
+      /* This is a lambda parameter list */
+      AstNode *lambda = calloc(1, sizeof(AstNode));
+      lambda->type = AST_LAMBDA;
+      lambda->line = line;
+      lambda->column = col;
+      ast_array_init(&lambda->as.lambda.params);
+
+      /* First param */
+      if (first && first->type == AST_IDENTIFIER) {
+        AstNode *param = calloc(1, sizeof(AstNode));
+        param->type = AST_VAR_DECL;
+        param->as.var_decl.name = first->as.identifier.name;
+        ast_array_push(&lambda->as.lambda.params, param);
+      }
+
+      /* More params */
+      do {
+        consume(parser, TOK_IDENT, "Expected parameter name");
+        AstNode *param = calloc(1, sizeof(AstNode));
+        param->type = AST_VAR_DECL;
+        param->as.var_decl.name = token_string(&parser->previous);
+        ast_array_push(&lambda->as.lambda.params, param);
+      } while (match(parser, TOK_COMMA));
+
+      consume(parser, TOK_RPAREN, "Expected ')' after parameters");
+      consume(parser, TOK_FATARROW, "Expected '=>' after parameters");
+      lambda->as.lambda.body = expression(parser);
+      return lambda;
+    }
+
+    consume(parser, TOK_RPAREN, "Expected ')' after expression");
+
+    /* Check for single-param lambda: (x) => expr */
+    if (check(parser, TOK_FATARROW) && first && first->type == AST_IDENTIFIER) {
+      advance(parser); /* consume => */
+      AstNode *lambda = calloc(1, sizeof(AstNode));
+      lambda->type = AST_LAMBDA;
+      lambda->line = line;
+      lambda->column = col;
+      ast_array_init(&lambda->as.lambda.params);
+      AstNode *param = calloc(1, sizeof(AstNode));
+      param->type = AST_VAR_DECL;
+      param->as.var_decl.name = first->as.identifier.name;
+      ast_array_push(&lambda->as.lambda.params, param);
+      lambda->as.lambda.body = expression(parser);
+      return lambda;
+    }
+
+    return first;
+  }
+
+  /* Array literal: [expr, expr, ...] with optional trailing comma */
+  if (match(parser, TOK_LBRACKET)) {
+    AstNode *arr = calloc(1, sizeof(AstNode));
+    arr->type = AST_ARRAY_LITERAL;
+    arr->line = line;
+    arr->column = col;
+    ast_array_init(&arr->as.array_literal.elements);
+
+    if (!check(parser, TOK_RBRACKET)) {
+      do {
+        /* Allow trailing comma */
+        if (check(parser, TOK_RBRACKET))
+          break;
+        AstNode *elem = expression(parser);
+        if (elem)
+          ast_array_push(&arr->as.array_literal.elements, elem);
+      } while (match(parser, TOK_COMMA));
+    }
+    consume(parser, TOK_RBRACKET, "Expected ']' after array elements");
+    return arr;
+  }
+
+  parser_error_at_current(parser, "Expected expression");
+  return NULL;
+}
+
+/* Helper: parse string interpolation - converts "hello {name}" into concat */
+static AstNode *parse_interpolated_string(Parser *parser, const char *str,
+                                          int len, int line, int col) {
+  /* Simple string without interpolation */
+  bool has_interpolation = false;
+  for (int i = 0; i < len; i++) {
+    if (str[i] == '{') {
+      has_interpolation = true;
+      break;
+    }
+  }
+
+  if (!has_interpolation) {
+    return ast_new_string(str, len, line, col);
+  }
+
+  /* Build concatenation expression */
+  AstNode *result = NULL;
+  int start = 0;
+
+  for (int i = 0; i < len; i++) {
+    if (str[i] == '{') {
+      /* Add literal part before { */
+      if (i > start) {
+        AstNode *lit = ast_new_string(str + start, i - start, line, col);
+        if (!result)
+          result = lit;
+        else
+          result = ast_new_binary(OP_ADD, result, lit, line, col);
+      }
+
+      /* Find closing } */
+      int end = i + 1;
+      while (end < len && str[end] != '}')
+        end++;
+
+      /* Extract variable name */
+      int var_len = end - i - 1;
+      char *var_name = malloc(var_len + 1);
+      memcpy(var_name, str + i + 1, var_len);
+      var_name[var_len] = '\0';
+
+      /* Create call to str(var) for conversion */
+      AstNode *ident = ast_new_identifier(var_name, line, col);
+      AstNode *str_call =
+          ast_new_call(ast_new_identifier("str", line, col), line, col);
+      ast_array_push(&str_call->as.call.args, ident);
+
+      if (!result)
+        result = str_call;
+      else
+        result = ast_new_binary(OP_ADD, result, str_call, line, col);
+
+      start = end + 1;
+      i = end;
+    }
+  }
+
+  /* Add remaining literal part */
+  if (start < len) {
+    AstNode *lit = ast_new_string(str + start, len - start, line, col);
+    if (!result)
+      result = lit;
+    else
+      result = ast_new_binary(OP_ADD, result, lit, line, col);
+  }
+
+  return result ? result : ast_new_string("", 0, line, col);
+}
+
+/* call → primary ( '(' arguments? ')' | '[' expr ']' | '.' ident | '++' | '--'
+ * )* */
+static AstNode *call(Parser *parser) {
+  AstNode *expr = primary(parser);
+  if (!expr)
+    return NULL; /* Prevent segfault on parse error */
+
+  while (true) {
+    if (match(parser, TOK_LPAREN)) {
+      AstNode *call_node = ast_new_call(expr, expr->line, expr->column);
+
+      if (!check(parser, TOK_RPAREN)) {
+        do {
+          AstNode *arg = expression(parser);
+          if (arg)
+            ast_array_push(&call_node->as.call.args, arg);
+        } while (match(parser, TOK_COMMA));
+      }
+
+      consume(parser, TOK_RPAREN, "Expected ')' after arguments");
+      expr = call_node;
+    } else if (match(parser, TOK_LBRACKET)) {
+      /* Array indexing: expr[index] */
+      int line = parser->previous.line;
+      int col = parser->previous.column;
+      AstNode *index_expr = expression(parser);
+      consume(parser, TOK_RBRACKET, "Expected ']' after index");
+      AstNode *index_node = calloc(1, sizeof(AstNode));
+      index_node->type = AST_INDEX;
+      index_node->line = line;
+      index_node->column = col;
+      index_node->as.index.object = expr;
+      index_node->as.index.index = index_expr;
+      expr = index_node;
+    } else if (match(parser, TOK_DOT)) {
+      consume(parser, TOK_IDENT, "Expected property name after '.'");
+      /* Create member access node */
+      AstNode *member = ast_alloc_member(expr, token_string(&parser->previous),
+                                         expr->line, expr->column);
+      if (!member)
+        return expr; /* Prevent segfault */
+      expr = member;
+    } else if (match(parser, TOK_PLUSPLUS)) {
+      /* Postfix increment: expr++ */
+      int line = parser->previous.line;
+      int col = parser->previous.column;
+      expr = ast_new_unary(OP_INC, expr, line, col);
+    } else if (match(parser, TOK_MINUSMINUS)) {
+      /* Postfix decrement: expr-- */
+      int line = parser->previous.line;
+      int col = parser->previous.column;
+      expr = ast_new_unary(OP_DEC, expr, line, col);
+    } else {
+      break;
+    }
+  }
+
+  return expr;
+}
+
+/* Helper for member node - we need to add this */
+static AstNode *ast_alloc_member(AstNode *obj, char *member, int line,
+                                 int col) {
+  AstNode *node = calloc(1, sizeof(AstNode));
+  node->type = AST_MEMBER;
+  node->line = line;
+  node->column = col;
+  node->as.member.object = obj;
+  node->as.member.member = member;
+  return node;
+}
+
+/* unary → ('!' | '-' | 'not') unary | call */
+static AstNode *unary(Parser *parser) {
+  int line = parser->current.line;
+  int col = parser->current.column;
+
+  if (match(parser, TOK_MINUS)) {
+    return ast_new_unary(OP_NEG, unary(parser), line, col);
+  }
+  if (match(parser, TOK_BANG) || match(parser, TOK_NOT)) {
+    return ast_new_unary(OP_NOT, unary(parser), line, col);
+  }
+  if (match(parser, TOK_TILDE)) {
+    return ast_new_unary(OP_BIT_NOT, unary(parser), line, col);
+  }
+
+  return call(parser);
+}
+
+/* factor → unary (('*' | '/' | '%') unary)* */
+static AstNode *factor(Parser *parser) {
+  AstNode *expr = unary(parser);
+
+  while (match(parser, TOK_STAR) || match(parser, TOK_SLASH) ||
+         match(parser, TOK_PERCENT)) {
+    BinaryOp op;
+    switch (parser->previous.type) {
+    case TOK_STAR:
+      op = OP_MUL;
+      break;
+    case TOK_SLASH:
+      op = OP_DIV;
+      break;
+    case TOK_PERCENT:
+      op = OP_MOD;
+      break;
+    default:
+      op = OP_MUL;
+      break;
+    }
+    int line = parser->previous.line;
+    int col = parser->previous.column;
+    AstNode *right = unary(parser);
+    expr = ast_new_binary(op, expr, right, line, col);
+  }
+
+  return expr;
+}
+
+/* term → factor (('+' | '-') factor)* */
+static AstNode *term(Parser *parser) {
+  AstNode *expr = factor(parser);
+
+  while (match(parser, TOK_PLUS) || match(parser, TOK_MINUS)) {
+    BinaryOp op = parser->previous.type == TOK_PLUS ? OP_ADD : OP_SUB;
+    int line = parser->previous.line;
+    int col = parser->previous.column;
+    AstNode *right = factor(parser);
+    expr = ast_new_binary(op, expr, right, line, col);
+  }
+
+  return expr;
+}
+
+/* comparison → term (('<' | '>' | '<=' | '>=' | 'has') term)* */
+static AstNode *comparison(Parser *parser) {
+  AstNode *expr = term(parser);
+
+  while (match(parser, TOK_LT) || match(parser, TOK_GT) ||
+         match(parser, TOK_LE) || match(parser, TOK_GE) ||
+         match(parser, TOK_HAS)) {
+    BinaryOp op;
+    int line = parser->previous.line;
+    int col = parser->previous.column;
+
+    if (parser->previous.type == TOK_HAS) {
+      /* has _ checks if maybe value is present */
+      /* Consume the _ placeholder if present */
+      if (check(parser, TOK_IDENT) && parser->current.length == 1 &&
+          parser->current.start[0] == '_') {
+        advance(parser); /* consume _ */
+      }
+      /* Create a has-value check node */
+      AstNode *has_node = calloc(1, sizeof(AstNode));
+      has_node->type = AST_UNARY_OP;
+      has_node->line = line;
+      has_node->column = col;
+      has_node->as.unary.op =
+          OP_NOT; /* Temporarily use NOT, will need OP_HAS */
+      has_node->as.unary.operand = expr;
+      expr = has_node;
+      continue;
+    }
+
+    switch (parser->previous.type) {
+    case TOK_LT:
+      op = OP_LT;
+      break;
+    case TOK_GT:
+      op = OP_GT;
+      break;
+    case TOK_LE:
+      op = OP_LE;
+      break;
+    case TOK_GE:
+      op = OP_GE;
+      break;
+    default:
+      op = OP_LT;
+      break;
+    }
+    AstNode *right = term(parser);
+    expr = ast_new_binary(op, expr, right, line, col);
+  }
+
+  return expr;
+}
+
+/* equality → comparison (('==' | '!=') comparison)* */
+static AstNode *equality(Parser *parser) {
+  AstNode *expr = comparison(parser);
+
+  while (match(parser, TOK_EQ) || match(parser, TOK_NE)) {
+    BinaryOp op = parser->previous.type == TOK_EQ ? OP_EQ : OP_NE;
+    int line = parser->previous.line;
+    int col = parser->previous.column;
+    AstNode *right = comparison(parser);
+    expr = ast_new_binary(op, expr, right, line, col);
+  }
+
+  return expr;
+}
+
+/* logic_and → equality (('&&' | 'and') equality)* */
+static AstNode *logic_and(Parser *parser) {
+  AstNode *expr = equality(parser);
+
+  while (match(parser, TOK_AMPAMP) || match(parser, TOK_AND)) {
+    int line = parser->previous.line;
+    int col = parser->previous.column;
+    AstNode *right = equality(parser);
+    expr = ast_new_binary(OP_AND, expr, right, line, col);
+  }
+
+  return expr;
+}
+
+/* logic_or → logic_and (('||' | 'or') logic_and)* */
+static AstNode *logic_or(Parser *parser) {
+  AstNode *expr = logic_and(parser);
+
+  while (match(parser, TOK_PIPEPIPE) || match(parser, TOK_OR)) {
+    int line = parser->previous.line;
+    int col = parser->previous.column;
+    AstNode *right = logic_and(parser);
+    expr = ast_new_binary(OP_OR, expr, right, line, col);
+  }
+
+  return expr;
+}
+
+/* pipeline → logic_or ('>>' logic_or)* */
+static AstNode *pipeline(Parser *parser) {
+  AstNode *expr = logic_or(parser);
+
+  while (match(parser, TOK_PIPELINE)) {
+    int line = parser->previous.line;
+    int col = parser->previous.column;
+    AstNode *right = logic_or(parser);
+    expr = ast_new_binary(OP_PIPELINE, expr, right, line, col);
+  }
+
+  return expr;
+}
+
+/* expression → assignment */
+static AstNode *expression(Parser *parser) { return assignment(parser); }
+
+/* assignment → or_expr ('=' assignment)? */
+static AstNode *assignment(Parser *parser) {
+  AstNode *expr = pipeline(parser);
+  if (!expr)
+    return NULL;
+
+  if (match(parser, TOK_ASSIGN)) {
+    int line = parser->previous.line;
+    int col = parser->previous.column;
+    AstNode *value = assignment(parser); /* Right-associative */
+    return ast_new_assign(expr, value, line, col);
+  }
+
+  return expr;
+}
+
+/* ======== Statement Parsing ======== */
+
+/* expression_statement → expression ';' */
+static AstNode *expression_statement(Parser *parser) {
+  AstNode *expr = expression(parser);
+  if (!expr)
+    return NULL;
+  consume(parser, TOK_SEMICOLON, "Expected ';' after expression");
+  return expr; /* Return the expression (assignment or otherwise) */
+}
+
+/* block → '{' declaration* '}' */
+static AstNode *block(Parser *parser) {
+  int line = parser->previous.line;
+  int col = parser->previous.column;
+
+  AstNode *blk = ast_new_block(line, col);
+
+  while (!check(parser, TOK_RBRACE) && !check(parser, TOK_EOF)) {
+    AstNode *decl = declaration(parser);
+    if (decl) {
+      ast_array_push(&blk->as.block.statements, decl);
+    }
+  }
+
+  consume(parser, TOK_RBRACE, "Expected '}' after block");
+  return blk;
+}
+
+/* if_statement → 'if' expression block ('else' (if_statement | block))? */
+static AstNode *if_statement(Parser *parser) {
+  int line = parser->previous.line;
+  int col = parser->previous.column;
+
+  AstNode *condition = expression(parser);
+  consume(parser, TOK_LBRACE, "Expected '{' after if condition");
+  AstNode *then_branch = block(parser);
+
+  AstNode *else_branch = NULL;
+  if (match(parser, TOK_ELSE)) {
+    if (match(parser, TOK_IF)) {
+      else_branch = if_statement(parser);
+    } else {
+      consume(parser, TOK_LBRACE, "Expected '{' after else");
+      else_branch = block(parser);
+    }
+  }
+
+  return ast_new_if(condition, then_branch, else_branch, line, col);
+}
+
+/* while_statement → 'while' expression block */
+static AstNode *while_statement(Parser *parser) {
+  int line = parser->previous.line;
+  int col = parser->previous.column;
+
+  AstNode *condition = expression(parser);
+  consume(parser, TOK_LBRACE, "Expected '{' after while condition");
+  AstNode *body = block(parser);
+
+  return ast_new_while(condition, body, line, col);
+}
+
+/* for_statement → 'for' (type? ident 'in' expr | init? ';' cond? ';' update?)
+ * block */
+static AstNode *for_statement(Parser *parser) {
+  int line = parser->previous.line;
+  int col = parser->previous.column;
+
+  /* Check for for...in syntax: for TYPE IDENT in EXPR { } */
+  /* Lookahead to detect 'in' keyword */
+  TypeInfo *var_type = NULL;
+  char *var_name = NULL;
+  bool is_for_in = false;
+
+  /* Try to detect for...in pattern */
+  if (check(parser, TOK_INT) || check(parser, TOK_AUTO) ||
+      check(parser, TOK_STRING) || check(parser, TOK_FLOAT) ||
+      check(parser, TOK_BOOL) || check(parser, TOK_IDENT)) {
+    /* Save state for backtracking */
+    Token saved_current = parser->current;
+    Token saved_previous = parser->previous;
+
+    /* Parse optional type */
+    if (check(parser, TOK_INT) || check(parser, TOK_AUTO) ||
+        check(parser, TOK_STRING) || check(parser, TOK_FLOAT) ||
+        check(parser, TOK_BOOL)) {
+      var_type = parse_type(parser);
+    }
+
+    /* Parse identifier */
+    if (check(parser, TOK_IDENT)) {
+      advance(parser);
+      var_name = token_string(&parser->previous);
+
+      /* Check for 'in' keyword */
+      if (check(parser, TOK_IN)) {
+        advance(parser); /* consume 'in' */
+        is_for_in = true;
+
+        /* Parse iterable expression */
+        AstNode *iterable = expression(parser);
+
+        consume(parser, TOK_LBRACE, "Expected '{' after for...in");
+        AstNode *body = block(parser);
+
+        /* Create for-in node (desugar to index-based loop) */
+        /* For now, create a simple loop structure */
+        AstNode *for_node = calloc(1, sizeof(AstNode));
+        for_node->type = AST_FOR;
+        for_node->line = line;
+        for_node->column = col;
+        for_node->as.for_stmt.var_name = var_name;
+        for_node->as.for_stmt.var_type = var_type;
+        for_node->as.for_stmt.iterable = iterable;
+        for_node->as.for_stmt.body = body;
+        return for_node;
+      }
+    }
+
+    /* Not for...in, restore state for C-style parsing */
+    if (!is_for_in) {
+      parser->current = saved_current;
+      parser->previous = saved_previous;
+      if (var_type)
+        type_info_free(var_type);
+      var_type = NULL;
+      var_name = NULL;
+    }
+  }
+
+  /* C-style for loop: for int i = 0; i < 10; i++ { } */
+  AstNode *init = NULL;
+  AstNode *condition = NULL;
+  AstNode *update = NULL;
+
+  /* Check for optional initializer (variable declaration or expression) */
+  if (!check(parser, TOK_SEMICOLON)) {
+    /* Could be a type name or expression */
+    if (check(parser, TOK_INT) || check(parser, TOK_AUTO) ||
+        check(parser, TOK_STRING) || check(parser, TOK_FLOAT) ||
+        check(parser, TOK_BOOL)) {
+      /* Variable declaration */
+      init = declaration(parser);
+    } else {
+      init = expression(parser);
+      consume(parser, TOK_SEMICOLON, "Expected ';' after for initializer");
+    }
+  } else {
+    consume(parser, TOK_SEMICOLON, "Expected ';'");
+  }
+
+  /* Condition */
+  if (!check(parser, TOK_SEMICOLON)) {
+    condition = expression(parser);
+  }
+  consume(parser, TOK_SEMICOLON, "Expected ';' after for condition");
+
+  /* Update */
+  if (!check(parser, TOK_LBRACE)) {
+    update = expression(parser);
+  }
+
+  consume(parser, TOK_LBRACE, "Expected '{' after for clauses");
+  AstNode *body = block(parser);
+
+  /* Desugar into while loop */
+  /* { init; while (cond) { body; update; } } */
+  AstNode *outer = ast_new_block(line, col);
+  if (init) {
+    ast_array_push(&outer->as.block.statements, init);
+  }
+
+  /* Add update to end of body */
+  if (update) {
+    ast_array_push(&body->as.block.statements, update);
+  }
+
+  /* Create while */
+  if (!condition) {
+    condition = ast_new_bool(true, line, col);
+  }
+  AstNode *while_node = ast_new_while(condition, body, line, col);
+  ast_array_push(&outer->as.block.statements, while_node);
+
+  return outer;
+}
+
+/* give_statement → 'give' expression? ';' */
+static AstNode *give_statement(Parser *parser) {
+  int line = parser->previous.line;
+  int col = parser->previous.column;
+
+  AstNode *value = NULL;
+  if (!check(parser, TOK_SEMICOLON)) {
+    value = expression(parser);
+  }
+  consume(parser, TOK_SEMICOLON, "Expected ';' after give value");
+
+  return ast_new_give(value, line, col);
+}
+
+/* statement → if | while | for | give | try | block | expr_stmt */
+static AstNode *statement(Parser *parser) {
+  if (match(parser, TOK_IF))
+    return if_statement(parser);
+  if (match(parser, TOK_WHILE))
+    return while_statement(parser);
+  if (match(parser, TOK_FOR))
+    return for_statement(parser);
+  if (match(parser, TOK_GIVE))
+    return give_statement(parser);
+  if (match(parser, TOK_LBRACE))
+    return block(parser);
+  if (match(parser, TOK_BREAK)) {
+    consume(parser, TOK_SEMICOLON, "Expected ';' after break");
+    AstNode *node = calloc(1, sizeof(AstNode));
+    node->type = AST_BREAK;
+    return node;
+  }
+  if (match(parser, TOK_CONTINUE)) {
+    consume(parser, TOK_SEMICOLON, "Expected ';' after continue");
+    AstNode *node = calloc(1, sizeof(AstNode));
+    node->type = AST_CONTINUE;
+    return node;
+  }
+  /* Stub: try/catch/fail - skip until we find a block end or semicolon */
+  if (match(parser, TOK_TRY)) {
+    /* Skip try block */
+    consume(parser, TOK_LBRACE, "Expected '{' after try");
+    int depth = 1;
+    while (depth > 0 && !check(parser, TOK_EOF)) {
+      if (match(parser, TOK_LBRACE))
+        depth++;
+      else if (match(parser, TOK_RBRACE))
+        depth--;
+      else
+        advance(parser);
+    }
+    /* Skip any catch blocks */
+    while (match(parser, TOK_CATCH)) {
+      while (!check(parser, TOK_LBRACE) && !check(parser, TOK_EOF))
+        advance(parser);
+      if (match(parser, TOK_LBRACE)) {
+        depth = 1;
+        while (depth > 0 && !check(parser, TOK_EOF)) {
+          if (match(parser, TOK_LBRACE))
+            depth++;
+          else if (match(parser, TOK_RBRACE))
+            depth--;
+          else
+            advance(parser);
+        }
+      }
+    }
+    return ast_new_none(parser->previous.line, parser->previous.column);
+  }
+  if (match(parser, TOK_FAIL)) {
+    /* Skip fail statement until semicolon */
+    while (!check(parser, TOK_SEMICOLON) && !check(parser, TOK_EOF))
+      advance(parser);
+    match(parser, TOK_SEMICOLON);
+    return ast_new_none(parser->previous.line, parser->previous.column);
+  }
+
+  return expression_statement(parser);
+}
+
+/* ======== Declaration Parsing ======== */
+
+/* Parse type annotation */
+static TypeInfo *parse_type(Parser *parser) {
+  char *name = NULL;
+
+  if (match(parser, TOK_INT))
+    name = strdup("int");
+  else if (match(parser, TOK_UINT))
+    name = strdup("uint");
+  else if (match(parser, TOK_I8))
+    name = strdup("i8");
+  else if (match(parser, TOK_I16))
+    name = strdup("i16");
+  else if (match(parser, TOK_I32))
+    name = strdup("i32");
+  else if (match(parser, TOK_I64))
+    name = strdup("i64");
+  else if (match(parser, TOK_U8))
+    name = strdup("u8");
+  else if (match(parser, TOK_U16))
+    name = strdup("u16");
+  else if (match(parser, TOK_U32))
+    name = strdup("u32");
+  else if (match(parser, TOK_U64))
+    name = strdup("u64");
+  else if (match(parser, TOK_F32))
+    name = strdup("f32");
+  else if (match(parser, TOK_F64))
+    name = strdup("f64");
+  else if (match(parser, TOK_FLOAT))
+    name = strdup("float");
+  else if (match(parser, TOK_DOUBLE))
+    name = strdup("double");
+  else if (match(parser, TOK_BOOL))
+    name = strdup("bool");
+  else if (match(parser, TOK_CHAR))
+    name = strdup("char");
+  else if (match(parser, TOK_STRING))
+    name = strdup("string");
+  else if (match(parser, TOK_VOID))
+    name = strdup("void");
+  else if (match(parser, TOK_IDENT))
+    name = token_string(&parser->previous);
+  else
+    return NULL;
+
+  TypeInfo *info = type_info_new(name);
+  free(name);
+
+  /* Check for modifiers */
+  if (match(parser, TOK_STAR)) {
+    info->is_pointer = true;
+  }
+  if (match(parser, TOK_LBRACKET)) {
+    info->is_array = true;
+    if (!check(parser, TOK_RBRACKET)) {
+      /* Array size - skip for now */
+      expression(parser);
+    }
+    consume(parser, TOK_RBRACKET, "Expected ']' after array type");
+  }
+
+  return info;
+}
+
+/* var_declaration → type ident ('=' expression)? ';' */
+/*                 | 'auto' ident '=' expression ';' */
+static AstNode *var_declaration(Parser *parser) {
+  int line = parser->current.line;
+  int col = parser->current.column;
+  bool is_auto = false;
+  TypeInfo *type = NULL;
+
+  if (match(parser, TOK_AUTO)) {
+    is_auto = true;
+  } else {
+    type = parse_type(parser);
+    if (!type) {
+      parser_error_at_current(parser, "Expected type");
+      return NULL;
+    }
+  }
+
+  consume(parser, TOK_IDENT, "Expected variable name");
+  char *name = token_string(&parser->previous);
+
+  AstNode *initializer = NULL;
+  if (match(parser, TOK_ASSIGN)) {
+    initializer = expression(parser);
+  } else if (is_auto) {
+    parser_error(parser, "auto variables must have an initializer");
+  }
+
+  consume(parser, TOK_SEMICOLON, "Expected ';' after variable declaration");
+
+  return ast_new_var_decl(name, type, initializer, is_auto, line, col);
+}
+
+/* proc_declaration → 'proc' ident '(' params? ')' ('gives' type)? ('canfail')?
+ * block */
+static AstNode *proc_declaration(Parser *parser) {
+  int line = parser->previous.line;
+  int col = parser->previous.column;
+
+  consume(parser, TOK_IDENT, "Expected procedure name");
+  char *name = token_string(&parser->previous);
+
+  AstNode *proc = ast_new_proc(name, line, col);
+  free(name);
+
+  consume(parser, TOK_LPAREN, "Expected '(' after procedure name");
+
+  /* Parse parameters */
+  if (!check(parser, TOK_RPAREN)) {
+    do {
+      TypeInfo *param_type = parse_type(parser);
+      if (!param_type) {
+        parser_error_at_current(parser, "Expected parameter type");
+        break;
+      }
+
+      consume(parser, TOK_IDENT, "Expected parameter name");
+      char *param_name = token_string(&parser->previous);
+
+      AstNode *param =
+          ast_new_var_decl(param_name, param_type, NULL, false,
+                           parser->previous.line, parser->previous.column);
+      ast_array_push(&proc->as.proc.params, param);
+      free(param_name);
+
+    } while (match(parser, TOK_COMMA));
+  }
+
+  consume(parser, TOK_RPAREN, "Expected ')' after parameters");
+
+  /* Return type */
+  if (match(parser, TOK_GIVES)) {
+    proc->as.proc.return_type = parse_type(parser);
+  }
+
+  /* canfail modifier */
+  if (match(parser, TOK_CANFAIL)) {
+    proc->as.proc.is_canfail = true;
+  }
+
+  /* Body */
+  consume(parser, TOK_LBRACE, "Expected '{' before procedure body");
+  proc->as.proc.body = block(parser);
+
+  return proc;
+}
+
+/* Check if current token starts a type */
+static bool is_type_start(Parser *parser) {
+  switch (parser->current.type) {
+  case TOK_INT:
+  case TOK_UINT:
+  case TOK_I8:
+  case TOK_I16:
+  case TOK_I32:
+  case TOK_I64:
+  case TOK_U8:
+  case TOK_U16:
+  case TOK_U32:
+  case TOK_U64:
+  case TOK_F32:
+  case TOK_F64:
+  case TOK_FLOAT:
+  case TOK_DOUBLE:
+  case TOK_BOOL:
+  case TOK_CHAR:
+  case TOK_STRING:
+  case TOK_VOID:
+  case TOK_AUTO:
+  case TOK_MAYBE:
+    return true;
+  default:
+    return false;
+  }
+}
+
+/* declaration → proc_declaration | struct_declaration | var_declaration |
+ * statement */
+static AstNode *declaration(Parser *parser) {
+  AstNode *result = NULL;
+
+  if (match(parser, TOK_PROC)) {
+    result = proc_declaration(parser);
+  } else if (match(parser, TOK_STRUCT)) {
+    /* Skip struct definition for now - consume until closing brace */
+    consume(parser, TOK_IDENT, "Expected struct name");
+    consume(parser, TOK_LBRACE, "Expected '{' after struct name");
+    while (!check(parser, TOK_RBRACE) && !check(parser, TOK_EOF)) {
+      advance(parser);
+    }
+    consume(parser, TOK_RBRACE, "Expected '}' after struct body");
+    /* Return an empty placeholder node instead of NULL */
+    result = ast_new_none(parser->previous.line, parser->previous.column);
+  } else if (is_type_start(parser)) {
+    result = var_declaration(parser);
+  } else {
+    result = statement(parser);
+  }
+
+  if (parser->panic_mode)
+    synchronize(parser);
+  return result;
+}
+
+/* ======== Pragma Parsing ======== */
+
+static AstNode *parse_pragma(Parser *parser) {
+  /* #pragma consumed, now expect name:value */
+  int line = parser->previous.line;
+  int col = parser->previous.column;
+
+  consume(parser, TOK_IDENT, "Expected pragma name");
+  char *name = token_string(&parser->previous);
+
+  char *value = NULL;
+  if (match(parser, TOK_COLON)) {
+    consume(parser, TOK_IDENT, "Expected pragma value");
+    value = token_string(&parser->previous);
+  }
+
+  AstNode *pragma = calloc(1, sizeof(AstNode));
+  pragma->type = AST_PRAGMA;
+  pragma->line = line;
+  pragma->column = col;
+  pragma->as.pragma.name = name;
+  pragma->as.pragma.value = value;
+
+  return pragma;
+}
+
+/* ======== Main Parse Function ======== */
+
+void parser_init(Parser *parser, Lexer *lexer) {
+  parser->lexer = lexer;
+  parser->had_error = false;
+  parser->panic_mode = false;
+  parser->error_message[0] = '\0';
+
+  /* Prime the parser with first token */
+  advance(parser);
+}
+
+AstNode *parser_parse(Parser *parser) {
+  AstNode *program = ast_new_program();
+
+  while (!check(parser, TOK_EOF)) {
+    if (match(parser, TOK_PRAGMA)) {
+      AstNode *pragma = parse_pragma(parser);
+      if (pragma) {
+        ast_array_push(&program->as.program.pragmas, pragma);
+      }
+    } else {
+      AstNode *decl = declaration(parser);
+      if (decl) {
+        ast_array_push(&program->as.program.declarations, decl);
+      }
+    }
+  }
+
+  return program;
+}
+
+AstNode *parser_parse_expression(Parser *parser) { return expression(parser); }
+
+AstNode *parser_parse_statement(Parser *parser) { return statement(parser); }
+
+AstNode *parser_parse_declaration(Parser *parser) {
+  return declaration(parser);
+}

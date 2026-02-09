@@ -12,6 +12,7 @@ BIN_DIR = bin
 SRCS = $(wildcard $(SRC_DIR)/*.c) \
        $(wildcard $(SRC_DIR)/lexer/*.c) \
        $(wildcard $(SRC_DIR)/parser/*.c) \
+       $(wildcard $(SRC_DIR)/interpreter/*.c) \
        $(wildcard $(SRC_DIR)/ir/*.c) \
        $(wildcard $(SRC_DIR)/types/*.c) \
        $(wildcard $(SRC_DIR)/profile/*.c) \
@@ -41,6 +42,7 @@ dirs:
 	@mkdir -p $(BIN_DIR)
 	@mkdir -p $(BUILD_DIR)/lexer
 	@mkdir -p $(BUILD_DIR)/parser
+	@mkdir -p $(BUILD_DIR)/interpreter
 	@mkdir -p $(BUILD_DIR)/ir
 	@mkdir -p $(BUILD_DIR)/types
 	@mkdir -p $(BUILD_DIR)/profile

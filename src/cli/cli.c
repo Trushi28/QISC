@@ -3,7 +3,11 @@
  */
 
 #include "cli.h"
+#include "../interpreter/interpreter.h"
+#include "../lexer/lexer.h"
+#include "../parser/parser.h"
 #include "../personality/personality.h"
+#include "../utils/utils.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +51,7 @@ void qisc_cli_help(void) {
   printf("  -O<n>             Optimization level (0-3)\n\n");
   printf("Examples:\n");
   printf("  qisc build hello.qisc\n");
+  printf("  qisc run hello.qisc\n");
   printf("  qisc build --profile app.qisc\n");
   printf("  qisc build --converge app.qisc\n");
 }
@@ -178,9 +183,7 @@ int qisc_cli_run(int argc, char **argv) {
       fprintf(stderr, "Error: No input file specified\n");
       return 1;
     }
-    /* TODO: Implement run command */
-    printf("Run command not yet implemented\n");
-    return 1;
+    return qisc_run_file(args.input_file, &args.options);
 
   default:
     qisc_cli_help();
@@ -188,18 +191,117 @@ int qisc_cli_run(int argc, char **argv) {
   }
 }
 
-/* Stub for compile - will be implemented in later phases */
+/* Compile a file */
 QiscResult qisc_compile_file(const char *path, QiscOptions *options) {
-  (void)path;
   (void)options;
-  /* TODO: Implement actual compilation */
-  printf("[DEBUG] Would compile: %s\n", path);
+
+  /* Read source file */
+  char *source = qisc_read_file(path);
+  if (!source) {
+    fprintf(stderr, "Could not read file: %s\n", path);
+    return QISC_ERROR_FILE_NOT_FOUND;
+  }
+
+  /* Initialize lexer */
+  Lexer lexer;
+  lexer_init(&lexer, source);
+
+  /* Initialize parser */
+  Parser parser;
+  parser_init(&parser, &lexer);
+
+  /* Parse program */
+  AstNode *program = parser_parse(&parser);
+
+  if (parser.had_error) {
+    free(source);
+    if (program)
+      ast_free(program);
+    return QISC_ERROR_SYNTAX;
+  }
+
+/* For now, print AST (in debug mode) */
+#ifdef DEBUG
+  printf("\n=== AST ===\n");
+  ast_print(program, 0);
+  printf("===========\n\n");
+#endif
+
+  /* Cleanup */
+  ast_free(program);
+  free(source);
+
   return QISC_OK;
+}
+
+/* Run a file - compile and execute */
+int qisc_run_file(const char *path, QiscOptions *options) {
+  qisc_personality_print(options->personality, "Compiling %s...\n", path);
+
+  /* Read source file */
+  char *source = qisc_read_file(path);
+  if (!source) {
+    qisc_personality_print(options->personality,
+                           "Error: Could not read file: %s\n", path);
+    return 1;
+  }
+
+  /* Initialize lexer */
+  Lexer lexer;
+  lexer_init(&lexer, source);
+
+  /* Initialize parser */
+  Parser parser;
+  parser_init(&parser, &lexer);
+
+  /* Parse program */
+  AstNode *program = parser_parse(&parser);
+
+  if (parser.had_error) {
+    qisc_personality_print(options->personality, "Error: Parse error: %s\n",
+                           parser.error_message);
+    free(source);
+    if (program)
+      ast_free(program);
+    return 1;
+  }
+
+  /* Initialize interpreter */
+  Interpreter interp;
+  interpreter_init(&interp);
+
+  /* Run program */
+  Value result = interpreter_run(&interp, program);
+
+  if (interp.had_error) {
+    qisc_personality_print(options->personality, "Error: Runtime error: %s\n",
+                           interp.error_message);
+    interpreter_free(&interp);
+    ast_free(program);
+    free(source);
+    return 1;
+  }
+
+  /* Print result if not none */
+  if (result.type != VAL_NONE) {
+    printf("=> ");
+    value_print(&result);
+    printf("\n");
+  }
+
+  qisc_personality_print(options->personality, "Successfully ran %s\n", path);
+
+  /* Cleanup */
+  interpreter_free(&interp);
+  ast_free(program);
+  free(source);
+
+  return 0;
 }
 
 QiscResult qisc_compile_string(const char *source, QiscOptions *options) {
   (void)source;
   (void)options;
-  /* TODO: Implement actual compilation */
+  /* TODO: Implement string compilation */
   return QISC_OK;
 }

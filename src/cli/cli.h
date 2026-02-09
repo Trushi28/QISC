@@ -36,4 +36,7 @@ void qisc_cli_help(void);
 /* Print version */
 void qisc_cli_version(void);
 
+/* Run a file directly */
+int qisc_run_file(const char *path, QiscOptions *options);
+
 #endif /* QISC_CLI_H */

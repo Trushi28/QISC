@@ -1,0 +1,205 @@
+/*
+ * QISC CLI Implementation
+ */
+
+#include "cli.h"
+#include "../personality/personality.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Default options */
+QiscOptions qisc_default_options(void) {
+  QiscOptions opts = {
+      .context = QISC_CONTEXT_CLI,
+      .personality = QISC_PERSONALITY_FRIENDLY,
+      .collect_profile = false,
+      .use_profile = false,
+      .converge = false,
+      .profile_path = NULL,
+      .optimization_level = 2,
+  };
+  return opts;
+}
+
+/* Version string */
+const char *qisc_version(void) { return QISC_VERSION_STRING; }
+
+/* Print help message */
+void qisc_cli_help(void) {
+  printf("QISC - Quantum-Inspired Superposition Compiler v%s\n\n",
+         QISC_VERSION_STRING);
+  printf("Usage: qisc <command> [options] <file>\n\n");
+  printf("Commands:\n");
+  printf("  build     Compile a .qisc file\n");
+  printf("  run       Compile and immediately run\n");
+  printf("  version   Show version information\n");
+  printf("  help      Show this help message\n\n");
+  printf("Build Options:\n");
+  printf("  --profile         Collect profile data during execution\n");
+  printf("  --use-profile <f> Use profile file for optimization\n");
+  printf("  --converge        Compile until convergence\n");
+  printf(
+      "  --context <ctx>   Set context (cli|server|web|notebook|embedded)\n");
+  printf("  --personality <p> Set personality "
+         "(off|minimal|friendly|snarky|sage|cryptic)\n");
+  printf("  -o <file>         Output file name\n");
+  printf("  -O<n>             Optimization level (0-3)\n\n");
+  printf("Examples:\n");
+  printf("  qisc build hello.qisc\n");
+  printf("  qisc build --profile app.qisc\n");
+  printf("  qisc build --converge app.qisc\n");
+}
+
+/* Print version */
+void qisc_cli_version(void) {
+  qisc_personality_print(QISC_PERSONALITY_FRIENDLY,
+                         "QISC Compiler v%s\n"
+                         "A self-evolving, profile-driven compiler\n"
+                         "\"Getting smarter with every compilation\"\n",
+                         QISC_VERSION_STRING);
+}
+
+/* Parse CLI arguments */
+CliArgs qisc_cli_parse(int argc, char **argv) {
+  CliArgs args = {
+      .command = CLI_CMD_NONE,
+      .input_file = NULL,
+      .output_file = NULL,
+      .options = qisc_default_options(),
+  };
+
+  if (argc < 2) {
+    return args;
+  }
+
+  /* Parse command */
+  if (strcmp(argv[1], "build") == 0) {
+    args.command = CLI_CMD_BUILD;
+  } else if (strcmp(argv[1], "run") == 0) {
+    args.command = CLI_CMD_RUN;
+  } else if (strcmp(argv[1], "version") == 0 ||
+             strcmp(argv[1], "--version") == 0) {
+    args.command = CLI_CMD_VERSION;
+  } else if (strcmp(argv[1], "help") == 0 || strcmp(argv[1], "--help") == 0) {
+    args.command = CLI_CMD_HELP;
+  }
+
+  /* Parse options */
+  for (int i = 2; i < argc; i++) {
+    if (strcmp(argv[i], "--profile") == 0) {
+      args.options.collect_profile = true;
+    } else if (strcmp(argv[i], "--use-profile") == 0 && i + 1 < argc) {
+      args.options.use_profile = true;
+      args.options.profile_path = argv[++i];
+    } else if (strcmp(argv[i], "--converge") == 0) {
+      args.options.converge = true;
+    } else if (strcmp(argv[i], "--context") == 0 && i + 1 < argc) {
+      i++;
+      if (strcmp(argv[i], "cli") == 0)
+        args.options.context = QISC_CONTEXT_CLI;
+      else if (strcmp(argv[i], "server") == 0)
+        args.options.context = QISC_CONTEXT_SERVER;
+      else if (strcmp(argv[i], "web") == 0)
+        args.options.context = QISC_CONTEXT_WEB;
+      else if (strcmp(argv[i], "notebook") == 0)
+        args.options.context = QISC_CONTEXT_NOTEBOOK;
+      else if (strcmp(argv[i], "embedded") == 0)
+        args.options.context = QISC_CONTEXT_EMBEDDED;
+    } else if (strcmp(argv[i], "--personality") == 0 && i + 1 < argc) {
+      i++;
+      if (strcmp(argv[i], "off") == 0)
+        args.options.personality = QISC_PERSONALITY_OFF;
+      else if (strcmp(argv[i], "minimal") == 0)
+        args.options.personality = QISC_PERSONALITY_MINIMAL;
+      else if (strcmp(argv[i], "friendly") == 0)
+        args.options.personality = QISC_PERSONALITY_FRIENDLY;
+      else if (strcmp(argv[i], "snarky") == 0)
+        args.options.personality = QISC_PERSONALITY_SNARKY;
+      else if (strcmp(argv[i], "sage") == 0)
+        args.options.personality = QISC_PERSONALITY_SAGE;
+      else if (strcmp(argv[i], "cryptic") == 0)
+        args.options.personality = QISC_PERSONALITY_CRYPTIC;
+    } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
+      args.output_file = argv[++i];
+    } else if (strncmp(argv[i], "-O", 2) == 0) {
+      args.options.optimization_level = argv[i][2] - '0';
+      if (args.options.optimization_level < 0)
+        args.options.optimization_level = 0;
+      if (args.options.optimization_level > 3)
+        args.options.optimization_level = 3;
+    } else if (argv[i][0] != '-') {
+      /* Input file */
+      args.input_file = argv[i];
+    }
+  }
+
+  return args;
+}
+
+/* Main CLI entry point */
+int qisc_cli_run(int argc, char **argv) {
+  CliArgs args = qisc_cli_parse(argc, argv);
+
+  switch (args.command) {
+  case CLI_CMD_VERSION:
+    qisc_cli_version();
+    return 0;
+
+  case CLI_CMD_HELP:
+    qisc_cli_help();
+    return 0;
+
+  case CLI_CMD_BUILD:
+    if (!args.input_file) {
+      qisc_personality_print(args.options.personality,
+                             "Error: No input file specified\n"
+                             "Use 'qisc help' for usage information\n");
+      return 1;
+    }
+
+    qisc_personality_print(args.options.personality, "Compiling %s...\n",
+                           args.input_file);
+
+    QiscResult result = qisc_compile_file(args.input_file, &args.options);
+
+    if (result != QISC_OK) {
+      qisc_personality_print(args.options.personality,
+                             "Compilation failed with error %d\n", result);
+      return 1;
+    }
+
+    qisc_personality_print(args.options.personality,
+                           "Compilation successful!\n");
+    return 0;
+
+  case CLI_CMD_RUN:
+    if (!args.input_file) {
+      fprintf(stderr, "Error: No input file specified\n");
+      return 1;
+    }
+    /* TODO: Implement run command */
+    printf("Run command not yet implemented\n");
+    return 1;
+
+  default:
+    qisc_cli_help();
+    return 1;
+  }
+}
+
+/* Stub for compile - will be implemented in later phases */
+QiscResult qisc_compile_file(const char *path, QiscOptions *options) {
+  (void)path;
+  (void)options;
+  /* TODO: Implement actual compilation */
+  printf("[DEBUG] Would compile: %s\n", path);
+  return QISC_OK;
+}
+
+QiscResult qisc_compile_string(const char *source, QiscOptions *options) {
+  (void)source;
+  (void)options;
+  /* TODO: Implement actual compilation */
+  return QISC_OK;
+}

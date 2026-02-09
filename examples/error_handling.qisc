@@ -1,0 +1,60 @@
+// Error handling example in QISC
+// Demonstrates canfail, try/catch, and fail
+
+#pragma context:cli
+
+struct Config {
+    string host;
+    int port;
+    string database;
+}
+
+// A function that can fail uses 'canfail'
+proc read_config(string path) gives Config canfail {
+    if !file_exists(path) {
+        fail FileNotFound(path);
+    }
+    
+    auto content = read_file(path)!;  // ! propagates failure
+    auto config = parse_json(content)!;
+    
+    give Config {
+        host: config["host"],
+        port: config["port"],
+        database: config["database"],
+    };
+}
+
+proc connect_database(Config cfg) gives Connection canfail {
+    auto conn = db_connect(cfg.host, cfg.port, cfg.database)!;
+    give conn;
+}
+
+proc main() gives int {
+    // Try block to handle potential failures
+    try {
+        auto config = read_config("config.json")!;
+        print("Loaded config: {config.host}:{config.port}");
+        
+        auto conn = connect_database(config)!;
+        print("Connected to database!");
+        
+        // Do work...
+        conn.close();
+        
+        give 0;
+        
+    } catch FileNotFound e {
+        print("Config file not found: {e.path}");
+        print("Please create a config.json file");
+        give 1;
+        
+    } catch DbConnectionError e {
+        print("Failed to connect to database: {e.message}");
+        give 2;
+        
+    } catch any e {
+        print("Unexpected error: {e}");
+        give 99;
+    }
+}

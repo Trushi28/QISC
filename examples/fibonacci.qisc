@@ -1,0 +1,34 @@
+// Fibonacci example in QISC
+// Demonstrates functions, loops, and conditionals
+
+#pragma context:cli
+#pragma compiler_personality:friendly
+
+proc fibonacci(int n) gives int {
+    if n <= 1 {
+        give n;
+    }
+    
+    int a = 0;
+    int b = 1;
+    int result = 0;
+    
+    for int i = 2; i <= n; i++ {
+        result = a + b;
+        a = b;
+        b = result;
+    }
+    
+    give result;
+}
+
+proc main() gives int {
+    print("Fibonacci sequence:");
+    
+    for int i = 0; i < 20; i++ {
+        int fib = fibonacci(i);
+        print("fib({i}) = {fib}");
+    }
+    
+    give 0;
+}

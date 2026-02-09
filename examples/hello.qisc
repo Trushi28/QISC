@@ -1,0 +1,10 @@
+// Hello World example in QISC
+// This is the simplest possible QISC program
+
+#pragma context:cli
+#pragma compiler_personality:friendly
+
+proc main() gives int {
+    print("Hello, World!");
+    give 0;
+}

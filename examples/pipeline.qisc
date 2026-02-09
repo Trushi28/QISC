@@ -1,0 +1,47 @@
+// Pipeline example in QISC
+// Demonstrates the >> pipeline operator
+
+#pragma context:cli
+#pragma style:pipeline
+
+struct Person {
+    string name;
+    int age;
+    maybe string email;
+}
+
+proc get_people() gives Person[] {
+    give [
+        Person { name: "Alice", age: 30, email: "alice@example.com" },
+        Person { name: "Bob", age: 25, email: none },
+        Person { name: "Charlie", age: 35, email: "charlie@example.com" },
+        Person { name: "Diana", age: 28, email: "diana@example.com" },
+        Person { name: "Eve", age: 22, email: none },
+    ];
+}
+
+proc main() gives int {
+    // Pipeline to filter adults with email and get their names
+    auto names = get_people()
+        >> filter(p => p.age >= 25)
+        >> filter(p => p.email has _)
+        >> map(p => p.name)
+        >> collect();
+    
+    print("Adults with email:");
+    for string name in names {
+        print("  - {name}");
+    }
+    
+    // Pipeline to calculate average age
+    auto ages = get_people()
+        >> map(p => p.age)
+        >> collect();
+    
+    int total = ages >> reduce(0, (a, b) => a + b);
+    int avg = total / ages.length;
+    
+    print("Average age: {avg}");
+    
+    give 0;
+}

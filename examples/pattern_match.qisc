@@ -1,0 +1,56 @@
+// Pattern matching example in QISC
+// Demonstrates the when/is syntax
+
+#pragma context:cli
+#pragma style:friendly
+
+proc describe_number(int n) gives string {
+    when n {
+        is 0 { give "zero"; }
+        is 1 { give "one"; }
+        is 2 { give "two"; }
+        is 3 { give "three"; }
+        is _ { give "many"; }
+    }
+    give "unknown";
+}
+
+proc classify_temp(int temp) gives string {
+    when temp {
+        is 0 { give "freezing"; }
+        is 100 { give "boiling"; }
+        is _ { give "moderate"; }
+    }
+    give "unknown";
+}
+
+proc main() gives int {
+    // Integer pattern matching
+    print("Number words:");
+    int i = 0;
+    while i < 5 {
+        auto word = describe_number(i);
+        print("  {i} is {word}");
+        i = i + 1;
+    }
+    print("  42 is " + describe_number(42));
+    
+    // Temperature classification
+    print("");
+    print("Temperatures:");
+    print("  0°C: " + classify_temp(0));
+    print("  100°C: " + classify_temp(100));
+    print("  25°C: " + classify_temp(25));
+    
+    // String pattern matching
+    print("");
+    auto color = "red";
+    when color {
+        is "red" { print("Color: roses are red"); }
+        is "blue" { print("Color: sky is blue"); }
+        is "green" { print("Color: grass is green"); }
+        is _ { print("Color: unknown"); }
+    }
+    
+    give 0;
+}

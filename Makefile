@@ -29,7 +29,7 @@ TARGET = $(BIN_DIR)/qisc
 # Debug/Release
 DEBUG ?= 1
 ifeq ($(DEBUG), 1)
-    CFLAGS += -g -O0 -DDEBUG
+    CFLAGS += -g -O0 -DDEBUG -fno-stack-protector
 else
     CFLAGS += -O3 -DNDEBUG
 endif

@@ -16,6 +16,7 @@ typedef enum {
   VAL_STRING,
   VAL_PROC,
   VAL_ARRAY,
+  VAL_STRUCT,
   VAL_ERROR,
 } ValueType;
 
@@ -39,6 +40,12 @@ typedef struct Value {
       int count;
       int capacity;
     } array_val;
+    struct {
+      char **field_names;
+      struct Value *field_values;
+      int field_count;
+      char *type_name; /* struct type name, e.g. "Person" */
+    } struct_val;
     struct {
       char *message;
     } error_val;

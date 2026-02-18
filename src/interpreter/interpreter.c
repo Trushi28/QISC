@@ -55,6 +55,14 @@ void value_free(Value *val) {
     free(val->as.string_val.str);
   } else if (val->type == VAL_ERROR) {
     free(val->as.error_val.message);
+  } else if (val->type == VAL_ARRAY) {
+    free(val->as.array_val.items);
+  } else if (val->type == VAL_STRUCT) {
+    for (int i = 0; i < val->as.struct_val.field_count; i++)
+      free(val->as.struct_val.field_names[i]);
+    free(val->as.struct_val.field_names);
+    free(val->as.struct_val.field_values);
+    free(val->as.struct_val.type_name);
   }
 }
 
@@ -79,7 +87,24 @@ void value_print(Value *val) {
     printf("<proc>");
     break;
   case VAL_ARRAY:
-    printf("[array]");
+    printf("[");
+    for (int i = 0; i < val->as.array_val.count; i++) {
+      if (i > 0)
+        printf(", ");
+      value_print(&val->as.array_val.items[i]);
+    }
+    printf("]");
+    break;
+  case VAL_STRUCT:
+    printf("%s { ", val->as.struct_val.type_name ? val->as.struct_val.type_name
+                                                 : "struct");
+    for (int i = 0; i < val->as.struct_val.field_count; i++) {
+      if (i > 0)
+        printf(", ");
+      printf("%s: ", val->as.struct_val.field_names[i]);
+      value_print(&val->as.struct_val.field_values[i]);
+    }
+    printf(" }");
     break;
   case VAL_ERROR:
     printf("Error: %s", val->as.error_val.message);
@@ -118,7 +143,9 @@ Environment *env_new(Environment *parent) {
 void env_free(Environment *env) {
   for (int i = 0; i < env->count; i++) {
     free(env->names[i]);
-    value_free(&env->values[i]);
+    /* Note: we do NOT call value_free here because values are shallow-copied.
+     * Without reference counting, freeing values here would cause
+     * use-after-free when values are returned from function calls. */
   }
   free(env->names);
   free(env->values);
@@ -301,10 +328,102 @@ static Value runtime_error(Interpreter *interp, const char *format, ...) {
 /* Forward declaration */
 static Value evaluate(Interpreter *interp, AstNode *node);
 static void execute(Interpreter *interp, AstNode *node);
+static Value call_value(Interpreter *interp, Value *fn, Value *args, int argc);
 
 /* ======== Expression Evaluation ======== */
 
 static Value eval_binary(Interpreter *interp, AstNode *node) {
+  BinaryOp op = node->as.binary.op;
+
+  /* Pipeline: handle specially - inject left as first arg to right call */
+  if (op == OP_PIPELINE) {
+    Value left = evaluate(interp, node->as.binary.left);
+    if (interp->had_error)
+      return left;
+
+    /* Check if right side is a function call (filter, map, etc.) */
+    AstNode *rhs = node->as.binary.right;
+    if (rhs->type == AST_CALL && rhs->as.call.callee->type == AST_IDENTIFIER) {
+      char *fn_name = rhs->as.call.callee->as.identifier.name;
+
+      if (strcmp(fn_name, "filter") == 0 && rhs->as.call.args.count >= 1) {
+        /* filter(pred): keep elements where pred(elem) is truthy */
+        Value pred = evaluate(interp, rhs->as.call.args.items[0]);
+        if (interp->had_error)
+          return pred;
+        if (left.type == VAL_ARRAY && pred.type == VAL_PROC) {
+          Value result = {.type = VAL_ARRAY};
+          result.as.array_val.capacity = left.as.array_val.count;
+          result.as.array_val.items =
+              malloc(result.as.array_val.capacity * sizeof(Value));
+          result.as.array_val.count = 0;
+          for (int i = 0; i < left.as.array_val.count; i++) {
+            Value elem = left.as.array_val.items[i];
+            Value test = call_value(interp, &pred, &elem, 1);
+            if (interp->had_error)
+              return test;
+            if (value_is_truthy(&test)) {
+              result.as.array_val.items[result.as.array_val.count++] = elem;
+            }
+          }
+          return result;
+        }
+        return left;
+      }
+
+      if (strcmp(fn_name, "map") == 0 && rhs->as.call.args.count >= 1) {
+        /* map(fn): transform each element */
+        Value fn = evaluate(interp, rhs->as.call.args.items[0]);
+        if (interp->had_error)
+          return fn;
+        if (left.type == VAL_ARRAY && fn.type == VAL_PROC) {
+          Value result = {.type = VAL_ARRAY};
+          result.as.array_val.count = left.as.array_val.count;
+          result.as.array_val.capacity = left.as.array_val.count;
+          result.as.array_val.items =
+              malloc(result.as.array_val.count * sizeof(Value));
+          for (int i = 0; i < left.as.array_val.count; i++) {
+            Value elem = left.as.array_val.items[i];
+            result.as.array_val.items[i] = call_value(interp, &fn, &elem, 1);
+            if (interp->had_error)
+              return result;
+          }
+          return result;
+        }
+        return left;
+      }
+
+      if (strcmp(fn_name, "collect") == 0) {
+        /* collect(): materialize pipeline - return as-is */
+        return left;
+      }
+
+      if (strcmp(fn_name, "reduce") == 0 && rhs->as.call.args.count >= 2) {
+        /* reduce(init, fn): fold array */
+        Value acc = evaluate(interp, rhs->as.call.args.items[0]);
+        Value fn = evaluate(interp, rhs->as.call.args.items[1]);
+        if (interp->had_error)
+          return acc;
+        if (left.type == VAL_ARRAY && fn.type == VAL_PROC) {
+          for (int i = 0; i < left.as.array_val.count; i++) {
+            Value call_args[2] = {acc, left.as.array_val.items[i]};
+            acc = call_value(interp, &fn, call_args, 2);
+            if (interp->had_error)
+              return acc;
+          }
+        }
+        return acc;
+      }
+    }
+
+    /* Default pipeline: evaluate right and return it */
+    Value right = evaluate(interp, rhs);
+    if (right.type == VAL_PROC) {
+      return call_value(interp, &right, &left, 1);
+    }
+    return right;
+  }
+
   Value left = evaluate(interp, node->as.binary.left);
   if (interp->had_error)
     return left;
@@ -312,8 +431,6 @@ static Value eval_binary(Interpreter *interp, AstNode *node) {
   Value right = evaluate(interp, node->as.binary.right);
   if (interp->had_error)
     return right;
-
-  BinaryOp op = node->as.binary.op;
 
   /* Handle string concatenation */
   if (op == OP_ADD && left.type == VAL_STRING && right.type == VAL_STRING) {
@@ -412,7 +529,10 @@ static Value eval_binary(Interpreter *interp, AstNode *node) {
     return value_bool(value_is_truthy(&left) && value_is_truthy(&right));
   }
   if (op == OP_OR) {
-    return value_bool(value_is_truthy(&left) || value_is_truthy(&right));
+    /* Maybe-default: if left is none, return right; else return left */
+    if (left.type == VAL_NONE)
+      return right;
+    return left;
   }
 
   return runtime_error(interp, "Invalid operands for binary operator");
@@ -470,6 +590,49 @@ static Value eval_unary(Interpreter *interp, AstNode *node) {
   }
 }
 
+/* Helper: call a VAL_PROC value (proc or lambda) with arguments */
+static Value call_value(Interpreter *interp, Value *fn, Value *args, int argc) {
+  if (!fn || fn->type != VAL_PROC) {
+    return runtime_error(interp, "Value is not callable");
+  }
+  AstNode *node = fn->as.proc_val.proc;
+  Environment *closure = fn->as.proc_val.closure;
+  Environment *call_env = env_new(closure ? closure : interp->global);
+  Environment *prev = interp->current;
+
+  if (node->type == AST_LAMBDA) {
+    /* Lambda: params are in lambda.params, body is lambda.body */
+    for (int i = 0; i < node->as.lambda.params.count && i < argc; i++) {
+      AstNode *p = node->as.lambda.params.items[i];
+      if (p->type == AST_VAR_DECL)
+        env_define(call_env, p->as.var_decl.name, args[i]);
+      else if (p->type == AST_IDENTIFIER)
+        env_define(call_env, p->as.identifier.name, args[i]);
+    }
+    interp->current = call_env;
+    Value result = evaluate(interp, node->as.lambda.body);
+    interp->current = prev;
+    env_free(call_env);
+    return result;
+  } else if (node->type == AST_PROC) {
+    /* Regular proc */
+    for (int i = 0; i < node->as.proc.params.count && i < argc; i++) {
+      AstNode *p = node->as.proc.params.items[i];
+      env_define(call_env, p->as.var_decl.name, args[i]);
+    }
+    interp->current = call_env;
+    interp->returning = false;
+    execute(interp, node->as.proc.body);
+    Value result = interp->return_value;
+    interp->return_value = value_none();
+    interp->returning = false;
+    interp->current = prev;
+    env_free(call_env);
+    return result;
+  }
+  return value_none();
+}
+
 static Value eval_call(Interpreter *interp, AstNode *node) {
   /* Handle built-in functions by name */
   if (node->as.call.callee->type == AST_IDENTIFIER) {
@@ -499,6 +662,37 @@ static Value eval_call(Interpreter *interp, AstNode *node) {
       result = builtin_float(interp, args, argc);
     } else if (strcmp(name, "str") == 0) {
       result = builtin_str(interp, args, argc);
+    } else if (strcmp(name, "filter") == 0) {
+      /* filter(predicate) on array - used in pipelines */
+      if (argc >= 1 && args[0].type == VAL_PROC) {
+        /* Return the lambda itself; pipeline will apply it */
+        result = args[0];
+      } else {
+        result = value_none();
+      }
+    } else if (strcmp(name, "map") == 0) {
+      /* map(transform) on array - used in pipelines */
+      if (argc >= 1 && args[0].type == VAL_PROC) {
+        result = args[0];
+      } else {
+        result = value_none();
+      }
+    } else if (strcmp(name, "collect") == 0) {
+      /* Collect materializes a pipeline - return input as-is */
+      result = argc > 0 ? args[0] : value_none();
+    } else if (strcmp(name, "reduce") == 0) {
+      /* reduce(initial, lambda) - fold array */
+      if (argc >= 2 && args[1].type == VAL_PROC) {
+        result = args[0]; /* Will be applied in pipeline */
+      } else {
+        result = argc > 0 ? args[0] : value_none();
+      }
+    } else if (strcmp(name, "file_exists") == 0 ||
+               strcmp(name, "read_file") == 0 ||
+               strcmp(name, "parse_json") == 0 ||
+               strcmp(name, "db_connect") == 0) {
+      /* I/O stubs - return none */
+      result = value_none();
     } else {
       /* Look up user-defined function */
       Value *proc_val = env_get(interp->current, name);
@@ -577,6 +771,133 @@ static Value evaluate(Interpreter *interp, AstNode *node) {
 
   case AST_CALL:
     return eval_call(interp, node);
+
+  case AST_VAR_DECL: {
+    /* Handle var decl appearing in expression context */
+    Value init = value_none();
+    if (node->as.var_decl.initializer) {
+      init = evaluate(interp, node->as.var_decl.initializer);
+      if (interp->had_error)
+        return init;
+    }
+    env_define(interp->current, node->as.var_decl.name, init);
+    return init;
+  }
+
+  case AST_MEMBER: {
+    /* Member access: obj.field */
+    Value obj = evaluate(interp, node->as.member.object);
+    if (interp->had_error)
+      return obj;
+    if (obj.type == VAL_STRUCT) {
+      char *field = node->as.member.member;
+      for (int i = 0; i < obj.as.struct_val.field_count; i++) {
+        if (strcmp(obj.as.struct_val.field_names[i], field) == 0) {
+          return obj.as.struct_val.field_values[i];
+        }
+      }
+      return runtime_error(interp, "Struct '%s' has no field '%s'",
+                           obj.as.struct_val.type_name, field);
+    }
+    if (obj.type == VAL_ARRAY &&
+        strcmp(node->as.member.member, "length") == 0) {
+      return value_int(obj.as.array_val.count);
+    }
+    if (obj.type == VAL_STRING &&
+        strcmp(node->as.member.member, "length") == 0) {
+      return value_int(obj.as.string_val.length);
+    }
+    return runtime_error(interp,
+                         "Cannot access member '%s' on value of type %d",
+                         node->as.member.member, obj.type);
+  }
+
+  case AST_INDEX: {
+    /* Array indexing: arr[i] */
+    Value obj = evaluate(interp, node->as.index.object);
+    if (interp->had_error)
+      return obj;
+    Value idx = evaluate(interp, node->as.index.index);
+    if (interp->had_error)
+      return idx;
+    if (obj.type == VAL_ARRAY && idx.type == VAL_INT) {
+      int i = (int)idx.as.int_val;
+      if (i < 0 || i >= obj.as.array_val.count)
+        return runtime_error(interp, "Array index %d out of bounds (size %d)",
+                             i, obj.as.array_val.count);
+      return obj.as.array_val.items[i];
+    }
+    if (obj.type == VAL_STRING && idx.type == VAL_INT) {
+      int i = (int)idx.as.int_val;
+      if (i < 0 || i >= obj.as.string_val.length)
+        return runtime_error(interp, "String index %d out of bounds", i);
+      return value_string(&obj.as.string_val.str[i], 1);
+    }
+    return runtime_error(interp, "Cannot index value of this type");
+  }
+
+  case AST_ARRAY_LITERAL: {
+    /* Build runtime array from elements */
+    int count = node->as.array_literal.elements.count;
+    Value arr = {.type = VAL_ARRAY};
+    arr.as.array_val.count = count;
+    arr.as.array_val.capacity = count;
+    arr.as.array_val.items = count > 0 ? malloc(count * sizeof(Value)) : NULL;
+    for (int i = 0; i < count; i++) {
+      arr.as.array_val.items[i] =
+          evaluate(interp, node->as.array_literal.elements.items[i]);
+      if (interp->had_error)
+        return arr;
+    }
+    return arr;
+  }
+
+  case AST_LAMBDA: {
+    /* Lambda expression: store as a proc-like value with closure */
+    Value lambda = {.type = VAL_PROC};
+    lambda.as.proc_val.proc = node;
+    lambda.as.proc_val.closure = interp->current;
+    return lambda;
+  }
+
+  case AST_ASSIGN:
+    /* Assignment as expression: evaluate and return the value */
+    {
+      Value val = evaluate(interp, node->as.assign.value);
+      if (interp->had_error)
+        return val;
+      if (node->as.assign.target->type == AST_IDENTIFIER) {
+        char *name = node->as.assign.target->as.identifier.name;
+        Value *existing = env_get(interp->current, name);
+        if (existing) {
+          *existing = val;
+        } else {
+          env_define(interp->current, name, val);
+        }
+      }
+      return val;
+    }
+
+  case AST_STRUCT_LITERAL: {
+    /* Build runtime struct from field assignments */
+    int fc = node->as.struct_decl.fields.count;
+    Value sv = {.type = VAL_STRUCT};
+    sv.as.struct_val.field_count = fc;
+    sv.as.struct_val.type_name = strdup(node->as.struct_decl.name);
+    sv.as.struct_val.field_names = malloc(fc * sizeof(char *));
+    sv.as.struct_val.field_values = malloc(fc * sizeof(Value));
+    for (int i = 0; i < fc; i++) {
+      AstNode *field = node->as.struct_decl.fields.items[i];
+      /* Fields stored as AST_ASSIGN with target=identifier, value=expr */
+      sv.as.struct_val.field_names[i] =
+          strdup(field->as.assign.target->as.identifier.name);
+      sv.as.struct_val.field_values[i] =
+          evaluate(interp, field->as.assign.value);
+      if (interp->had_error)
+        return sv;
+    }
+    return sv;
+  }
 
   default:
     return runtime_error(interp, "Cannot evaluate node type: %d", node->type);
@@ -693,6 +1014,56 @@ static void execute(Interpreter *interp, AstNode *node) {
     exec_if(interp, node);
     break;
 
+  case AST_WHEN: {
+    /* Pattern matching: evaluate value, compare against each case */
+    Value val = evaluate(interp, node->as.when_stmt.value);
+    if (interp->had_error)
+      return;
+    for (int i = 0; i < node->as.when_stmt.cases.count; i++) {
+      AstNode *c = node->as.when_stmt.cases.items[i];
+      AstNode *pattern = c->as.if_stmt.condition;
+      /* Wildcard _ matches everything */
+      if (pattern->type == AST_IDENTIFIER &&
+          strcmp(pattern->as.identifier.name, "_") == 0) {
+        execute(interp, c->as.if_stmt.then_branch);
+        break;
+      }
+      /* Evaluate pattern and compare */
+      Value pv = evaluate(interp, pattern);
+      if (interp->had_error)
+        return;
+      int matched = 0;
+      if (val.type == pv.type) {
+        switch (val.type) {
+        case VAL_INT:
+          matched = (val.as.int_val == pv.as.int_val);
+          break;
+        case VAL_FLOAT:
+          matched = (val.as.float_val == pv.as.float_val);
+          break;
+        case VAL_BOOL:
+          matched = (val.as.bool_val == pv.as.bool_val);
+          break;
+        case VAL_STRING:
+          matched = (val.as.string_val.length == pv.as.string_val.length &&
+                     memcmp(val.as.string_val.str, pv.as.string_val.str,
+                            val.as.string_val.length) == 0);
+          break;
+        case VAL_NONE:
+          matched = 1;
+          break;
+        default:
+          break;
+        }
+      }
+      if (matched) {
+        execute(interp, c->as.if_stmt.then_branch);
+        break;
+      }
+    }
+    break;
+  }
+
   case AST_WHILE:
     exec_while(interp, node);
     break;
@@ -721,6 +1092,41 @@ static void execute(Interpreter *interp, AstNode *node) {
     exec_proc(interp, node);
     break;
 
+  case AST_NONE_LITERAL:
+    /* No-op: used as placeholder for struct definitions */
+    break;
+
+  case AST_FOR: {
+    /* for-in loop: iterate over array */
+    if (node->as.for_stmt.iterable && node->as.for_stmt.var_name) {
+      Value iterable = evaluate(interp, node->as.for_stmt.iterable);
+      if (interp->had_error)
+        return;
+      if (iterable.type == VAL_ARRAY) {
+        Environment *loop_env = env_new(interp->current);
+        Environment *prev = interp->current;
+        interp->current = loop_env;
+        for (int i = 0; i < iterable.as.array_val.count; i++) {
+          env_define(loop_env, node->as.for_stmt.var_name,
+                     iterable.as.array_val.items[i]);
+          execute(interp, node->as.for_stmt.body);
+          if (interp->had_error || interp->returning)
+            break;
+          if (interp->breaking) {
+            interp->breaking = false;
+            break;
+          }
+          if (interp->continuing) {
+            interp->continuing = false;
+          }
+        }
+        interp->current = prev;
+        env_free(loop_env);
+      }
+    }
+    break;
+  }
+
   case AST_EXPR_STMT:
   case AST_INT_LITERAL:
   case AST_FLOAT_LITERAL:
@@ -730,6 +1136,12 @@ static void execute(Interpreter *interp, AstNode *node) {
   case AST_BINARY_OP:
   case AST_UNARY_OP:
   case AST_CALL:
+  case AST_MEMBER:
+  case AST_INDEX:
+  case AST_ARRAY_LITERAL:
+  case AST_STRUCT_LITERAL:
+  case AST_LAMBDA:
+  case AST_PIPELINE:
     /* Expression as statement - evaluate and discard */
     evaluate(interp, node);
     break;

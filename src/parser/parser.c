@@ -165,8 +165,11 @@ static AstNode *primary(Parser *parser) {
       return lambda;
     }
 
-    /* Check for struct literal: Name { field: value, ... } */
-    if (check(parser, TOK_LBRACE)) {
+    /* Check for struct literal: Name { field: value, ... }
+     * Only enter struct literal mode if the identifier starts with uppercase
+     * (convention for type/struct names). This prevents ambiguity with
+     * patterns like 'names { ... }' where { starts a block. */
+    if (check(parser, TOK_LBRACE) && name[0] >= 'A' && name[0] <= 'Z') {
       advance(parser); /* consume { */
       AstNode *lit = calloc(1, sizeof(AstNode));
       lit->type = AST_STRUCT_LITERAL;
@@ -189,7 +192,7 @@ static AstNode *primary(Parser *parser) {
           AstNode *field = ast_new_assign(
               ast_new_identifier(field_name, line, col), field_val, line, col);
           ast_array_push(&lit->as.struct_decl.fields, field);
-        } while (match(parser, TOK_COMMA));
+        } while (match(parser, TOK_COMMA) && !check(parser, TOK_RBRACE));
       }
       consume(parser, TOK_RBRACE, "Expected '}' after struct literal");
       return lit;
@@ -404,6 +407,10 @@ static AstNode *call(Parser *parser) {
       int line = parser->previous.line;
       int col = parser->previous.column;
       expr = ast_new_unary(OP_DEC, expr, line, col);
+    } else if (match(parser, TOK_BANG)) {
+      /* Error propagation: expr! - pass through for now */
+      /* In full impl, would unwrap or propagate error */
+      (void)parser; /* no-op, just consume the ! */
     } else {
       break;
     }
@@ -505,15 +512,7 @@ static AstNode *comparison(Parser *parser) {
           parser->current.start[0] == '_') {
         advance(parser); /* consume _ */
       }
-      /* Create a has-value check node */
-      AstNode *has_node = calloc(1, sizeof(AstNode));
-      has_node->type = AST_UNARY_OP;
-      has_node->line = line;
-      has_node->column = col;
-      has_node->as.unary.op =
-          OP_NOT; /* Temporarily use NOT, will need OP_HAS */
-      has_node->as.unary.operand = expr;
-      expr = has_node;
+      /* has _ : pass through expr; truthy = has value, falsy = none */
       continue;
     }
 
@@ -601,7 +600,7 @@ static AstNode *pipeline(Parser *parser) {
 /* expression → assignment */
 static AstNode *expression(Parser *parser) { return assignment(parser); }
 
-/* assignment → or_expr ('=' assignment)? */
+/* assignment → or_expr ('=' | '+=' | '-=' | '*=' | '/=' | '%=' ) assignment? */
 static AstNode *assignment(Parser *parser) {
   AstNode *expr = pipeline(parser);
   if (!expr)
@@ -612,6 +611,32 @@ static AstNode *assignment(Parser *parser) {
     int col = parser->previous.column;
     AstNode *value = assignment(parser); /* Right-associative */
     return ast_new_assign(expr, value, line, col);
+  }
+
+  /* Compound assignment: x += y --> x = x + y */
+  BinaryOp compound_op = -1;
+  if (match(parser, TOK_PLUS_ASSIGN))
+    compound_op = OP_ADD;
+  else if (match(parser, TOK_MINUS_ASSIGN))
+    compound_op = OP_SUB;
+  else if (match(parser, TOK_STAR_ASSIGN))
+    compound_op = OP_MUL;
+  else if (match(parser, TOK_SLASH_ASSIGN))
+    compound_op = OP_DIV;
+  else if (match(parser, TOK_PERCENT_ASSIGN))
+    compound_op = OP_MOD;
+
+  if (compound_op != (BinaryOp)-1) {
+    int line = parser->previous.line;
+    int col = parser->previous.column;
+    AstNode *rhs = assignment(parser);
+    AstNode *bin = ast_new_binary(compound_op, expr, rhs, line, col);
+    /* Re-create target node (expr is consumed by binary, need a copy) */
+    AstNode *target = calloc(1, sizeof(AstNode));
+    *target = *expr; /* Shallow copy of the target identifier */
+    if (expr->type == AST_IDENTIFIER)
+      target->as.identifier.name = strdup(expr->as.identifier.name);
+    return ast_new_assign(target, bin, line, col);
   }
 
   return expr;
@@ -696,7 +721,8 @@ static AstNode *for_statement(Parser *parser) {
   if (check(parser, TOK_INT) || check(parser, TOK_AUTO) ||
       check(parser, TOK_STRING) || check(parser, TOK_FLOAT) ||
       check(parser, TOK_BOOL) || check(parser, TOK_IDENT)) {
-    /* Save state for backtracking */
+    /* Save FULL state for backtracking (lexer + parser tokens) */
+    Lexer saved_lexer = *parser->lexer;
     Token saved_current = parser->current;
     Token saved_previous = parser->previous;
 
@@ -723,8 +749,7 @@ static AstNode *for_statement(Parser *parser) {
         consume(parser, TOK_LBRACE, "Expected '{' after for...in");
         AstNode *body = block(parser);
 
-        /* Create for-in node (desugar to index-based loop) */
-        /* For now, create a simple loop structure */
+        /* Create for-in node */
         AstNode *for_node = calloc(1, sizeof(AstNode));
         for_node->type = AST_FOR;
         for_node->line = line;
@@ -737,8 +762,9 @@ static AstNode *for_statement(Parser *parser) {
       }
     }
 
-    /* Not for...in, restore state for C-style parsing */
+    /* Not for...in, restore FULL state for C-style parsing */
     if (!is_for_in) {
+      *parser->lexer = saved_lexer;
       parser->current = saved_current;
       parser->previous = saved_previous;
       if (var_type)
@@ -819,10 +845,69 @@ static AstNode *give_statement(Parser *parser) {
   return ast_new_give(value, line, col);
 }
 
-/* statement → if | while | for | give | try | block | expr_stmt */
+/* when/is pattern matching */
+static AstNode *when_statement(Parser *parser) {
+  int line = parser->previous.line;
+  int col = parser->previous.column;
+
+  /* Parse the value to match on */
+  AstNode *value = expression(parser);
+  consume(parser, TOK_LBRACE, "Expected '{' after when expression");
+
+  /* Build when node */
+  AstNode *node = calloc(1, sizeof(AstNode));
+  node->type = AST_WHEN;
+  node->line = line;
+  node->column = col;
+  node->as.when_stmt.value = value;
+  node->as.when_stmt.cases.count = 0;
+  node->as.when_stmt.cases.capacity = 8;
+  node->as.when_stmt.cases.items = calloc(8, sizeof(AstNode *));
+
+  /* Parse cases: is pattern { body } */
+  while (!check(parser, TOK_RBRACE) && !check(parser, TOK_EOF)) {
+    if (!match(parser, TOK_IS)) {
+      parser_error(parser, "Expected 'is' in when block");
+      break;
+    }
+
+    /* Parse the pattern (an expression: literal, identifier, or _) */
+    AstNode *pattern = expression(parser);
+
+    /* Parse the body block */
+    consume(parser, TOK_LBRACE, "Expected '{' after is pattern");
+    AstNode *body = block(parser);
+
+    /* Store case as AST_IF node: condition=pattern, then_branch=body */
+    AstNode *case_node = calloc(1, sizeof(AstNode));
+    case_node->type = AST_IF;
+    case_node->line = pattern->line;
+    case_node->column = pattern->column;
+    case_node->as.if_stmt.condition = pattern;
+    case_node->as.if_stmt.then_branch = body;
+    case_node->as.if_stmt.else_branch = NULL;
+
+    /* Add to cases array */
+    if (node->as.when_stmt.cases.count >= node->as.when_stmt.cases.capacity) {
+      node->as.when_stmt.cases.capacity *= 2;
+      node->as.when_stmt.cases.items =
+          realloc(node->as.when_stmt.cases.items,
+                  node->as.when_stmt.cases.capacity * sizeof(AstNode *));
+    }
+    node->as.when_stmt.cases.items[node->as.when_stmt.cases.count++] =
+        case_node;
+  }
+
+  consume(parser, TOK_RBRACE, "Expected '}' to close when block");
+  return node;
+}
+
+/* statement → if | when | while | for | give | try | block | expr_stmt */
 static AstNode *statement(Parser *parser) {
   if (match(parser, TOK_IF))
     return if_statement(parser);
+  if (match(parser, TOK_WHEN))
+    return when_statement(parser);
   if (match(parser, TOK_WHILE))
     return while_statement(parser);
   if (match(parser, TOK_FOR))

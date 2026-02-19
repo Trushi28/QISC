@@ -299,6 +299,7 @@ void interpreter_init(Interpreter *interp) {
   interp->return_value = value_none();
   interp->breaking = false;
   interp->continuing = false;
+  interp->method_count = 0;
 
   register_builtins(interp);
 }
@@ -610,7 +611,17 @@ static Value call_value(Interpreter *interp, Value *fn, Value *args, int argc) {
         env_define(call_env, p->as.identifier.name, args[i]);
     }
     interp->current = call_env;
-    Value result = evaluate(interp, node->as.lambda.body);
+    Value result;
+    if (node->as.lambda.body->type == AST_BLOCK) {
+      /* do block: execute statements, return via give */
+      interp->returning = false;
+      execute(interp, node->as.lambda.body);
+      result = interp->returning ? interp->return_value : value_none();
+      interp->returning = false;
+    } else {
+      /* expression lambda */
+      result = evaluate(interp, node->as.lambda.body);
+    }
     interp->current = prev;
     env_free(call_env);
     return result;
@@ -687,6 +698,66 @@ static Value eval_call(Interpreter *interp, AstNode *node) {
       } else {
         result = argc > 0 ? args[0] : value_none();
       }
+    } else if (strcmp(name, "typeof") == 0) {
+      if (argc >= 1) {
+        const char *tname = "unknown";
+        switch (args[0].type) {
+        case VAL_INT:
+          tname = "int";
+          break;
+        case VAL_FLOAT:
+          tname = "float";
+          break;
+        case VAL_BOOL:
+          tname = "bool";
+          break;
+        case VAL_STRING:
+          tname = "string";
+          break;
+        case VAL_ARRAY:
+          tname = "array";
+          break;
+        case VAL_STRUCT:
+          tname = "struct";
+          break;
+        case VAL_PROC:
+          tname = "proc";
+          break;
+        case VAL_NONE:
+          tname = "none";
+          break;
+        default:
+          break;
+        }
+        result = value_string(tname, (int)strlen(tname));
+      } else {
+        result = value_string("none", 4);
+      }
+    } else if (strcmp(name, "sizeof") == 0) {
+      if (argc >= 1) {
+        switch (args[0].type) {
+        case VAL_INT:
+          result = value_int(8);
+          break;
+        case VAL_FLOAT:
+          result = value_int(8);
+          break;
+        case VAL_BOOL:
+          result = value_int(1);
+          break;
+        case VAL_STRING:
+          result = value_int(args[0].as.string_val.length);
+          break;
+        case VAL_ARRAY:
+          result = value_int(args[0].as.array_val.count);
+          break;
+        default:
+          result = value_int(0);
+          break;
+        }
+      } else {
+        result = value_int(0);
+      }
     } else if (strcmp(name, "file_exists") == 0 ||
                strcmp(name, "read_file") == 0 ||
                strcmp(name, "parse_json") == 0 ||
@@ -701,33 +772,77 @@ static Value eval_call(Interpreter *interp, AstNode *node) {
         return runtime_error(interp, "Undefined function: %s", name);
       }
 
-      /* Create new environment for function call */
-      AstNode *proc = proc_val->as.proc_val.proc;
-      Environment *func_env = env_new(interp->global);
-
-      /* Bind parameters */
-      for (int i = 0; i < proc->as.proc.params.count && i < argc; i++) {
-        AstNode *param = proc->as.proc.params.items[i];
-        env_define(func_env, param->as.var_decl.name, args[i]);
-      }
-
-      /* Execute function body */
-      Environment *prev_env = interp->current;
-      interp->current = func_env;
-      interp->returning = false;
-
-      execute(interp, proc->as.proc.body);
-
-      result = interp->return_value;
-      interp->return_value = value_none();
-      interp->returning = false;
-
-      interp->current = prev_env;
-      env_free(func_env);
+      result = call_value(interp, proc_val, args, argc);
     }
 
     free(args);
     return result;
+  }
+
+  /* Handle method calls: obj.method() */
+  if (node->as.call.callee->type == AST_MEMBER) {
+    Value obj = evaluate(interp, node->as.call.callee->as.member.object);
+    if (interp->had_error)
+      return obj;
+    char *method_name = node->as.call.callee->as.member.member;
+
+    /* Determine type name */
+    char *type_name = NULL;
+    if (obj.type == VAL_STRUCT)
+      type_name = obj.as.struct_val.type_name;
+    else if (obj.type == VAL_ARRAY)
+      type_name = "Array";
+    else if (obj.type == VAL_STRING)
+      type_name = "String";
+    else if (obj.type == VAL_INT)
+      type_name = "int";
+
+    if (type_name) {
+      /* Look up method in registry */
+      for (int m = 0; m < interp->method_count; m++) {
+        if (strcmp(interp->methods[m].type_name, type_name) == 0 &&
+            strcmp(interp->methods[m].method_name, method_name) == 0) {
+          AstNode *proc = interp->methods[m].proc;
+          Environment *method_env = env_new(interp->global);
+
+          /* Bind 'self' to the object */
+          env_define(method_env, "self", obj);
+
+          /* Evaluate and bind remaining args (skip 'self' param) */
+          int argc = node->as.call.args.count;
+          int param_start = 0;
+          if (proc->as.proc.params.count > 0) {
+            AstNode *first_param = proc->as.proc.params.items[0];
+            if (strcmp(first_param->as.var_decl.name, "self") == 0)
+              param_start = 1;
+          }
+          for (int i = 0;
+               i < argc && (i + param_start) < proc->as.proc.params.count;
+               i++) {
+            Value arg_val = evaluate(interp, node->as.call.args.items[i]);
+            if (interp->had_error) {
+              env_free(method_env);
+              return arg_val;
+            }
+            AstNode *param = proc->as.proc.params.items[i + param_start];
+            env_define(method_env, param->as.var_decl.name, arg_val);
+          }
+
+          Environment *prev = interp->current;
+          interp->current = method_env;
+          interp->returning = false;
+          execute(interp, proc->as.proc.body);
+          Value result = interp->return_value;
+          interp->return_value = value_none();
+          interp->returning = false;
+          interp->current = prev;
+          env_free(method_env);
+          return result;
+        }
+      }
+    }
+    return runtime_error(interp, "No method '%s' on type '%s'", method_name,
+                         type_name ? type_name : "unknown");
   }
 
   return runtime_error(interp, "Expression is not callable");
@@ -1022,13 +1137,75 @@ static void execute(Interpreter *interp, AstNode *node) {
     for (int i = 0; i < node->as.when_stmt.cases.count; i++) {
       AstNode *c = node->as.when_stmt.cases.items[i];
       AstNode *pattern = c->as.if_stmt.condition;
+
       /* Wildcard _ matches everything */
       if (pattern->type == AST_IDENTIFIER &&
           strcmp(pattern->as.identifier.name, "_") == 0) {
         execute(interp, c->as.if_stmt.then_branch);
         break;
       }
-      /* Evaluate pattern and compare */
+
+      /* Range pattern: AST_BINARY_OP with NULL left → direct compare */
+      if (pattern->type == AST_BINARY_OP && pattern->as.binary.left == NULL) {
+        Value rhs = evaluate(interp, pattern->as.binary.right);
+        if (interp->had_error)
+          return;
+        int matched = 0;
+        double lv =
+            (val.type == VAL_FLOAT) ? val.as.float_val : (double)val.as.int_val;
+        double rv =
+            (rhs.type == VAL_FLOAT) ? rhs.as.float_val : (double)rhs.as.int_val;
+        switch (pattern->as.binary.op) {
+        case OP_GT:
+          matched = (lv > rv);
+          break;
+        case OP_GE:
+          matched = (lv >= rv);
+          break;
+        case OP_LT:
+          matched = (lv < rv);
+          break;
+        case OP_LE:
+          matched = (lv <= rv);
+          break;
+        default:
+          break;
+        }
+        if (matched) {
+          execute(interp, c->as.if_stmt.then_branch);
+          break;
+        }
+        continue;
+      }
+
+      /* Multi-pattern: AST_BLOCK — match if any sub-pattern matches */
+      if (pattern->type == AST_BLOCK) {
+        int any_matched = 0;
+        for (int j = 0; j < pattern->as.block.statements.count; j++) {
+          Value pv = evaluate(interp, pattern->as.block.statements.items[j]);
+          if (interp->had_error)
+            return;
+          if (val.type == pv.type) {
+            if ((val.type == VAL_INT && val.as.int_val == pv.as.int_val) ||
+                (val.type == VAL_STRING &&
+                 val.as.string_val.length == pv.as.string_val.length &&
+                 memcmp(val.as.string_val.str, pv.as.string_val.str,
+                        val.as.string_val.length) == 0) ||
+                (val.type == VAL_BOOL && val.as.bool_val == pv.as.bool_val) ||
+                (val.type == VAL_NONE)) {
+              any_matched = 1;
+              break;
+            }
+          }
+        }
+        if (any_matched) {
+          execute(interp, c->as.if_stmt.then_branch);
+          break;
+        }
+        continue;
+      }
+
+      /* Single pattern: evaluate and compare */
       Value pv = evaluate(interp, pattern);
       if (interp->had_error)
         return;
@@ -1091,6 +1268,39 @@ static void execute(Interpreter *interp, AstNode *node) {
   case AST_PROC:
     exec_proc(interp, node);
     break;
+
+  case AST_ENUM: {
+    /* Register enum as a struct where fields are variants with int values */
+    Value enum_val;
+    enum_val.type = VAL_STRUCT;
+    enum_val.as.struct_val.type_name = strdup(node->as.enum_decl.name);
+    int num_variants = node->as.enum_decl.variants.count;
+    enum_val.as.struct_val.field_count = num_variants;
+    enum_val.as.struct_val.field_names = calloc(num_variants, sizeof(char *));
+    enum_val.as.struct_val.field_values = calloc(num_variants, sizeof(Value));
+    for (int i = 0; i < num_variants; i++) {
+      AstNode *v = node->as.enum_decl.variants.items[i];
+      enum_val.as.struct_val.field_names[i] = strdup(v->as.identifier.name);
+      enum_val.as.struct_val.field_values[i] = value_int(i);
+    }
+    env_define(interp->global, node->as.enum_decl.name, enum_val);
+    break;
+  }
+
+  case AST_EXTEND: {
+    /* Register methods in the method table */
+    char *type_name = node->as.extend_decl.type_name;
+    for (int i = 0; i < node->as.extend_decl.methods.count; i++) {
+      AstNode *method = node->as.extend_decl.methods.items[i];
+      if (interp->method_count < 256) {
+        int idx = interp->method_count++;
+        interp->methods[idx].type_name = strdup(type_name);
+        interp->methods[idx].method_name = strdup(method->as.proc.name);
+        interp->methods[idx].proc = method;
+      }
+    }
+    break;
+  }
 
   case AST_NONE_LITERAL:
     /* No-op: used as placeholder for struct definitions */

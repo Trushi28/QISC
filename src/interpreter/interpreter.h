@@ -71,6 +71,13 @@ typedef struct {
   Value return_value;
   bool breaking;
   bool continuing;
+  /* Method registry: type_name.method_name → proc AST */
+  struct {
+    char *type_name;
+    char *method_name;
+    AstNode *proc;
+  } methods[256];
+  int method_count;
 } Interpreter;
 
 /* Initialize interpreter */

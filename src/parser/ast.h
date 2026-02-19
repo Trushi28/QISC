@@ -261,6 +261,18 @@ struct AstNode {
       AstNodeArray fields;
     } struct_decl;
 
+    /* Enum declaration */
+    struct {
+      char *name;
+      AstNodeArray variants; /* Each variant is an AST_IDENTIFIER */
+    } enum_decl;
+
+    /* Extend declaration (methods on a type) */
+    struct {
+      char *type_name;
+      AstNodeArray methods; /* Each is an AST_PROC */
+    } extend_decl;
+
     /* Pragma */
     struct {
       char *name;

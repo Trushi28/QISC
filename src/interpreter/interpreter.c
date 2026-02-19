@@ -1302,6 +1302,51 @@ static void execute(Interpreter *interp, AstNode *node) {
     break;
   }
 
+  case AST_TRY: {
+    /* Execute try block */
+    execute(interp, node->as.try_stmt.try_block);
+
+    /* If error occurred, try to handle with catch */
+    if (interp->had_error && node->as.try_stmt.catches.count > 0) {
+      /* Save error message */
+      char saved_error[512];
+      strncpy(saved_error, interp->error_message, sizeof(saved_error) - 1);
+      saved_error[sizeof(saved_error) - 1] = '\0';
+
+      /* Clear error state */
+      interp->had_error = false;
+      interp->error_message[0] = '\0';
+
+      /* Execute first catch block */
+      AstNode *catch_node = node->as.try_stmt.catches.items[0];
+      /* condition holds the error variable name */
+      const char *err_var =
+          catch_node->as.if_stmt.condition->as.identifier.name;
+
+      /* Bind error variable in current scope */
+      Value err_val = value_string(saved_error, (int)strlen(saved_error));
+      env_define(interp->current, err_var, err_val);
+
+      /* Execute catch body */
+      execute(interp, catch_node->as.if_stmt.then_branch);
+    }
+    break;
+  }
+
+  case AST_FAIL: {
+    /* Evaluate error expression and trigger error */
+    Value err = evaluate(interp, node->as.fail_stmt.error);
+    if (interp->had_error)
+      return;
+    if (err.type == VAL_STRING) {
+      runtime_error(interp, "%.*s", err.as.string_val.length,
+                    err.as.string_val.str);
+    } else {
+      runtime_error(interp, "fail: unhandled error");
+    }
+    return;
+  }
+
   case AST_NONE_LITERAL:
     /* No-op: used as placeholder for struct definitions */
     break;

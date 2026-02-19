@@ -1078,43 +1078,63 @@ static AstNode *statement(Parser *parser) {
     node->type = AST_CONTINUE;
     return node;
   }
-  /* Stub: try/catch/fail - skip until we find a block end or semicolon */
+  /* try/catch/fail */
   if (match(parser, TOK_TRY)) {
-    /* Skip try block */
+    AstNode *node = calloc(1, sizeof(AstNode));
+    node->type = AST_TRY;
+    node->line = parser->previous.line;
+    node->column = parser->previous.column;
+
+    /* Parse try block */
     consume(parser, TOK_LBRACE, "Expected '{' after try");
-    int depth = 1;
-    while (depth > 0 && !check(parser, TOK_EOF)) {
-      if (match(parser, TOK_LBRACE))
-        depth++;
-      else if (match(parser, TOK_RBRACE))
-        depth--;
-      else
-        advance(parser);
-    }
-    /* Skip any catch blocks */
+    node->as.try_stmt.try_block = block(parser);
+    ast_array_init(&node->as.try_stmt.catches);
+
+    /* Parse catch blocks: catch [TypeName] varname { ... }
+     * If two identifiers before '{', first is type (ignored), second is var.
+     * If one identifier before '{', it is the var name. */
     while (match(parser, TOK_CATCH)) {
-      while (!check(parser, TOK_LBRACE) && !check(parser, TOK_EOF))
+      AstNode *catch_node = calloc(1, sizeof(AstNode));
+      catch_node->type = AST_IF;
+      catch_node->line = parser->previous.line;
+      catch_node->column = parser->previous.column;
+
+      /* First identifier */
+      consume(parser, TOK_IDENT, "Expected identifier after catch");
+      char *first = token_string(&parser->previous);
+
+      char *err_name;
+      if (check(parser, TOK_IDENT)) {
+        /* Two identifiers: TypeName varname */
         advance(parser);
-      if (match(parser, TOK_LBRACE)) {
-        depth = 1;
-        while (depth > 0 && !check(parser, TOK_EOF)) {
-          if (match(parser, TOK_LBRACE))
-            depth++;
-          else if (match(parser, TOK_RBRACE))
-            depth--;
-          else
-            advance(parser);
-        }
+        err_name = token_string(&parser->previous);
+        free(first); /* type name discarded for now */
+      } else {
+        /* One identifier: varname */
+        err_name = first;
       }
+
+      catch_node->as.if_stmt.condition = ast_new_identifier(
+          err_name, parser->previous.line, parser->previous.column);
+      free(err_name);
+
+      /* Catch body */
+      consume(parser, TOK_LBRACE, "Expected '{' after catch variable");
+      catch_node->as.if_stmt.then_branch = block(parser);
+      catch_node->as.if_stmt.else_branch = NULL;
+
+      ast_array_push(&node->as.try_stmt.catches, catch_node);
     }
-    return ast_new_none(parser->previous.line, parser->previous.column);
+    return node;
   }
   if (match(parser, TOK_FAIL)) {
-    /* Skip fail statement until semicolon */
-    while (!check(parser, TOK_SEMICOLON) && !check(parser, TOK_EOF))
-      advance(parser);
-    match(parser, TOK_SEMICOLON);
-    return ast_new_none(parser->previous.line, parser->previous.column);
+    AstNode *node = calloc(1, sizeof(AstNode));
+    node->type = AST_FAIL;
+    node->line = parser->previous.line;
+    node->column = parser->previous.column;
+    node->as.fail_stmt.error = expression(parser);
+    consume(parser, TOK_SEMICOLON, "Expected ';' after fail expression");
+    return node;
   }
 
   return expression_statement(parser);

@@ -22,7 +22,7 @@
 [![Version](https://img.shields.io/badge/Version-0.1.0-blueviolet?style=for-the-badge&logo=semver&logoColor=white)](https://github.com/BethuTrushi/QISC)
 [![C11](https://img.shields.io/badge/Written_In-C11-00599C?style=for-the-badge&logo=c&logoColor=white)](https://en.wikipedia.org/wiki/C11_(C_standard_revision))
 [![LLVM](https://img.shields.io/badge/Backend-LLVM_21-262D3A?style=for-the-badge&logo=llvm&logoColor=white)](https://llvm.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg?style=for-the-badge)](https://opensource.org/licenses/Apache-2.0)
 [![Status](https://img.shields.io/badge/Status-Experimental-ff6347?style=for-the-badge)](https://github.com/BethuTrushi/QISC)
 
 <br/>
@@ -577,7 +577,7 @@ QISC is experimental and under active development. Contributions, ideas, and fee
 
 ## 📄 License
 
-This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details.
+This project is licensed under the **Apache License 2.0** — see the [LICENSE](LICENSE) file for details.
 
 <br/>
 

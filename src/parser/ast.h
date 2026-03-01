@@ -78,6 +78,7 @@ typedef enum {
   OP_LSHIFT,
   OP_RSHIFT,
   OP_PIPELINE,
+  OP_HAS, /* maybe has value check */
 } BinaryOp;
 
 /* Unary operators */
@@ -180,6 +181,7 @@ struct AstNode {
       TypeInfo *type_info;
       AstNode *initializer;
       bool is_auto;
+      bool is_const;
     } var_decl;
 
     /* Assignment */

@@ -57,6 +57,7 @@ typedef struct Environment {
   struct Environment *parent;
   char **names;
   Value *values;
+  bool *is_const; /* per-variable const flag */
   int count;
   int capacity;
 } Environment;

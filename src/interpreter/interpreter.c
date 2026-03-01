@@ -137,27 +137,28 @@ Environment *env_new(Environment *parent) {
   env->capacity = 8;
   env->names = calloc(env->capacity, sizeof(char *));
   env->values = calloc(env->capacity, sizeof(Value));
+  env->is_const = calloc(env->capacity, sizeof(bool));
   return env;
 }
 
 void env_free(Environment *env) {
   for (int i = 0; i < env->count; i++) {
     free(env->names[i]);
-    /* Note: we do NOT call value_free here because values are shallow-copied.
-     * Without reference counting, freeing values here would cause
-     * use-after-free when values are returned from function calls. */
   }
   free(env->names);
   free(env->values);
+  free(env->is_const);
   free(env);
 }
 
-void env_define(Environment *env, const char *name, Value value) {
+static void env_define_ex(Environment *env, const char *name, Value value,
+                          bool is_const_var) {
   /* Check if already exists in current scope */
   for (int i = 0; i < env->count; i++) {
     if (strcmp(env->names[i], name) == 0) {
       value_free(&env->values[i]);
       env->values[i] = value;
+      env->is_const[i] = is_const_var;
       return;
     }
   }
@@ -167,10 +168,20 @@ void env_define(Environment *env, const char *name, Value value) {
     env->capacity *= 2;
     env->names = realloc(env->names, env->capacity * sizeof(char *));
     env->values = realloc(env->values, env->capacity * sizeof(Value));
+    env->is_const = realloc(env->is_const, env->capacity * sizeof(bool));
   }
   env->names[env->count] = strdup(name);
   env->values[env->count] = value;
+  env->is_const[env->count] = is_const_var;
   env->count++;
+}
+
+void env_define(Environment *env, const char *name, Value value) {
+  env_define_ex(env, name, value, false);
+}
+
+void env_define_const(Environment *env, const char *name, Value value) {
+  env_define_ex(env, name, value, true);
 }
 
 Value *env_get(Environment *env, const char *name) {
@@ -188,6 +199,10 @@ Value *env_get(Environment *env, const char *name) {
 bool env_set(Environment *env, const char *name, Value value) {
   for (int i = 0; i < env->count; i++) {
     if (strcmp(env->names[i], name) == 0) {
+      if (env->is_const[i]) {
+        fprintf(stderr, "Error: Cannot reassign const variable '%s'\n", name);
+        return false;
+      }
       value_free(&env->values[i]);
       env->values[i] = value;
       return true;
@@ -428,6 +443,11 @@ static Value eval_binary(Interpreter *interp, AstNode *node) {
   Value left = evaluate(interp, node->as.binary.left);
   if (interp->had_error)
     return left;
+
+  /* Has check must short-circuit before right eval (right may be NULL) */
+  if (op == OP_HAS) {
+    return value_bool(left.type != VAL_NONE);
+  }
 
   Value right = evaluate(interp, node->as.binary.right);
   if (interp->had_error)
@@ -1039,7 +1059,36 @@ static void exec_block(Interpreter *interp, AstNode *node) {
 }
 
 static void exec_if(Interpreter *interp, AstNode *node) {
-  Value cond = evaluate(interp, node->as.if_stmt.condition);
+  AstNode *cond_node = node->as.if_stmt.condition;
+
+  /* Check for 'if expr has name' pattern (named maybe unwrapping) */
+  if (cond_node && cond_node->type == AST_BINARY_OP &&
+      cond_node->as.binary.op == OP_HAS && cond_node->as.binary.right != NULL &&
+      cond_node->as.binary.right->type == AST_IDENTIFIER) {
+
+    /* Evaluate the left side (the maybe value) */
+    Value maybe_val = evaluate(interp, cond_node->as.binary.left);
+    if (interp->had_error)
+      return;
+
+    if (maybe_val.type != VAL_NONE) {
+      /* Value present — create new scope and bind the unwrapped value */
+      const char *bind_name = cond_node->as.binary.right->as.identifier.name;
+      Environment *prev = interp->current;
+      interp->current = env_new(prev);
+      env_define(interp->current, bind_name, maybe_val);
+      execute(interp, node->as.if_stmt.then_branch);
+      Environment *scope = interp->current;
+      interp->current = prev;
+      env_free(scope);
+    } else if (node->as.if_stmt.else_branch) {
+      execute(interp, node->as.if_stmt.else_branch);
+    }
+    return;
+  }
+
+  /* Normal if-else */
+  Value cond = evaluate(interp, cond_node);
   if (interp->had_error)
     return;
 
@@ -1081,7 +1130,11 @@ static void exec_var_decl(Interpreter *interp, AstNode *node) {
     if (interp->had_error)
       return;
   }
-  env_define(interp->current, node->as.var_decl.name, val);
+  if (node->as.var_decl.is_const) {
+    env_define_const(interp->current, node->as.var_decl.name, val);
+  } else {
+    env_define(interp->current, node->as.var_decl.name, val);
+  }
 }
 
 static void exec_assign(Interpreter *interp, AstNode *node) {
@@ -1092,8 +1145,16 @@ static void exec_assign(Interpreter *interp, AstNode *node) {
   if (node->as.assign.target->type == AST_IDENTIFIER) {
     char *name = node->as.assign.target->as.identifier.name;
     if (!env_set(interp->current, name, val)) {
-      /* If not found, define it */
-      env_define(interp->current, name, val);
+      /* env_set returns false for const vars or undefined vars */
+      /* Check if it exists at all */
+      Value *existing = env_get(interp->current, name);
+      if (existing) {
+        /* It exists but is const — error already printed by env_set */
+        runtime_error(interp, "Cannot reassign const variable '%s'", name);
+      } else {
+        /* Not found — define it */
+        env_define(interp->current, name, val);
+      }
     }
   } else {
     runtime_error(interp, "Invalid assignment target");
@@ -1286,6 +1347,35 @@ static void execute(Interpreter *interp, AstNode *node) {
     env_define(interp->global, node->as.enum_decl.name, enum_val);
     break;
   }
+
+  case AST_STRUCT: {
+    /* Register struct type definition:
+     * Stores a descriptor with default field values (none) so that
+     * constructors like `Person { name: "Alice", age: 30 }` can work
+     * and the type name is accessible via typeof(). */
+    int nfields = node->as.struct_decl.fields.count;
+    Value stype;
+    stype.type = VAL_STRUCT;
+    stype.as.struct_val.type_name = strdup(node->as.struct_decl.name);
+    stype.as.struct_val.field_count = nfields;
+    stype.as.struct_val.field_names = calloc(nfields, sizeof(char *));
+    stype.as.struct_val.field_values = calloc(nfields, sizeof(Value));
+    for (int i = 0; i < nfields; i++) {
+      AstNode *f = node->as.struct_decl.fields.items[i];
+      stype.as.struct_val.field_names[i] = strdup(f->as.var_decl.name);
+      /* Default value is none; struct literals override at construction */
+      stype.as.struct_val.field_values[i] = value_none();
+    }
+    env_define(interp->global, node->as.struct_decl.name, stype);
+    break;
+  }
+
+  case AST_MODULE:
+  case AST_IMPORT:
+  case AST_PRAGMA:
+    /* Module/import = currently no-op (stubs for future linking) */
+    /* Pragma = handled at compile-time, no runtime effect */
+    break;
 
   case AST_EXTEND: {
     /* Register methods in the method table */

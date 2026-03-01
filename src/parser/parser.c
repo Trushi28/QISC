@@ -554,13 +554,22 @@ static AstNode *comparison(Parser *parser) {
     int col = parser->previous.column;
 
     if (parser->previous.type == TOK_HAS) {
-      /* has _ checks if maybe value is present */
-      /* Consume the _ placeholder if present */
-      if (check(parser, TOK_IDENT) && parser->current.length == 1 &&
-          parser->current.start[0] == '_') {
-        advance(parser); /* consume _ */
+      /* has _ = boolean truthiness check (is value not none?)
+       * has name = named unwrap (bind value to 'name' in if-block scope) */
+      AstNode *right = NULL;
+      if (check(parser, TOK_IDENT)) {
+        if (parser->current.length == 1 && parser->current.start[0] == '_') {
+          advance(parser); /* consume _ */
+          /* right stays NULL = anonymous has check */
+        } else {
+          /* Named binding: has varname */
+          advance(parser);
+          right = ast_new_identifier(token_string(&parser->previous),
+                                     parser->previous.line,
+                                     parser->previous.column);
+        }
       }
-      /* has _ : pass through expr; truthy = has value, falsy = none */
+      expr = ast_new_binary(OP_HAS, expr, right, line, col);
       continue;
     }
 
@@ -1206,15 +1215,29 @@ static TypeInfo *parse_type(Parser *parser) {
   return info;
 }
 
+/* Parse type annotation with optional 'maybe' prefix */
+static TypeInfo *parse_maybe_type(Parser *parser) {
+  bool is_maybe = match(parser, TOK_MAYBE);
+  TypeInfo *info = parse_type(parser);
+  if (info && is_maybe) {
+    info->is_maybe = true;
+  }
+  return info;
+}
+
 /* var_declaration → type ident ('=' expression)? ';' */
 /*                 | 'auto' ident '=' expression ';' */
 static AstNode *var_declaration(Parser *parser) {
-  int line = parser->current.line;
-  int col = parser->current.column;
+  int line = parser->previous.line;
+  int col = parser->previous.column;
   bool is_auto = false;
+  bool is_const = false;
   TypeInfo *type = NULL;
 
-  if (match(parser, TOK_AUTO)) {
+  if (match(parser, TOK_CONST)) {
+    is_const = true;
+    is_auto = true; /* const infers type like auto */
+  } else if (match(parser, TOK_AUTO)) {
     is_auto = true;
   } else {
     type = parse_type(parser);
@@ -1231,12 +1254,14 @@ static AstNode *var_declaration(Parser *parser) {
   if (match(parser, TOK_ASSIGN)) {
     initializer = expression(parser);
   } else if (is_auto) {
-    parser_error(parser, "auto variables must have an initializer");
+    parser_error(parser, "auto/const variables must have an initializer");
   }
 
   consume(parser, TOK_SEMICOLON, "Expected ';' after variable declaration");
 
-  return ast_new_var_decl(name, type, initializer, is_auto, line, col);
+  AstNode *node = ast_new_var_decl(name, type, initializer, is_auto, line, col);
+  node->as.var_decl.is_const = is_const;
+  return node;
 }
 
 /* proc_declaration → 'proc' ident '(' params? ')' ('gives' type)? ('canfail')?
@@ -1324,6 +1349,7 @@ static bool is_type_start(Parser *parser) {
   case TOK_STRING:
   case TOK_VOID:
   case TOK_AUTO:
+  case TOK_CONST:
   case TOK_MAYBE:
     return true;
   default:
@@ -1339,15 +1365,57 @@ static AstNode *declaration(Parser *parser) {
   if (match(parser, TOK_PROC)) {
     result = proc_declaration(parser);
   } else if (match(parser, TOK_STRUCT)) {
-    /* Skip struct definition for now - consume until closing brace */
+    /* struct Name { type field; type field; ... } */
+    int line = parser->previous.line;
+    int col = parser->previous.column;
+
     consume(parser, TOK_IDENT, "Expected struct name");
+    char *sname = token_string(&parser->previous);
+
     consume(parser, TOK_LBRACE, "Expected '{' after struct name");
+
+    /* Create AST_STRUCT node */
+    AstNode *snode = calloc(1, sizeof(AstNode));
+    snode->type = AST_STRUCT;
+    snode->line = line;
+    snode->column = col;
+    snode->as.struct_decl.name = sname;
+    snode->as.struct_decl.fields.count = 0;
+    snode->as.struct_decl.fields.capacity = 8;
+    snode->as.struct_decl.fields.items = calloc(8, sizeof(AstNode *));
+
     while (!check(parser, TOK_RBRACE) && !check(parser, TOK_EOF)) {
-      advance(parser);
+      /* Parse: [maybe] type name ; */
+      TypeInfo *ftype = parse_maybe_type(parser);
+      if (!ftype) {
+        parser_error(parser, "Expected field type in struct body");
+        break;
+      }
+
+      consume(parser, TOK_IDENT, "Expected field name");
+      char *fname = token_string(&parser->previous);
+
+      /* Create field as AST_VAR_DECL (no initializer) */
+      AstNode *field =
+          ast_new_var_decl(fname, ftype, NULL, false, parser->previous.line,
+                           parser->previous.column);
+      free(fname);
+
+      /* Add to fields */
+      if (snode->as.struct_decl.fields.count >=
+          snode->as.struct_decl.fields.capacity) {
+        snode->as.struct_decl.fields.capacity *= 2;
+        snode->as.struct_decl.fields.items =
+            realloc(snode->as.struct_decl.fields.items,
+                    snode->as.struct_decl.fields.capacity * sizeof(AstNode *));
+      }
+      snode->as.struct_decl.fields.items[snode->as.struct_decl.fields.count++] =
+          field;
+
+      match(parser, TOK_SEMICOLON); /* optional semicolon */
     }
     consume(parser, TOK_RBRACE, "Expected '}' after struct body");
-    /* Return an empty placeholder node instead of NULL */
-    result = ast_new_none(parser->previous.line, parser->previous.column);
+    result = snode;
   } else if (match(parser, TOK_ENUM)) {
     /* enum Name { Variant1, Variant2, ... } */
     int line = parser->previous.line;
@@ -1420,6 +1488,27 @@ static AstNode *declaration(Parser *parser) {
     }
     consume(parser, TOK_RBRACE, "Expected '}' after extend body");
     result = node;
+  } else if (match(parser, TOK_MODULE)) {
+    /* module Name; — stub: skip module name and semicolon */
+    consume(parser, TOK_IDENT, "Expected module name");
+    match(parser, TOK_SEMICOLON);
+    result = ast_new_none(parser->previous.line, parser->previous.column);
+  } else if (match(parser, TOK_IMPORT)) {
+    /* import Name; — stub: skip import path and semicolon */
+    consume(parser, TOK_IDENT, "Expected import name");
+    /* Handle dotted imports like import std.io */
+    while (match(parser, TOK_DOT)) {
+      consume(parser, TOK_IDENT, "Expected identifier after '.'");
+    }
+    match(parser, TOK_SEMICOLON);
+    result = ast_new_none(parser->previous.line, parser->previous.column);
+  } else if (match(parser, TOK_EXPORT)) {
+    /* export — prefix modifier, parse the next declaration */
+    result = declaration(parser);
+  } else if (match(parser, TOK_STATIC)) {
+    /* static — prefix modifier, parse the next declaration
+     * Marks variable/function as module-scoped (not exported) */
+    result = declaration(parser);
   } else if (is_type_start(parser)) {
     result = var_declaration(parser);
   } else {

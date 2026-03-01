@@ -3,10 +3,12 @@
  */
 
 #include "cli.h"
+#include "../codegen/codegen.h"
 #include "../interpreter/interpreter.h"
 #include "../lexer/lexer.h"
 #include "../parser/parser.h"
 #include "../personality/personality.h"
+#include "../typechecker/typechecker.h"
 #include "../utils/utils.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -220,14 +222,55 @@ QiscResult qisc_compile_file(const char *path, QiscOptions *options) {
     return QISC_ERROR_SYNTAX;
   }
 
-/* For now, print AST (in debug mode) */
-#ifdef DEBUG
-  printf("\n=== AST ===\n");
-  ast_print(program, 0);
-  printf("===========\n\n");
-#endif
+  /* Type check */
+  TypeChecker tc;
+  typechecker_init(&tc);
+  typecheck(&tc, program);
+  typechecker_report(&tc);
+
+  /* LLVM Codegen */
+  Codegen cg;
+  codegen_init(&cg, path);
+
+  if (codegen_emit(&cg, program)) {
+    fprintf(stderr, "Codegen failed: %s\n", cg.error_msg);
+    codegen_free(&cg);
+    ast_free(program);
+    free(source);
+    return QISC_ERROR_SYNTAX;
+  }
+
+  /* Dump IR to stdout */
+  printf("=== LLVM IR ===\n");
+  codegen_dump_ir(&cg);
+
+  /* Write object file */
+  char obj_path[512];
+  snprintf(obj_path, sizeof(obj_path), "%s.o", path);
+  if (codegen_write_object(&cg, obj_path) == 0) {
+    /* Link to binary */
+    char bin_path[512];
+    /* Strip .qisc extension */
+    strncpy(bin_path, path, sizeof(bin_path) - 1);
+    char *dot = strrchr(bin_path, '.');
+    if (dot)
+      *dot = '\0';
+
+    char link_cmd[1024];
+    snprintf(link_cmd, sizeof(link_cmd), "cc %s -o %s -lm", obj_path, bin_path);
+    printf("Linking: %s\n", link_cmd);
+    int ret = system(link_cmd);
+    if (ret == 0) {
+      printf("Binary written to: %s\n", bin_path);
+    } else {
+      fprintf(stderr, "Linking failed\n");
+    }
+    /* Remove object file */
+    remove(obj_path);
+  }
 
   /* Cleanup */
+  codegen_free(&cg);
   ast_free(program);
   free(source);
 
@@ -265,6 +308,12 @@ int qisc_run_file(const char *path, QiscOptions *options) {
       ast_free(program);
     return 1;
   }
+
+  /* Type checking pass (warnings only, doesn't block execution) */
+  TypeChecker tc;
+  typechecker_init(&tc);
+  typecheck(&tc, program);
+  typechecker_report(&tc);
 
   /* Initialize interpreter */
   Interpreter interp;

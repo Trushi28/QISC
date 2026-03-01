@@ -1,7 +1,7 @@
 # QISC Build System
 CC = gcc
-CFLAGS = -Wall -Wextra -std=c11 -I./include
-LDFLAGS = 
+CFLAGS = -Wall -Wextra -std=c11 -I./include $(shell llvm-config --cflags)
+LDFLAGS = $(shell llvm-config --ldflags --libs core) -lm
 
 # Directories
 SRC_DIR = src
@@ -13,6 +13,7 @@ SRCS = $(wildcard $(SRC_DIR)/*.c) \
        $(wildcard $(SRC_DIR)/lexer/*.c) \
        $(wildcard $(SRC_DIR)/parser/*.c) \
        $(wildcard $(SRC_DIR)/interpreter/*.c) \
+       $(wildcard $(SRC_DIR)/typechecker/*.c) \
        $(wildcard $(SRC_DIR)/ir/*.c) \
        $(wildcard $(SRC_DIR)/types/*.c) \
        $(wildcard $(SRC_DIR)/profile/*.c) \
@@ -43,6 +44,7 @@ dirs:
 	@mkdir -p $(BUILD_DIR)/lexer
 	@mkdir -p $(BUILD_DIR)/parser
 	@mkdir -p $(BUILD_DIR)/interpreter
+	@mkdir -p $(BUILD_DIR)/typechecker
 	@mkdir -p $(BUILD_DIR)/ir
 	@mkdir -p $(BUILD_DIR)/types
 	@mkdir -p $(BUILD_DIR)/profile

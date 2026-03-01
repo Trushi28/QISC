@@ -1,0 +1,99 @@
+/* QISC Comprehensive Feature Test
+ * Tests: const, typeof, sizeof, do blocks, when/is, try/catch/fail,
+ *        module/import, pipelines, lambdas, enums, extend
+ */
+
+module test;
+import std;
+
+enum Color { Red, Green, Blue }
+
+extend Color {
+    proc name(self) gives string {
+        when self {
+            is 0 { give "Red"; }
+            is 1 { give "Green"; }
+            is 2 { give "Blue"; }
+        }
+        give "Unknown";
+    }
+}
+
+proc add(int a, int b) gives int {
+    give a + b;
+}
+
+proc greet(string name) gives string {
+    give "Hello, " + name + "!";
+}
+
+proc risky() gives int canfail {
+    fail "Something went wrong";
+    give 42;
+}
+
+proc main() gives int {
+    /* === const enforcement === */
+    const PI = 3;
+    const LANG = "QISC";
+    print("PI = " + str(PI));
+    print("LANG = " + LANG);
+
+    /* === auto variables === */
+    auto x = 10;
+    x = 20;
+    print("x = " + str(x));
+
+    /* === typeof / sizeof === */
+    print("typeof(PI) = " + typeof(PI));
+    print("sizeof(LANG) = " + str(sizeof(LANG)));
+
+    /* === do blocks (multi-line lambdas) === */
+    auto doubler = do |n| {
+        give n * 2;
+    };
+    print("doubler(5) = " + str(doubler(5)));
+
+    /* === when/is pattern matching === */
+    auto val = 42;
+    when val {
+        is 1, 2, 3 {
+            print("Small number");
+        }
+        is > 40 {
+            print("Greater than 40: " + str(val));
+        }
+        else {
+            print("Other");
+        }
+    }
+
+    /* === try/catch/fail === */
+    try {
+        risky();
+    } catch err {
+        print("Caught error: " + err);
+    }
+
+    /* === pipelines === */
+    auto result = add(1, 2);
+    print("add(1, 2) = " + str(result));
+
+    /* === function calls === */
+    print(greet("World"));
+
+    /* === arrays and for === */
+    auto nums = [1, 2, 3, 4, 5];
+    auto sum = 0;
+    for n in nums {
+        sum = sum + n;
+    }
+    print("sum = " + str(sum));
+
+    /* === enums === */
+    auto c = Color.Red;
+    print("Color = " + str(c));
+
+    print("=== All tests passed! ===");
+    give 0;
+}

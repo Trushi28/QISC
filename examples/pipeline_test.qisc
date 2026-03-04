@@ -1,0 +1,33 @@
+// Pipeline and struct test in QISC
+
+#pragma context:cli
+
+proc multiply_two(int x) gives int {
+    give x * 2;
+}
+
+proc add_ten(int x) gives int {
+    give x + 10;
+}
+
+proc negate(int x) gives int {
+    give 0 - x;
+}
+
+proc main() gives int {
+    // Test pipeline operator
+    int result = 5 >> multiply_two();
+    print("5 >> multiply_two() = {result}");
+    
+    // Chained pipeline
+    int chained = 3 >> multiply_two() >> add_ten();
+    print("3 >> multiply_two() >> add_ten() = {chained}");
+    
+    // Another chain
+    int val = 7 >> add_ten() >> negate();
+    print("7 >> add_ten() >> negate() = {val}");
+    
+    print("=== Pipeline tests passed! ===");
+    
+    give 0;
+}

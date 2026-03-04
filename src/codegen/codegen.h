@@ -29,6 +29,18 @@ typedef struct {
   int count;
 } CgScope;
 
+/* Struct type registry */
+#define CG_MAX_STRUCTS 32
+#define CG_MAX_FIELDS 32
+
+typedef struct {
+  char *name;
+  LLVMTypeRef llvm_type;
+  char *field_names[CG_MAX_FIELDS];
+  LLVMTypeRef field_types[CG_MAX_FIELDS];
+  int field_count;
+} CgStructType;
+
 /* Code generator state */
 typedef struct {
   LLVMContextRef ctx;
@@ -57,6 +69,10 @@ typedef struct {
   /* Cached extern functions */
   LLVMValueRef fn_printf;
   LLVMValueRef fn_puts;
+
+  /* Struct type registry */
+  CgStructType structs[CG_MAX_STRUCTS];
+  int struct_count;
 
   /* Error handling */
   bool had_error;

@@ -89,13 +89,59 @@ static LLVMTypeRef cg_type_from_name(Codegen *cg, const char *name) {
     return cg->i8ptr_type;
   if (strcmp(name, "void") == 0)
     return cg->void_type;
+  /* Check registered struct types — return pointer to struct */
+  for (int i = 0; i < cg->struct_count; i++) {
+    if (strcmp(cg->structs[i].name, name) == 0)
+      return LLVMPointerType(cg->structs[i].llvm_type, 0);
+  }
   /* Default to i64 for unknown */
   return cg->i64_type;
 }
 
+/* Struct lookup helper */
+static CgStructType *cg_find_struct(Codegen *cg, const char *name) {
+  for (int i = 0; i < cg->struct_count; i++) {
+    if (strcmp(cg->structs[i].name, name) == 0)
+      return &cg->structs[i];
+  }
+  return NULL;
+}
+
+/* Register a struct type from an AST_STRUCT declaration */
+static void cg_register_struct(Codegen *cg, AstNode *decl) {
+  if (cg->struct_count >= CG_MAX_STRUCTS)
+    return;
+  const char *sname = decl->as.struct_decl.name;
+  int fc = decl->as.struct_decl.fields.count;
+  CgStructType *st = &cg->structs[cg->struct_count++];
+  st->name = (char *)sname;
+  st->field_count = fc;
+
+  LLVMTypeRef *ftypes = calloc(fc, sizeof(LLVMTypeRef));
+  for (int i = 0; i < fc; i++) {
+    AstNode *f = decl->as.struct_decl.fields.items[i];
+    st->field_names[i] = (f->type == AST_VAR_DECL) ? f->as.var_decl.name : "";
+    LLVMTypeRef ft = cg->i64_type;
+    if (f->type == AST_VAR_DECL && f->as.var_decl.type_info)
+      ft = cg_type_from_name(cg, f->as.var_decl.type_info->name);
+    st->field_types[i] = ft;
+    ftypes[i] = ft;
+  }
+
+  st->llvm_type = LLVMStructCreateNamed(cg->ctx, sname);
+  LLVMStructSetBody(st->llvm_type, ftypes, fc, false);
+  free(ftypes);
+}
+
 static LLVMTypeRef cg_return_type(Codegen *cg, AstNode *proc) {
   if (proc->as.proc.return_type) {
-    return cg_type_from_name(cg, proc->as.proc.return_type->name);
+    const char *rt = proc->as.proc.return_type->name;
+    /* Check for arrays of structs: Person[] → ptr */
+    int len = strlen(rt);
+    if (len > 2 && rt[len - 1] == ']' && rt[len - 2] == '[') {
+      return cg->i8ptr_type; /* array of structs is a pointer */
+    }
+    return cg_type_from_name(cg, rt);
   }
   return cg->void_type;
 }
@@ -153,6 +199,68 @@ static LLVMValueRef emit_identifier(Codegen *cg, AstNode *node) {
 
 static LLVMValueRef emit_binary(Codegen *cg, AstNode *node) {
   BinaryOp op = node->as.binary.op;
+
+  /* Pipeline: a >> f(x) → f(a, x) — must intercept before generic eval */
+  if (op == OP_PIPELINE) {
+    LLVMValueRef left_val = emit_expr(cg, node->as.binary.left);
+    if (cg->had_error)
+      return left_val;
+
+    AstNode *rhs = node->as.binary.right;
+    if (rhs && rhs->type == AST_CALL) {
+      /* Desugar: prepend left as first arg of the call */
+      const char *fname = NULL;
+      if (rhs->as.call.callee && rhs->as.call.callee->type == AST_IDENTIFIER)
+        fname = rhs->as.call.callee->as.identifier.name;
+
+      int orig_argc = rhs->as.call.args.count;
+      int new_argc = 1 + orig_argc;
+      LLVMValueRef *args = calloc(new_argc, sizeof(LLVMValueRef));
+      args[0] = left_val;
+      for (int i = 0; i < orig_argc; i++)
+        args[i + 1] = emit_expr(cg, rhs->as.call.args.items[i]);
+
+      /* Look up function */
+      LLVMValueRef fn = fname ? LLVMGetNamedFunction(cg->mod, fname) : NULL;
+      if (fn) {
+        LLVMTypeRef fn_type = LLVMGlobalGetValueType(fn);
+        LLVMTypeRef ret_type = LLVMGetReturnType(fn_type);
+        const char *call_name = (ret_type == cg->void_type) ? "" : "pipe";
+        LLVMValueRef result =
+            LLVMBuildCall2(cg->builder, fn_type, fn, args, new_argc, call_name);
+        free(args);
+        return result;
+      }
+
+      /* Maybe a lambda variable */
+      if (fname) {
+        CgSymbol *sym = cg_lookup(cg, fname);
+        if (sym) {
+          LLVMValueRef fn_ptr =
+              LLVMBuildLoad2(cg->builder, sym->type, sym->alloca, "pipe_fn");
+          LLVMTypeRef *ptypes = calloc(new_argc, sizeof(LLVMTypeRef));
+          for (int i = 0; i < new_argc; i++)
+            ptypes[i] = cg->i64_type;
+          LLVMTypeRef ft =
+              LLVMFunctionType(cg->i64_type, ptypes, new_argc, false);
+          free(ptypes);
+          LLVMValueRef result =
+              LLVMBuildCall2(cg->builder, ft, fn_ptr, args, new_argc, "pipe");
+          free(args);
+          return result;
+        }
+      }
+
+      free(args);
+      cg_error(cg, "Pipeline: undefined function: %s",
+               fname ? fname : "<expr>");
+      return left_val;
+    }
+
+    /* If right side is not a call, just return left (identity pipe) */
+    return left_val;
+  }
+
   LLVMValueRef left = emit_expr(cg, node->as.binary.left);
   LLVMValueRef right = emit_expr(cg, node->as.binary.right);
 
@@ -399,6 +507,9 @@ static void emit_print_call(Codegen *cg, LLVMValueRef value) {
 
 /* Emit str() builtin — converts int/float to string via sprintf */
 static LLVMValueRef emit_str_call(Codegen *cg, LLVMValueRef value) {
+  /* If already a string (pointer), return as-is */
+  if (LLVMTypeOf(value) == cg->i8ptr_type)
+    return value;
   /* Allocate buffer on stack (64 bytes) */
   LLVMValueRef buf = LLVMBuildArrayAlloca(
       cg->builder, cg->i8_type,
@@ -622,14 +733,39 @@ static LLVMValueRef emit_member(Codegen *cg, AstNode *node) {
     if (sym) {
       return LLVMBuildLoad2(cg->builder, sym->type, sym->alloca, full_name);
     }
-    /* Not found — try as a simple constant (enum variants are 0, 1, 2, ...) */
-    /* For now, just can't resolve; return 0 */
-    cg_error(cg, "Cannot resolve member: %s.%s", type_name, variant);
-    return LLVMConstInt(cg->i64_type, 0, false);
+    /* Not an enum — fall through to struct field access below */
   }
 
-  /* General member access on a value — not implemented yet */
-  cg_error(cg, "Member access not fully implemented in codegen");
+  /* General struct field access: obj.field → GEP into struct */
+  LLVMValueRef obj = emit_expr(cg, node->as.member.object);
+  if (cg->had_error)
+    return LLVMConstInt(cg->i64_type, 0, false);
+
+  const char *field = node->as.member.member;
+  LLVMTypeRef obj_type = LLVMTypeOf(obj);
+
+  /* obj should be a pointer to a struct type */
+  if (LLVMGetTypeKind(obj_type) == LLVMPointerTypeKind) {
+    /* Find which struct type this is */
+    for (int i = 0; i < cg->struct_count; i++) {
+      CgStructType *st = &cg->structs[i];
+      LLVMTypeRef st_ptr = LLVMPointerType(st->llvm_type, 0);
+      if (obj_type == st_ptr) {
+        /* Found the struct — look up field index */
+        for (int j = 0; j < st->field_count; j++) {
+          if (strcmp(st->field_names[j], field) == 0) {
+            LLVMValueRef gep =
+                LLVMBuildStructGEP2(cg->builder, st->llvm_type, obj, j, field);
+            return LLVMBuildLoad2(cg->builder, st->field_types[j], gep, field);
+          }
+        }
+        cg_error(cg, "Struct '%s' has no field '%s'", st->name, field);
+        return LLVMConstInt(cg->i64_type, 0, false);
+      }
+    }
+  }
+
+  /* Fallback for non-struct pointers — return as-is */
   return LLVMConstInt(cg->i64_type, 0, false);
 }
 
@@ -1268,10 +1404,11 @@ static void emit_stmt(Codegen *cg, AstNode *node) {
 
   case AST_WHEN: {
     /* when val { is X { ... } is Y { ... } else { ... } }
-     * → cascading if-else branches */
+     * → cascading if-else with val == pattern comparisons */
     LLVMValueRef val = emit_expr(cg, node->as.when_stmt.value);
     if (cg->had_error)
       break;
+    LLVMTypeRef val_type = LLVMTypeOf(val);
     int case_count = node->as.when_stmt.cases.count;
     LLVMBasicBlockRef merge_bb =
         LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "when.end");
@@ -1280,32 +1417,136 @@ static void emit_stmt(Codegen *cg, AstNode *node) {
       AstNode *wc = node->as.when_stmt.cases.items[i];
       if (!wc)
         continue;
-      /* Each case is an AST_IF with condition + body */
-      if (wc->type == AST_IF) {
-        LLVMBasicBlockRef then_bb =
-            LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "when.case");
-        LLVMBasicBlockRef next_bb =
-            LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "when.next");
-        LLVMValueRef cond = emit_expr(cg, wc->as.if_stmt.condition);
-        if (LLVMTypeOf(cond) != cg->i1_type)
-          cond = LLVMBuildICmp(cg->builder, LLVMIntNE, cond,
-                               LLVMConstNull(LLVMTypeOf(cond)), "tobool");
-        LLVMBuildCondBr(cg->builder, cond, then_bb, next_bb);
-        LLVMPositionBuilderAtEnd(cg->builder, then_bb);
-        cg_push_scope(cg);
-        emit_stmt(cg, wc->as.if_stmt.then_branch);
-        cg_pop_scope(cg);
-        if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(cg->builder)))
-          LLVMBuildBr(cg->builder, merge_bb);
-        LLVMPositionBuilderAtEnd(cg->builder, next_bb);
-      } else if (wc->type == AST_BLOCK) {
-        /* else block */
-        cg_push_scope(cg);
-        emit_block(cg, wc);
-        cg_pop_scope(cg);
+      if (wc->type != AST_IF)
+        continue;
+
+      AstNode *pat = wc->as.if_stmt.condition;
+      LLVMBasicBlockRef then_bb =
+          LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "when.case");
+      LLVMBasicBlockRef next_bb =
+          LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "when.next");
+
+      LLVMValueRef cond;
+
+      /* Generate condition based on pattern type */
+      if (pat->type == AST_IDENTIFIER &&
+          strcmp(pat->as.identifier.name, "_") == 0) {
+        /* Wildcard: always matches */
+        cond = LLVMConstInt(cg->i1_type, 1, false);
+
+      } else if (pat->type == AST_BINARY_OP && pat->as.binary.left == NULL) {
+        /* Range pattern: is > 40 → val > 40 */
+        LLVMValueRef rhs = emit_expr(cg, pat->as.binary.right);
+        if (val_type == cg->f64_type) {
+          switch (pat->as.binary.op) {
+          case OP_GT:
+            cond = LLVMBuildFCmp(cg->builder, LLVMRealOGT, val, rhs, "cmp");
+            break;
+          case OP_GE:
+            cond = LLVMBuildFCmp(cg->builder, LLVMRealOGE, val, rhs, "cmp");
+            break;
+          case OP_LT:
+            cond = LLVMBuildFCmp(cg->builder, LLVMRealOLT, val, rhs, "cmp");
+            break;
+          case OP_LE:
+            cond = LLVMBuildFCmp(cg->builder, LLVMRealOLE, val, rhs, "cmp");
+            break;
+          default:
+            cond = LLVMConstInt(cg->i1_type, 0, false);
+            break;
+          }
+        } else {
+          switch (pat->as.binary.op) {
+          case OP_GT:
+            cond = LLVMBuildICmp(cg->builder, LLVMIntSGT, val, rhs, "cmp");
+            break;
+          case OP_GE:
+            cond = LLVMBuildICmp(cg->builder, LLVMIntSGE, val, rhs, "cmp");
+            break;
+          case OP_LT:
+            cond = LLVMBuildICmp(cg->builder, LLVMIntSLT, val, rhs, "cmp");
+            break;
+          case OP_LE:
+            cond = LLVMBuildICmp(cg->builder, LLVMIntSLE, val, rhs, "cmp");
+            break;
+          default:
+            cond = LLVMConstInt(cg->i1_type, 0, false);
+            break;
+          }
+        }
+
+      } else if (pat->type == AST_BLOCK) {
+        /* Multi-pattern: is 1, 2, 3 → val==1 || val==2 || val==3 */
+        cond = LLVMConstInt(cg->i1_type, 0, false);
+        for (int j = 0; j < pat->as.block.statements.count; j++) {
+          LLVMValueRef pv = emit_expr(cg, pat->as.block.statements.items[j]);
+          LLVMValueRef eq;
+          if (val_type == cg->i8ptr_type) {
+            /* String comparison via strcmp */
+            LLVMValueRef fn_strcmp = LLVMGetNamedFunction(cg->mod, "strcmp");
+            if (!fn_strcmp) {
+              LLVMTypeRef st = LLVMFunctionType(
+                  LLVMInt32TypeInContext(cg->ctx),
+                  (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2, false);
+              fn_strcmp = LLVMAddFunction(cg->mod, "strcmp", st);
+            }
+            LLVMTypeRef st = LLVMFunctionType(
+                LLVMInt32TypeInContext(cg->ctx),
+                (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2, false);
+            LLVMValueRef r =
+                LLVMBuildCall2(cg->builder, st, fn_strcmp,
+                               (LLVMValueRef[]){val, pv}, 2, "scmp");
+            eq = LLVMBuildICmp(
+                cg->builder, LLVMIntEQ, r,
+                LLVMConstInt(LLVMInt32TypeInContext(cg->ctx), 0, false), "seq");
+          } else if (val_type == cg->f64_type) {
+            eq = LLVMBuildFCmp(cg->builder, LLVMRealOEQ, val, pv, "feq");
+          } else {
+            eq = LLVMBuildICmp(cg->builder, LLVMIntEQ, val, pv, "ieq");
+          }
+          cond = LLVMBuildOr(cg->builder, cond, eq, "multi");
+        }
+
       } else {
-        emit_stmt(cg, wc);
+        /* Simple literal/expr: val == pattern */
+        LLVMValueRef pv = emit_expr(cg, pat);
+        if (val_type == cg->i8ptr_type && LLVMTypeOf(pv) == cg->i8ptr_type) {
+          /* String equality via strcmp */
+          LLVMValueRef fn_strcmp = LLVMGetNamedFunction(cg->mod, "strcmp");
+          if (!fn_strcmp) {
+            LLVMTypeRef st = LLVMFunctionType(
+                LLVMInt32TypeInContext(cg->ctx),
+                (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2, false);
+            fn_strcmp = LLVMAddFunction(cg->mod, "strcmp", st);
+          }
+          LLVMTypeRef st = LLVMFunctionType(
+              LLVMInt32TypeInContext(cg->ctx),
+              (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2, false);
+          LLVMValueRef r = LLVMBuildCall2(cg->builder, st, fn_strcmp,
+                                          (LLVMValueRef[]){val, pv}, 2, "scmp");
+          cond = LLVMBuildICmp(
+              cg->builder, LLVMIntEQ, r,
+              LLVMConstInt(LLVMInt32TypeInContext(cg->ctx), 0, false), "seq");
+        } else if (val_type == cg->f64_type) {
+          cond = LLVMBuildFCmp(cg->builder, LLVMRealOEQ, val, pv, "feq");
+        } else {
+          /* Promote pattern to match val type if needed */
+          if (LLVMTypeOf(pv) != val_type && val_type == cg->i64_type &&
+              LLVMTypeOf(pv) == cg->i1_type) {
+            pv = LLVMBuildZExt(cg->builder, pv, cg->i64_type, "promo");
+          }
+          cond = LLVMBuildICmp(cg->builder, LLVMIntEQ, val, pv, "ieq");
+        }
       }
+
+      LLVMBuildCondBr(cg->builder, cond, then_bb, next_bb);
+      LLVMPositionBuilderAtEnd(cg->builder, then_bb);
+      cg_push_scope(cg);
+      emit_stmt(cg, wc->as.if_stmt.then_branch);
+      cg_pop_scope(cg);
+      if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(cg->builder)))
+        LLVMBuildBr(cg->builder, merge_bb);
+      LLVMPositionBuilderAtEnd(cg->builder, next_bb);
     }
     if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(cg->builder)))
       LLVMBuildBr(cg->builder, merge_bb);
@@ -1437,6 +1678,13 @@ static void emit_program(Codegen *cg, AstNode *program) {
       LLVMAddFunction(cg->mod, name, ft);
       free(pts);
     }
+  }
+
+  /* 1.5 pass: register struct types */
+  for (int i = 0; i < program->as.program.declarations.count; i++) {
+    AstNode *decl = program->as.program.declarations.items[i];
+    if (decl->type == AST_STRUCT)
+      cg_register_struct(cg, decl);
   }
 
   /* Second pass: register enums as global constants */

@@ -430,6 +430,25 @@ static Value eval_binary(Interpreter *interp, AstNode *node) {
         }
         return acc;
       }
+      /* General user-function pipeline: a >> fn(args) → fn(a, args) */
+      Value *fn_ptr = env_get(interp->current, fn_name);
+      if (fn_ptr && fn_ptr->type == VAL_PROC) {
+        int orig_argc = rhs->as.call.args.count;
+        int new_argc = 1 + orig_argc;
+        Value *call_args = malloc(new_argc * sizeof(Value));
+        call_args[0] = left;
+        for (int i = 0; i < orig_argc; i++) {
+          call_args[i + 1] = evaluate(interp, rhs->as.call.args.items[i]);
+          if (interp->had_error) {
+            free(call_args);
+            return left;
+          }
+        }
+        Value result = call_value(interp, fn_ptr, call_args, new_argc);
+        free(call_args);
+        return result;
+      }
+      interp->had_error = false; /* clear any lookup error */
     }
 
     /* Default pipeline: evaluate right and return it */
@@ -1407,8 +1426,9 @@ static void execute(Interpreter *interp, AstNode *node) {
       interp->had_error = false;
       interp->error_message[0] = '\0';
 
-      /* Execute first catch block */
-      AstNode *catch_node = node->as.try_stmt.catches.items[0];
+      /* Use the last catch block (catch-all: catch any e) */
+      int ci = node->as.try_stmt.catches.count - 1;
+      AstNode *catch_node = node->as.try_stmt.catches.items[ci];
       /* condition holds the error variable name */
       const char *err_var =
           catch_node->as.if_stmt.condition->as.identifier.name;

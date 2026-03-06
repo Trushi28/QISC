@@ -1,0 +1,26 @@
+// Struct test in QISC
+
+#pragma context:cli
+
+struct Point {
+    int x;
+    int y;
+}
+
+proc make_point(int x, int y) gives Point {
+    give Point { x: x, y: y };
+}
+
+proc main() gives int {
+    auto p = Point { x: 10, y: 20 };
+    print("Point: ({p.x}, {p.y})");
+    
+    auto q = make_point(3, 7);
+    print("make_point(3,7) = ({q.x}, {q.y})");
+    
+    int sum = p.x + p.y + q.x + q.y;
+    print("Sum of all coords = {sum}");
+    
+    print("=== Struct tests passed! ===");
+    give 0;
+}

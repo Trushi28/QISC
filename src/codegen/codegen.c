@@ -876,9 +876,48 @@ static LLVMValueRef emit_expr(Codegen *cg, AstNode *node) {
     if (node->as.binary.left)
       return emit_expr(cg, node->as.binary.left);
     return LLVMConstInt(cg->i64_type, 0, false);
-  case AST_STRUCT_LITERAL:
-    /* Struct literal: for now, return 0 */
-    return LLVMConstInt(cg->i64_type, 0, false);
+  case AST_STRUCT_LITERAL: {
+    /* Struct literal: Person { name: "Alice", age: 30 } */
+    const char *sname = node->as.struct_decl.name;
+    CgStructType *st = cg_find_struct(cg, sname);
+    if (!st) {
+      cg_error(cg, "Unknown struct type: %s", sname);
+      return LLVMConstInt(cg->i64_type, 0, false);
+    }
+    /* Malloc the struct */
+    LLVMValueRef struct_size = LLVMSizeOf(st->llvm_type);
+    LLVMValueRef fn_malloc = LLVMGetNamedFunction(cg->mod, "malloc");
+    if (!fn_malloc) {
+      LLVMTypeRef mt = LLVMFunctionType(
+          cg->i8ptr_type, (LLVMTypeRef[]){cg->i64_type}, 1, false);
+      fn_malloc = LLVMAddFunction(cg->mod, "malloc", mt);
+    }
+    LLVMTypeRef mt = LLVMFunctionType(cg->i8ptr_type,
+                                      (LLVMTypeRef[]){cg->i64_type}, 1, false);
+    LLVMValueRef raw = LLVMBuildCall2(cg->builder, mt, fn_malloc, &struct_size,
+                                      1, "struct_raw");
+    LLVMTypeRef st_ptr_type = LLVMPointerType(st->llvm_type, 0);
+    LLVMValueRef ptr = LLVMBuildBitCast(cg->builder, raw, st_ptr_type, sname);
+
+    /* Store each field */
+    for (int i = 0; i < node->as.struct_decl.fields.count; i++) {
+      AstNode *fa = node->as.struct_decl.fields.items[i];
+      if (fa->type != AST_ASSIGN || !fa->as.assign.target)
+        continue;
+      const char *fname = fa->as.assign.target->as.identifier.name;
+      /* Find field index */
+      for (int j = 0; j < st->field_count; j++) {
+        if (strcmp(st->field_names[j], fname) == 0) {
+          LLVMValueRef fval = emit_expr(cg, fa->as.assign.value);
+          LLVMValueRef gep =
+              LLVMBuildStructGEP2(cg->builder, st->llvm_type, ptr, j, fname);
+          LLVMBuildStore(cg->builder, fval, gep);
+          break;
+        }
+      }
+    }
+    return ptr;
+  }
   default:
     cg_error(cg, "Cannot emit expression for node type: %d", node->type);
     return LLVMConstInt(cg->i64_type, 0, false);

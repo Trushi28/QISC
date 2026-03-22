@@ -366,20 +366,51 @@ static AstNode *parse_interpolated_string(Parser *parser, const char *str,
 
       /* Find closing } */
       int end = i + 1;
-      while (end < len && str[end] != '}')
-        end++;
+      int depth = 1;
+      while (end < len && depth > 0) {
+        if (str[end] == '{') depth++;
+        else if (str[end] == '}') depth--;
+        if (depth > 0) end++;
+      }
 
-      /* Extract variable name */
-      int var_len = end - i - 1;
-      char *var_name = malloc(var_len + 1);
-      memcpy(var_name, str + i + 1, var_len);
-      var_name[var_len] = '\0';
+      /* Extract expression text between { and } */
+      int expr_len = end - i - 1;
+      char *expr_text = malloc(expr_len + 1);
+      memcpy(expr_text, str + i + 1, expr_len);
+      expr_text[expr_len] = '\0';
 
-      /* Create call to str(var) for conversion */
-      AstNode *ident = ast_new_identifier(var_name, line, col);
+      /* Parse the expression text as a dotted identifier chain.
+       * For "p.x" → AST_MEMBER(AST_IDENTIFIER("p"), "x")
+       * For "a.b.c" → AST_MEMBER(AST_MEMBER(AST_IDENTIFIER("a"), "b"), "c")
+       * For "name" → AST_IDENTIFIER("name")
+       */
+      AstNode *expr_node = NULL;
+      char *expr_copy = strdup(expr_text);
+      char *saveptr = NULL;
+      char *part = strtok_r(expr_copy, ".", &saveptr);
+      while (part != NULL) {
+        /* Trim any whitespace */
+        while (*part == ' ') part++;
+        char *pend = part + strlen(part) - 1;
+        while (pend > part && *pend == ' ') *pend-- = '\0';
+
+        if (expr_node == NULL) {
+          expr_node = ast_new_identifier(strdup(part), line, col);
+        } else {
+          expr_node = ast_alloc_member(expr_node, strdup(part), line, col);
+        }
+        part = strtok_r(NULL, ".", &saveptr);
+      }
+      free(expr_copy);
+      free(expr_text);
+
+      if (!expr_node)
+        expr_node = ast_new_identifier(strdup(""), line, col);
+
+      /* Create call to str(expr) for conversion */
       AstNode *str_call =
           ast_new_call(ast_new_identifier("str", line, col), line, col);
-      ast_array_push(&str_call->as.call.args, ident);
+      ast_array_push(&str_call->as.call.args, expr_node);
 
       if (!result)
         result = str_call;

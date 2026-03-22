@@ -1695,7 +1695,15 @@ static void emit_program(Codegen *cg, AstNode *program) {
   if (!program || program->type != AST_PROGRAM)
     return;
 
-  /* First pass: declare all functions (forward declarations) */
+  /* Pass 1: register struct types (must come before function declarations
+   * so that return types like `gives Point` can resolve to struct pointers) */
+  for (int i = 0; i < program->as.program.declarations.count; i++) {
+    AstNode *decl = program->as.program.declarations.items[i];
+    if (decl->type == AST_STRUCT)
+      cg_register_struct(cg, decl);
+  }
+
+  /* Pass 2: declare all functions (forward declarations) */
   for (int i = 0; i < program->as.program.declarations.count; i++) {
     AstNode *decl = program->as.program.declarations.items[i];
     if (decl->type == AST_PROC) {
@@ -1719,11 +1727,40 @@ static void emit_program(Codegen *cg, AstNode *program) {
     }
   }
 
-  /* 1.5 pass: register struct types */
+  /* 1.7 pass: forward-declare extend block methods */
   for (int i = 0; i < program->as.program.declarations.count; i++) {
     AstNode *decl = program->as.program.declarations.items[i];
-    if (decl->type == AST_STRUCT)
-      cg_register_struct(cg, decl);
+    if (decl->type == AST_EXTEND) {
+      const char *type_name = decl->as.extend_decl.type_name;
+      for (int m = 0; m < decl->as.extend_decl.methods.count; m++) {
+        AstNode *method = decl->as.extend_decl.methods.items[m];
+        if (method->type != AST_PROC)
+          continue;
+        /* Mangle name: TypeName__method_name */
+        char mangled[256];
+        snprintf(mangled, sizeof(mangled), "%s__%s", type_name,
+                 method->as.proc.name);
+        int pc = method->as.proc.params.count;
+        LLVMTypeRef ret = cg_return_type(cg, method);
+        LLVMTypeRef *pts = calloc(pc, sizeof(LLVMTypeRef));
+        for (int j = 0; j < pc; j++) {
+          AstNode *p = method->as.proc.params.items[j];
+          if (p->type == AST_VAR_DECL && p->as.var_decl.name &&
+              strcmp(p->as.var_decl.name, "self") == 0) {
+            /* self parameter: pointer to struct type */
+            CgStructType *st = cg_find_struct(cg, type_name);
+            pts[j] = st ? LLVMPointerType(st->llvm_type, 0) : cg->i64_type;
+          } else if (p->type == AST_VAR_DECL && p->as.var_decl.type_info) {
+            pts[j] = cg_type_from_name(cg, p->as.var_decl.type_info->name);
+          } else {
+            pts[j] = cg->i64_type;
+          }
+        }
+        LLVMTypeRef ft = LLVMFunctionType(ret, pts, pc, false);
+        LLVMAddFunction(cg->mod, mangled, ft);
+        free(pts);
+      }
+    }
   }
 
   /* Second pass: register enums as global constants */
@@ -1748,14 +1785,27 @@ static void emit_program(Codegen *cg, AstNode *program) {
     }
   }
 
-  /* Third pass: emit all procedure bodies */
+  /* Third pass: emit all procedure bodies (including extend methods) */
   for (int i = 0; i < program->as.program.declarations.count; i++) {
     AstNode *decl = program->as.program.declarations.items[i];
     if (decl->type == AST_PROC) {
       emit_proc(cg, decl);
+    } else if (decl->type == AST_EXTEND) {
+      /* Emit extend method bodies with mangled names */
+      const char *type_name = decl->as.extend_decl.type_name;
+      for (int m = 0; m < decl->as.extend_decl.methods.count; m++) {
+        AstNode *method = decl->as.extend_decl.methods.items[m];
+        if (method->type != AST_PROC)
+          continue;
+        /* Temporarily rename proc for emission with mangled name */
+        char *orig_name = method->as.proc.name;
+        char mangled[256];
+        snprintf(mangled, sizeof(mangled), "%s__%s", type_name, orig_name);
+        method->as.proc.name = mangled;
+        emit_proc(cg, method);
+        method->as.proc.name = orig_name; /* Restore original */
+      }
     }
-    /* Non-proc top-level nodes (enum, struct, extend, module, import, pragma)
-     * are registered above or are no-ops */
     if (cg->had_error)
       return;
   }

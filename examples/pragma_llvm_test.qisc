@@ -1,0 +1,47 @@
+/* QISC Pragma LLVM Integration Test
+ * Tests that pragmas actually affect LLVM IR generation
+ */
+
+#pragma context:server
+#pragma optimize:throughput
+
+proc hot_function(int x) gives int {
+    give x * 2;
+}
+
+#pragma cold_path
+proc cold_function(int x) gives int {
+    give x + 1;
+}
+
+#pragma context:cli
+#pragma optimize:size
+proc small_function(int x) gives int {
+    give x - 1;
+}
+
+#pragma context:embedded
+#pragma inline:never
+proc no_inline_function(int x) gives int {
+    give x * x;
+}
+
+#pragma vectorize:auto
+proc loop_function(int limit) gives int {
+    int sum = 0;
+    for int i = 0; i < limit; i++ {
+        sum = sum + i;
+    }
+    give sum;
+}
+
+proc main() gives int {
+    int a = hot_function(5);
+    int b = cold_function(5);
+    int c = small_function(5);
+    int d = no_inline_function(5);
+    int e = loop_function(10);
+    
+    print("hot: {a}, cold: {b}, small: {c}, noinline: {d}, loop: {e}");
+    give 0;
+}

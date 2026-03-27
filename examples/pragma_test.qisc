@@ -1,0 +1,48 @@
+/* QISC Extended Pragma Test
+ * Tests: hot_path, cold_path, profile directives, parallel, bounds_check, memoize
+ */
+
+#pragma context:server
+#pragma optimize:throughput
+#pragma inline:always
+#pragma vectorize:auto
+
+/* Profile directives */
+#pragma hot_path
+#pragma profile:this
+
+/* Behavior directives */
+#pragma parallel:auto
+#pragma memoize:auto
+
+/* This should print a warning */
+#pragma bounds_check:off
+
+/* Cold path test */
+#pragma cold_path
+#pragma profile:ignore
+
+proc fibonacci(int n) gives int {
+    if n <= 1 {
+        give n;
+    }
+    give fibonacci(n - 1) + fibonacci(n - 2);
+}
+
+proc compute_sum(int limit) gives int {
+    int total = 0;
+    for int i = 0; i < limit; i++ {
+        total = total + i;
+    }
+    give total;
+}
+
+proc main() gives int {
+    int fib_result = fibonacci(10);
+    int sum_result = compute_sum(100);
+    
+    print("Fibonacci(10) = {fib_result}");
+    print("Sum(0..99) = {sum_result}");
+    
+    give 0;
+}

@@ -6,55 +6,78 @@
 struct Config {
     string host;
     int port;
-    string database;
 }
 
 // A function that can fail uses 'canfail'
-proc read_config(string path) gives Config canfail {
-    if !file_exists(path) {
-        fail FileNotFound(path);
+proc load_config(int which) gives Config canfail {
+    if which < 0 {
+        fail "Invalid config index";
     }
     
-    auto content = read_file(path)!;  // ! propagates failure
-    auto config = parse_json(content)!;
+    if which == 0 {
+        give Config { host: "localhost", port: 8080 };
+    }
+    if which == 1 {
+        give Config { host: "prod.example.com", port: 443 };
+    }
     
-    give Config {
-        host: config["host"],
-        port: config["port"],
-        database: config["database"],
-    };
+    fail "Unknown config";
 }
 
-proc connect_database(Config cfg) gives Connection canfail {
-    auto conn = db_connect(cfg.host, cfg.port, cfg.database)!;
-    give conn;
+// Function that propagates failures
+proc connect(Config cfg) gives int canfail {
+    if cfg.port < 1 {
+        fail "Invalid port";
+    }
+    if cfg.port > 65535 {
+        fail "Port out of range";
+    }
+    
+    print("Connecting to {cfg.host}:{cfg.port}");
+    give 1;
+}
+
+proc disconnect(int handle) gives int {
+    print("Disconnecting handle {handle}");
+    give 0;
 }
 
 proc main() gives int {
-    // Try block to handle potential failures
+    // Test 1: Valid config
+    print("=== Test 1: Valid config ===");
     try {
-        auto config = read_config("config.json")!;
-        print("Loaded config: {config.host}:{config.port}");
+        auto config = load_config(0)!;
+        print("Config loaded: port={config.port}");
         
-        auto conn = connect_database(config)!;
-        print("Connected to database!");
-        
-        // Do work...
-        conn.close();
-        
-        give 0;
-        
-    } catch FileNotFound e {
-        print("Config file not found: {e.path}");
-        print("Please create a config.json file");
-        give 1;
-        
-    } catch DbConnectionError e {
-        print("Failed to connect to database: {e.message}");
-        give 2;
-        
-    } catch any e {
+        auto conn = connect(config)!;
+        print("Connected with handle {conn}");
+        disconnect(conn);
+        print("Test 1 passed");
+    } catch e {
         print("Unexpected error: {e}");
-        give 99;
     }
+    
+    // Test 2: Invalid config index
+    print("");
+    print("=== Test 2: Invalid index ===");
+    try {
+        auto config = load_config(-1)!;
+        print("Should not reach here");
+    } catch e {
+        print("Caught expected error: {e}");
+    }
+    
+    // Test 3: Unknown config
+    print("");
+    print("=== Test 3: Unknown config ===");
+    try {
+        auto config = load_config(5)!;
+        print("Should not reach here");
+    } catch e {
+        print("Caught expected error: {e}");
+    }
+    
+    print("");
+    print("=== All error handling tests passed ===");
+    give 0;
 }

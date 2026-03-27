@@ -737,6 +737,26 @@ static Value eval_call(Interpreter *interp, AstNode *node) {
       } else {
         result = argc > 0 ? args[0] : value_none();
       }
+    } else if (strcmp(name, "range") == 0) {
+      if (argc >= 2 && args[0].type == VAL_INT && args[1].type == VAL_INT) {
+        int64_t start = args[0].as.int_val;
+        int64_t end = args[1].as.int_val;
+        int64_t count = end - start;
+        if (count < 0)
+          count = 0;
+
+        Value arr = {.type = VAL_ARRAY};
+        arr.as.array_val.count = (int)count;
+        arr.as.array_val.capacity = (int)count;
+        arr.as.array_val.items =
+            count > 0 ? malloc(count * sizeof(Value)) : NULL;
+        for (int64_t i = 0; i < count; i++) {
+          arr.as.array_val.items[i] = value_int(start + i);
+        }
+        result = arr;
+      } else {
+        result = value_none();
+      }
     } else if (strcmp(name, "typeof") == 0) {
       if (argc >= 1) {
         const char *tname = "unknown";

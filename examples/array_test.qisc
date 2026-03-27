@@ -1,0 +1,37 @@
+/* Test array runtime with length tracking */
+
+#pragma context:cli
+
+proc main() gives int {
+    // Test 1: Array literal with len()
+    int[] arr = [10, 20, 30, 40, 50];
+    print("Array literal test:");
+    print("Expected length: 5");
+    int arr_len = len(arr);
+    print("Actual length: {arr_len}");
+    
+    // Test 2: Array element access
+    int e0 = arr[0];
+    int e2 = arr[2];
+    int e4 = arr[4];
+    print("Element at index 0: {e0}");
+    print("Element at index 2: {e2}");
+    print("Element at index 4: {e4}");
+    
+    // Test 3: range() with len()
+    int[] r = range(0, 10);
+    int r_len = len(r);
+    print("Range(0, 10) test:");
+    print("Expected length: 10");
+    print("Actual length: {r_len}");
+    
+    // Test 4: Single element array
+    int[] small = [42];
+    int small_len = len(small);
+    print("Single element array:");
+    print("Expected length: 1");
+    print("Actual length: {small_len}");
+    
+    print("All tests completed!");
+    give 0;
+}

@@ -64,6 +64,7 @@ typedef struct {
   bool collect_profile;
   bool use_profile;
   bool converge;
+  bool competitive;     /* Enable competitive mode */
   const char *profile_path;
   int optimization_level; /* 0-3 */
 } QiscOptions;

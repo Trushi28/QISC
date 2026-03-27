@@ -1,0 +1,25 @@
+// Simple error handling example
+#pragma context:cli
+
+proc divide(int a, int b) gives int canfail {
+    if b == 0 {
+        fail "Division by zero";
+    }
+    give a / b;
+}
+
+proc main() gives int {
+    // Test error handling
+    try {
+        int result = divide(10, 2)!;
+        print("10 / 2 = {result}");
+        
+        int bad = divide(10, 0)!;
+        print("Should not reach here");
+    } catch e {
+        print("Caught error: {e}");
+    }
+    
+    print("Error handling works!");
+    give 0;
+}

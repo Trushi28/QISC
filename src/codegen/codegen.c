@@ -6,6 +6,8 @@
  */
 
 #include "codegen.h"
+#include "../personality/easter_eggs.h"
+#include "../pragma/pragma.h"
 #include "qisc.h"
 #include <llvm-c/Analysis.h>
 #include <llvm-c/Core.h>
@@ -15,6 +17,298 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+/* ======== Debug Personality System ======== */
+
+/* Debug-only messages for curious debugger users */
+static const char *debug_only_messages[] = {
+    "If you're reading this in a debugger, hi!",
+    "Breakpoint here means you're curious. I respect that.",
+    "This variable changed. Suspicious.",
+    "Stack trace leads back to here. Good luck!",
+    "You found the secret debug message. Achievement unlocked!",
+    "Debugging at 3 AM? We've all been there.",
+    "The bug is always in the last place you look.",
+    "Have you tried turning it off and on again?",
+};
+
+/* Debug section comments for various contexts */
+static const char *debug_section_comments[] = {
+    "; Here be dragons (and also your variables)",
+    "; Stack frame - handle with care",
+    "; Local variables - they grow up so fast",
+    "; Return address - one way ticket home",
+    "; Function prologue - setting up shop",
+    "; Function epilogue - packing up to leave",
+    "; Loop body - round and round we go",
+    "; Branch taken - the road less traveled",
+};
+
+/* Generate funny symbol suffix for cryptic mode */
+static const char *funny_symbol_suffix(const char *func_name) {
+    static char buffer[256];
+    
+    if (!func_name) return "";
+    
+    if (strcmp(func_name, "main") == 0) {
+        snprintf(buffer, sizeof(buffer), 
+                 "main ; The adventure begins here");
+        return buffer;
+    }
+    if (strstr(func_name, "sort")) {
+        snprintf(buffer, sizeof(buffer), 
+                 "%s ; In theory, O(n log n). In practice, O(coffee)", func_name);
+        return buffer;
+    }
+    if (strstr(func_name, "loop") || strstr(func_name, "Loop")) {
+        snprintf(buffer, sizeof(buffer), 
+                 "%s ; Loop-de-loop", func_name);
+        return buffer;
+    }
+    if (strstr(func_name, "init") || strstr(func_name, "Init")) {
+        snprintf(buffer, sizeof(buffer),
+                 "%s ; Once upon a time...", func_name);
+        return buffer;
+    }
+    if (strstr(func_name, "parse") || strstr(func_name, "Parse")) {
+        snprintf(buffer, sizeof(buffer),
+                 "%s ; Making sense of chaos", func_name);
+        return buffer;
+    }
+    if (strstr(func_name, "error") || strstr(func_name, "Error")) {
+        snprintf(buffer, sizeof(buffer),
+                 "%s ; This is fine (narrator: it was not fine)", func_name);
+        return buffer;
+    }
+    if (strstr(func_name, "free") || strstr(func_name, "Free") ||
+        strstr(func_name, "cleanup") || strstr(func_name, "Cleanup")) {
+        snprintf(buffer, sizeof(buffer),
+                 "%s ; Farewell, memory. You served us well.", func_name);
+        return buffer;
+    }
+    if (strstr(func_name, "test") || strstr(func_name, "Test")) {
+        snprintf(buffer, sizeof(buffer),
+                 "%s ; Trust, but verify", func_name);
+        return buffer;
+    }
+    if (strstr(func_name, "calc") || strstr(func_name, "Calc") ||
+        strstr(func_name, "compute") || strstr(func_name, "Compute")) {
+        snprintf(buffer, sizeof(buffer),
+                 "%s ; Math is math, until it's a bug", func_name);
+        return buffer;
+    }
+    if (strstr(func_name, "print") || strstr(func_name, "Print") ||
+        strstr(func_name, "log") || strstr(func_name, "Log")) {
+        snprintf(buffer, sizeof(buffer),
+                 "%s ; Shouting into the void", func_name);
+        return buffer;
+    }
+    if (strstr(func_name, "read") || strstr(func_name, "Read") ||
+        strstr(func_name, "load") || strstr(func_name, "Load")) {
+        snprintf(buffer, sizeof(buffer),
+                 "%s ; Absorbing knowledge", func_name);
+        return buffer;
+    }
+    if (strstr(func_name, "write") || strstr(func_name, "Write") ||
+        strstr(func_name, "save") || strstr(func_name, "Save")) {
+        snprintf(buffer, sizeof(buffer),
+                 "%s ; Committing to permanent record", func_name);
+        return buffer;
+    }
+    
+    return func_name;
+}
+
+/* Get debug section comment based on section type */
+static const char *get_section_comment(int section_type) {
+    if (section_type < 0 || section_type >= 8) {
+        return "; Unknown territory - proceed with caution";
+    }
+    return debug_section_comments[section_type];
+}
+
+/* Get random debug message for curious debuggers */
+static const char *get_debug_easter_egg(void) {
+    static bool seeded = false;
+    if (!seeded) {
+        srand((unsigned int)time(NULL));
+        seeded = true;
+    }
+    int idx = rand() % (sizeof(debug_only_messages) / sizeof(debug_only_messages[0]));
+    return debug_only_messages[idx];
+}
+
+/* Add debug personality comment as module-level metadata */
+static void add_debug_personality_comment(Codegen *cg, const char *section, int section_type) {
+    if (!cg || !cg->debug_personality_enabled) return;
+    
+    char comment[512];
+    const char *section_comment = get_section_comment(section_type);
+    snprintf(comment, sizeof(comment), "%s\n%s", section, section_comment);
+    
+    LLVMValueRef md_string = LLVMMDStringInContext(cg->ctx, comment, strlen(comment));
+    LLVMValueRef md_node = LLVMMDNodeInContext(cg->ctx, &md_string, 1);
+    LLVMAddNamedMetadataOperand(cg->mod, "qisc.debug.comments", md_node);
+}
+
+/* Add compilation metadata with personality */
+static void add_compilation_metadata(Codegen *cg) {
+    if (!cg) return;
+    
+    char metadata[1024];
+    time_t now = time(NULL);
+    char *time_str = ctime(&now);
+    if (time_str) {
+        time_str[strlen(time_str) - 1] = '\0';  /* Remove trailing newline */
+    }
+    
+    bool cryptic = (cg->personality == QISC_PERSONALITY_CRYPTIC);
+    int easter_eggs = cryptic ? (rand() % 10 + 1) : 0;
+    
+    const char *mood;
+    switch (cg->personality) {
+        case QISC_PERSONALITY_CRYPTIC:  mood = "Mysterious"; break;
+        case QISC_PERSONALITY_SNARKY:   mood = "Witty"; break;
+        case QISC_PERSONALITY_SAGE:     mood = "Contemplative"; break;
+        case QISC_PERSONALITY_FRIENDLY: mood = "Cheerful"; break;
+        case QISC_PERSONALITY_MINIMAL:  mood = "Focused"; break;
+        default:                        mood = "Professional"; break;
+    }
+    
+    snprintf(metadata, sizeof(metadata),
+        "============================================\n"
+        "Compiled by QISC v%s\n"
+        "Date: %s\n"
+        "Mood: %s\n"
+        "Optimizations applied: %d\n"
+        "Warnings ignored: 0 (we take those seriously)\n"
+        "Easter eggs hidden: %d\n"
+        "============================================",
+        QISC_VERSION_STRING,
+        time_str ? time_str : "unknown",
+        mood,
+        cg->optimization_count,
+        easter_eggs
+    );
+    
+    LLVMValueRef md_string = LLVMMDStringInContext(cg->ctx, metadata, strlen(metadata));
+    LLVMValueRef md_node = LLVMMDNodeInContext(cg->ctx, &md_string, 1);
+    LLVMAddNamedMetadataOperand(cg->mod, "qisc.metadata", md_node);
+}
+
+/* Add line number personality notes as metadata */
+static void add_line_personality(Codegen *cg, int line) {
+    if (!cg || !cg->debug_personality_enabled) return;
+    if (cg->personality != QISC_PERSONALITY_CRYPTIC &&
+        cg->personality != QISC_PERSONALITY_SNARKY) return;
+    
+    const char *note = NULL;
+    char note_buf[256];
+    
+    if (line == 42) {
+        note = "Line 42 - The Answer to Life, the Universe, and Everything";
+    } else if (line == 404) {
+        note = "Line 404 - Hope this code is found";
+    } else if (line == 500) {
+        note = "Line 500 - Internal server error vibes";
+    } else if (line == 418) {
+        note = "Line 418 - I'm a teapot (RFC 2324)";
+    } else if (line == 666) {
+        note = "Line 666 - The number of the beast... function";
+    } else if (line == 1337) {
+        note = "Line 1337 - L33t code detected";
+    } else if (line == 80) {
+        note = "Line 80 - Classic column limit. Respect.";
+    } else if (line == 100) {
+        note = "Line 100 - A century of code";
+    } else if (line == 200) {
+        note = "Line 200 - OK (HTTP would be proud)";
+    } else if (line == 256) {
+        note = "Line 256 - A byte's worth of lines";
+    } else if (line == 512) {
+        note = "Line 512 - Half a kilobyte of lines";
+    } else if (line == 1024) {
+        note = "Line 1024 - A kilobyte of code lines";
+    } else if (line % 100 == 0 && line > 0) {
+        snprintf(note_buf, sizeof(note_buf), "Line %d - Milestone reached!", line);
+        note = note_buf;
+    }
+    
+    if (note) {
+        LLVMValueRef md_string = LLVMMDStringInContext(cg->ctx, note, strlen(note));
+        LLVMValueRef md_node = LLVMMDNodeInContext(cg->ctx, &md_string, 1);
+        LLVMAddNamedMetadataOperand(cg->mod, "qisc.debug.line_notes", md_node);
+    }
+}
+
+/* Add function entry/exit debug comments */
+static void add_function_debug_comments(Codegen *cg, LLVMValueRef func, const char *name) {
+    if (!cg || !cg->debug_personality_enabled) return;
+    if (cg->personality != QISC_PERSONALITY_CRYPTIC &&
+        cg->personality != QISC_PERSONALITY_SNARKY) return;
+    
+    char entry_comment[512];
+    char exit_comment[512];
+    
+    /* Get funny symbol name for cryptic mode */
+    const char *funny_name = (cg->personality == QISC_PERSONALITY_CRYPTIC) 
+                             ? funny_symbol_suffix(name) : name;
+    
+    /* Entry comment */
+    if (cg->personality == QISC_PERSONALITY_CRYPTIC) {
+        snprintf(entry_comment, sizeof(entry_comment),
+                 "Function '%s' checking in. Ready to compute. | %s",
+                 name, get_debug_easter_egg());
+    } else {
+        snprintf(entry_comment, sizeof(entry_comment),
+                 "Entering function '%s'. Let's see what happens.", name);
+    }
+    
+    /* Exit comment */
+    snprintf(exit_comment, sizeof(exit_comment),
+             "%s signing off. Mission accomplished (probably).", name);
+    
+    /* Add as function-level metadata */
+    LLVMValueRef entry_md = LLVMMDStringInContext(cg->ctx, entry_comment, strlen(entry_comment));
+    LLVMValueRef exit_md = LLVMMDStringInContext(cg->ctx, exit_comment, strlen(exit_comment));
+    LLVMValueRef funny_md = LLVMMDStringInContext(cg->ctx, funny_name, strlen(funny_name));
+    
+    LLVMValueRef entry_node = LLVMMDNodeInContext(cg->ctx, &entry_md, 1);
+    LLVMValueRef exit_node = LLVMMDNodeInContext(cg->ctx, &exit_md, 1);
+    LLVMValueRef funny_node = LLVMMDNodeInContext(cg->ctx, &funny_md, 1);
+    
+    /* Attach metadata to function */
+    unsigned entry_kind = LLVMGetMDKindIDInContext(cg->ctx, "qisc.fn.entry", 14);
+    unsigned exit_kind = LLVMGetMDKindIDInContext(cg->ctx, "qisc.fn.exit", 12);
+    unsigned symbol_kind = LLVMGetMDKindIDInContext(cg->ctx, "qisc.fn.symbol", 14);
+    
+    LLVMSetMetadata(func, entry_kind, entry_node);
+    LLVMSetMetadata(func, exit_kind, exit_node);
+    LLVMSetMetadata(func, symbol_kind, funny_node);
+}
+
+/* Add debug-only global string (visible in debugger) */
+static void add_debug_easter_egg_string(Codegen *cg) {
+    if (!cg || !cg->debug_personality_enabled) return;
+    if (cg->personality != QISC_PERSONALITY_CRYPTIC) return;
+    
+    const char *easter_egg = get_debug_easter_egg();
+    
+    /* Create a global string constant that's only visible in debug info */
+    LLVMValueRef str = LLVMBuildGlobalStringPtr(cg->builder, 
+                                                 easter_egg, 
+                                                 "__qisc_debug_easter_egg");
+    LLVMSetGlobalConstant(str, true);
+    LLVMSetLinkage(str, LLVMPrivateLinkage);
+    
+    /* Add debug greeting message */
+    LLVMValueRef greeting = LLVMBuildGlobalStringPtr(cg->builder,
+        "Welcome, debugger! You've found the QISC debug zone.",
+        "__qisc_debug_greeting");
+    LLVMSetGlobalConstant(greeting, true);
+    LLVMSetLinkage(greeting, LLVMPrivateLinkage);
+}
 
 /* ======== Error Handling ======== */
 
@@ -151,6 +445,308 @@ static LLVMTypeRef cg_return_type(Codegen *cg, AstNode *proc) {
 static LLVMValueRef emit_expr(Codegen *cg, AstNode *node);
 static void emit_stmt(Codegen *cg, AstNode *node);
 static void emit_block(Codegen *cg, AstNode *node);
+static void emit_profile_call(Codegen *cg, LLVMValueRef fn_profile, const char *name);
+
+/* ======== Context-Specific Compilation ======== */
+
+/* Get LLVM code generation level based on context */
+static LLVMCodeGenOptLevel cg_get_context_opt_level(Codegen *cg) {
+  switch (cg->pragma_opts.context) {
+    case CG_CONTEXT_CLI:
+      return LLVMCodeGenLevelDefault;  /* O2 equivalent */
+    case CG_CONTEXT_SERVER:
+      return LLVMCodeGenLevelAggressive;  /* O3 equivalent */
+    case CG_CONTEXT_EMBEDDED:
+      return LLVMCodeGenLevelLess;  /* O1 for size */
+    case CG_CONTEXT_WEB:
+      return LLVMCodeGenLevelDefault;  /* O2 with size focus */
+    case CG_CONTEXT_NOTEBOOK:
+      return LLVMCodeGenLevelLess;  /* O1 for fast compile */
+    default:
+      return LLVMCodeGenLevelDefault;
+  }
+}
+
+/* Apply context-specific function attributes */
+static void cg_apply_context_attrs(Codegen *cg, LLVMValueRef func) {
+  CgPragmaOpts *opts = &cg->pragma_opts;
+  unsigned kind;
+  
+  switch (opts->context) {
+    case CG_CONTEXT_CLI:
+      /*
+       * CLI: Optimize startup, small binary
+       * - Minimize static initialization
+       * - Favor code size over speed
+       * - Fast main() entry
+       */
+      kind = LLVMGetEnumAttributeKindForName("optsize", 7);
+      LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex,
+          LLVMCreateEnumAttribute(cg->ctx, kind, 0));
+      
+      /* Avoid aggressive inlining to reduce startup overhead */
+      if (!opts->mark_hot_path) {
+        kind = LLVMGetEnumAttributeKindForName("noinline", 8);
+        if (kind != 0) {
+          /* Only hint, don't force noinline */
+        }
+      }
+      break;
+      
+    case CG_CONTEXT_SERVER:
+      /*
+       * Server: Optimize throughput, allow larger binary
+       * - Aggressive inlining
+       * - Loop unrolling
+       * - Cache optimization
+       */
+      if (opts->enable_inline && !opts->mark_cold_path) {
+        kind = LLVMGetEnumAttributeKindForName("inlinehint", 10);
+        LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex,
+            LLVMCreateEnumAttribute(cg->ctx, kind, 0));
+      }
+      
+      /* Enable speculative execution hints */
+      kind = LLVMGetEnumAttributeKindForName("speculatable", 12);
+      if (kind != 0) {
+        /* Only add to pure functions - skip for now as we can't detect purity */
+      }
+      
+      /* Willreturn for better optimization */
+      kind = LLVMGetEnumAttributeKindForName("willreturn", 10);
+      if (kind != 0) {
+        LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex,
+            LLVMCreateEnumAttribute(cg->ctx, kind, 0));
+      }
+      break;
+      
+    case CG_CONTEXT_EMBEDDED:
+      /*
+       * Embedded: Optimize size, energy
+       * - Minimal code size
+       * - Avoid floating point if possible
+       * - Stack size optimization
+       */
+      kind = LLVMGetEnumAttributeKindForName("minsize", 7);
+      LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex,
+          LLVMCreateEnumAttribute(cg->ctx, kind, 0));
+      
+      /* Prevent inlining to minimize code size */
+      if (!opts->mark_hot_path) {
+        kind = LLVMGetEnumAttributeKindForName("noinline", 8);
+        LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex,
+            LLVMCreateEnumAttribute(cg->ctx, kind, 0));
+      }
+      
+      /* nounwind for smaller exception handling tables */
+      kind = LLVMGetEnumAttributeKindForName("nounwind", 8);
+      LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex,
+          LLVMCreateEnumAttribute(cg->ctx, kind, 0));
+      
+      /* norecurse hint for stack analysis */
+      kind = LLVMGetEnumAttributeKindForName("norecurse", 9);
+      if (kind != 0) {
+        /* Only add if we can verify no recursion - skip for safety */
+      }
+      break;
+      
+    case CG_CONTEXT_WEB:
+      /*
+       * Web: Optimize for WASM/size
+       * - Small binary
+       * - Fast startup
+       * - Minimal runtime
+       */
+      kind = LLVMGetEnumAttributeKindForName("minsize", 7);
+      LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex,
+          LLVMCreateEnumAttribute(cg->ctx, kind, 0));
+      
+      /* nounwind for WASM compatibility */
+      kind = LLVMGetEnumAttributeKindForName("nounwind", 8);
+      LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex,
+          LLVMCreateEnumAttribute(cg->ctx, kind, 0));
+      
+      /* Memory attributes for WASM safety */
+      kind = LLVMGetEnumAttributeKindForName("nofree", 6);
+      if (kind != 0) {
+        LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex,
+            LLVMCreateEnumAttribute(cg->ctx, kind, 0));
+      }
+      break;
+      
+    case CG_CONTEXT_NOTEBOOK:
+      /*
+       * Notebook: Optimize for interactive use
+       * - Fast incremental compilation
+       * - Keep debug info
+       * - REPL-friendly
+       */
+      /* No aggressive optimizations - prioritize compile speed */
+      /* Keep debug info via separate mechanism */
+      
+      /* Willreturn for REPL safety */
+      kind = LLVMGetEnumAttributeKindForName("willreturn", 10);
+      if (kind != 0) {
+        LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex,
+            LLVMCreateEnumAttribute(cg->ctx, kind, 0));
+      }
+      break;
+      
+    default:
+      break;
+  }
+}
+
+/* ======== Pragma → LLVM Attribute Helpers ======== */
+
+/* Apply function-level pragma attributes to LLVM function */
+static void cg_apply_pragma_attrs(Codegen *cg, LLVMValueRef func) {
+  CgPragmaOpts *opts = &cg->pragma_opts;
+  unsigned kind;
+  
+  /* Inline control */
+  if (opts->enable_inline && opts->mark_hot_path) {
+    /* #pragma inline:always or hot_path → alwaysinline */
+    kind = LLVMGetEnumAttributeKindForName("alwaysinline", 12);
+    LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex,
+        LLVMCreateEnumAttribute(cg->ctx, kind, 0));
+  } else if (!opts->enable_inline) {
+    /* #pragma inline:never → noinline */
+    kind = LLVMGetEnumAttributeKindForName("noinline", 8);
+    LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex,
+        LLVMCreateEnumAttribute(cg->ctx, kind, 0));
+  }
+  
+  /* Optimization focus attributes */
+  switch (opts->opt_focus) {
+    case CG_OPT_SIZE:
+    case CG_OPT_MEMORY:
+      /* optimize:size/memory → optsize */
+      kind = LLVMGetEnumAttributeKindForName("optsize", 7);
+      LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex,
+          LLVMCreateEnumAttribute(cg->ctx, kind, 0));
+      break;
+    case CG_OPT_LATENCY:
+    case CG_OPT_THROUGHPUT:
+      /* optimize:latency/throughput → disable optsize, enable inlining */
+      if (opts->enable_inline) {
+        kind = LLVMGetEnumAttributeKindForName("inlinehint", 10);
+        LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex,
+            LLVMCreateEnumAttribute(cg->ctx, kind, 0));
+      }
+      break;
+    default:
+      break;
+  }
+  
+  /* Cold path → cold attribute (deprioritizes optimization) */
+  if (opts->mark_cold_path) {
+    kind = LLVMGetEnumAttributeKindForName("cold", 4);
+    LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex,
+        LLVMCreateEnumAttribute(cg->ctx, kind, 0));
+    /* Also set minsize for cold paths */
+    kind = LLVMGetEnumAttributeKindForName("minsize", 7);
+    LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex,
+        LLVMCreateEnumAttribute(cg->ctx, kind, 0));
+  }
+  
+  /* Hot path → hot attribute (enables aggressive optimization) */
+  if (opts->mark_hot_path && !opts->mark_cold_path) {
+    kind = LLVMGetEnumAttributeKindForName("hot", 3);
+    if (kind != 0) {
+      LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex,
+          LLVMCreateEnumAttribute(cg->ctx, kind, 0));
+    }
+  }
+  
+  /* Context-based function attributes */
+  cg_apply_context_attrs(cg, func);
+
+  /* Bounds checking disabled → nosanitize (no UBSan instrumentation) */
+  if (opts->disable_bounds) {
+    /* Note: LLVM doesn't have a direct "disable bounds" attr, but we can add
+     * attributes that affect sanitizer behavior. For now we use nosync/nofree 
+     * which signals the function has no unusual semantics. */
+    kind = LLVMGetEnumAttributeKindForName("nofree", 6);
+    if (kind != 0) {
+      LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex,
+          LLVMCreateEnumAttribute(cg->ctx, kind, 0));
+    }
+  }
+}
+
+/* Create loop vectorization/unroll metadata */
+static LLVMMetadataRef cg_create_loop_metadata(Codegen *cg, bool vectorize, bool unroll) {
+  LLVMMetadataRef loop_md[4];
+  unsigned count = 0;
+  
+  /* Self-reference placeholder (first element is the loop ID itself) */
+  loop_md[count++] = NULL;  /* Will be replaced by self-ref */
+  
+  if (vectorize) {
+    /* llvm.loop.vectorize.enable = true */
+    LLVMMetadataRef key = LLVMMDStringInContext2(cg->ctx, "llvm.loop.vectorize.enable", 26);
+    LLVMMetadataRef val = LLVMValueAsMetadata(LLVMConstInt(cg->i1_type, 1, false));
+    LLVMMetadataRef pair[2] = {key, val};
+    loop_md[count++] = LLVMMDNodeInContext2(cg->ctx, pair, 2);
+  }
+  
+  if (unroll) {
+    /* llvm.loop.unroll.enable = true */
+    LLVMMetadataRef key = LLVMMDStringInContext2(cg->ctx, "llvm.loop.unroll.enable", 23);
+    LLVMMetadataRef val = LLVMValueAsMetadata(LLVMConstInt(cg->i1_type, 1, false));
+    LLVMMetadataRef pair[2] = {key, val};
+    loop_md[count++] = LLVMMDNodeInContext2(cg->ctx, pair, 2);
+  }
+  
+  if (count <= 1) return NULL;  /* No meaningful metadata to add */
+  
+  /* Create the loop metadata node */
+  LLVMMetadataRef md = LLVMMDNodeInContext2(cg->ctx, loop_md, count);
+  
+  /* Replace self-reference (LLVM requires this for loop metadata) */
+  /* Note: Due to C API limitations, we create a simple node that works */
+  return md;
+}
+
+/* Apply loop-level pragma metadata to a branch instruction */
+static void cg_apply_loop_pragmas(Codegen *cg, LLVMValueRef branch_inst) {
+  if (!branch_inst) return;
+  
+  CgPragmaOpts *opts = &cg->pragma_opts;
+  
+  /* Create loop metadata if vectorize is enabled */
+  if (opts->enable_vectorize) {
+    LLVMMetadataRef loop_md = cg_create_loop_metadata(cg, true, false);
+    if (loop_md) {
+      unsigned loop_kind = LLVMGetMDKindIDInContext(cg->ctx, "llvm.loop", 9);
+      LLVMValueRef md_val = LLVMMetadataAsValue(cg->ctx, loop_md);
+      LLVMSetMetadata(branch_inst, loop_kind, md_val);
+    }
+  }
+}
+
+/* Add branch weight metadata for likely/unlikely hints */
+static void cg_apply_branch_weights(Codegen *cg, LLVMValueRef branch_inst, bool likely_true) {
+  if (!branch_inst) return;
+  
+  unsigned prof_kind = LLVMGetMDKindIDInContext(cg->ctx, "prof", 4);
+  
+  /* Create branch_weights metadata: !{!"branch_weights", i32 heavy, i32 light} */
+  LLVMValueRef weights[3];
+  weights[0] = LLVMMDString("branch_weights", 14);
+  
+  if (likely_true) {
+    weights[1] = LLVMConstInt(LLVMInt32TypeInContext(cg->ctx), 2000, false);
+    weights[2] = LLVMConstInt(LLVMInt32TypeInContext(cg->ctx), 1, false);
+  } else {
+    weights[1] = LLVMConstInt(LLVMInt32TypeInContext(cg->ctx), 1, false);
+    weights[2] = LLVMConstInt(LLVMInt32TypeInContext(cg->ctx), 2000, false);
+  }
+  
+  LLVMValueRef md = LLVMMDNode(weights, 3);
+  LLVMSetMetadata(branch_inst, prof_kind, md);
+}
 
 /* ======== Expression Emission ======== */
 
@@ -212,6 +808,218 @@ static LLVMValueRef emit_binary(Codegen *cg, AstNode *node) {
       const char *fname = NULL;
       if (rhs->as.call.callee && rhs->as.call.callee->type == AST_IDENTIFIER)
         fname = rhs->as.call.callee->as.identifier.name;
+
+      /* Check if this is a builtin that takes array as first arg */
+      if (fname && (strcmp(fname, "filter") == 0 || strcmp(fname, "map") == 0 || 
+                    strcmp(fname, "reduce") == 0 || strcmp(fname, "collect") == 0)) {
+        /* Create a modified call node with left_val prepended */
+        /* For builtins, we need to handle them specially */
+        
+        if (strcmp(fname, "filter") == 0 && rhs->as.call.args.count >= 1) {
+          /* filter(predicate) with left_val as array */
+          LLVMValueRef pred_fn = emit_expr(cg, rhs->as.call.args.items[0]);
+          
+          /* Get array length */
+          LLVMValueRef fn_array_len = LLVMGetNamedFunction(cg->mod, "__qisc_array_len");
+          LLVMTypeRef arr_len_type = LLVMFunctionType(cg->i64_type,
+              (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+          LLVMValueRef len = LLVMBuildCall2(cg->builder, arr_len_type, fn_array_len,
+              (LLVMValueRef[]){left_val}, 1, "filter_len");
+          
+          /* Create result array */
+          LLVMValueRef fn_array_new = LLVMGetNamedFunction(cg->mod, "__qisc_array_new");
+          LLVMTypeRef arr_new_type = LLVMFunctionType(cg->i8ptr_type,
+              (LLVMTypeRef[]){cg->i64_type, cg->i64_type}, 2, false);
+          LLVMValueRef elem_size = LLVMConstInt(cg->i64_type, 8, false);
+          LLVMValueRef result_arr = LLVMBuildCall2(cg->builder, arr_new_type, fn_array_new,
+              (LLVMValueRef[]){elem_size, len}, 2, "filter_result");
+          
+          /* Loop through and filter */
+          LLVMValueRef idx_alloca = LLVMBuildAlloca(cg->builder, cg->i64_type, "filter_idx");
+          LLVMValueRef res_alloca = LLVMBuildAlloca(cg->builder, cg->i8ptr_type, "filter_res");
+          LLVMBuildStore(cg->builder, LLVMConstInt(cg->i64_type, 0, false), idx_alloca);
+          LLVMBuildStore(cg->builder, result_arr, res_alloca);
+          
+          LLVMBasicBlockRef loop_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "pfilter.loop");
+          LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "pfilter.body");
+          LLVMBasicBlockRef then_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "pfilter.then");
+          LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "pfilter.cont");
+          LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "pfilter.end");
+          
+          LLVMBuildBr(cg->builder, loop_bb);
+          LLVMPositionBuilderAtEnd(cg->builder, loop_bb);
+          
+          LLVMValueRef idx = LLVMBuildLoad2(cg->builder, cg->i64_type, idx_alloca, "i");
+          LLVMValueRef cond = LLVMBuildICmp(cg->builder, LLVMIntSLT, idx, len, "filter_cond");
+          LLVMBuildCondBr(cg->builder, cond, body_bb, end_bb);
+          
+          LLVMPositionBuilderAtEnd(cg->builder, body_bb);
+          
+          /* Get element at index */
+          LLVMValueRef fn_array_get = LLVMGetNamedFunction(cg->mod, "__qisc_array_get");
+          LLVMTypeRef arr_get_type = LLVMFunctionType(cg->i8ptr_type,
+              (LLVMTypeRef[]){cg->i8ptr_type, cg->i64_type}, 2, false);
+          LLVMValueRef elem_ptr = LLVMBuildCall2(cg->builder, arr_get_type, fn_array_get,
+              (LLVMValueRef[]){left_val, idx}, 2, "elem_ptr");
+          LLVMValueRef elem = LLVMBuildLoad2(cg->builder, cg->i64_type, elem_ptr, "elem");
+          
+          /* Call predicate(elem) */
+          LLVMTypeRef pred_fn_type = LLVMFunctionType(cg->i64_type,
+              (LLVMTypeRef[]){cg->i64_type}, 1, false);
+          LLVMValueRef pred_result = LLVMBuildCall2(cg->builder, pred_fn_type, pred_fn,
+              (LLVMValueRef[]){elem}, 1, "pred_result");
+          
+          LLVMValueRef is_truthy = LLVMBuildICmp(cg->builder, LLVMIntNE, pred_result,
+              LLVMConstInt(cg->i64_type, 0, false), "is_truthy");
+          LLVMBuildCondBr(cg->builder, is_truthy, then_bb, cont_bb);
+          
+          LLVMPositionBuilderAtEnd(cg->builder, then_bb);
+          
+          LLVMValueRef val_alloca = LLVMBuildAlloca(cg->builder, cg->i64_type, "filter_val");
+          LLVMBuildStore(cg->builder, elem, val_alloca);
+          
+          LLVMValueRef fn_array_push = LLVMGetNamedFunction(cg->mod, "__qisc_array_push");
+          LLVMTypeRef arr_push_type = LLVMFunctionType(cg->i8ptr_type,
+              (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2, false);
+          LLVMValueRef cur_res = LLVMBuildLoad2(cg->builder, cg->i8ptr_type, res_alloca, "cur_res");
+          LLVMValueRef new_res = LLVMBuildCall2(cg->builder, arr_push_type, fn_array_push,
+              (LLVMValueRef[]){cur_res, val_alloca}, 2, "pushed");
+          LLVMBuildStore(cg->builder, new_res, res_alloca);
+          LLVMBuildBr(cg->builder, cont_bb);
+          
+          LLVMPositionBuilderAtEnd(cg->builder, cont_bb);
+          LLVMValueRef next_idx = LLVMBuildAdd(cg->builder, idx, LLVMConstInt(cg->i64_type, 1, false), "next");
+          LLVMBuildStore(cg->builder, next_idx, idx_alloca);
+          LLVMBuildBr(cg->builder, loop_bb);
+          
+          LLVMPositionBuilderAtEnd(cg->builder, end_bb);
+          return LLVMBuildLoad2(cg->builder, cg->i8ptr_type, res_alloca, "filter_final");
+        }
+        
+        if (strcmp(fname, "map") == 0 && rhs->as.call.args.count >= 1) {
+          /* map(fn) with left_val as array */
+          LLVMValueRef map_fn = emit_expr(cg, rhs->as.call.args.items[0]);
+          
+          LLVMValueRef fn_array_len = LLVMGetNamedFunction(cg->mod, "__qisc_array_len");
+          LLVMTypeRef arr_len_type = LLVMFunctionType(cg->i64_type,
+              (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+          LLVMValueRef len = LLVMBuildCall2(cg->builder, arr_len_type, fn_array_len,
+              (LLVMValueRef[]){left_val}, 1, "map_len");
+          
+          LLVMValueRef fn_array_new = LLVMGetNamedFunction(cg->mod, "__qisc_array_new");
+          LLVMTypeRef arr_new_type = LLVMFunctionType(cg->i8ptr_type,
+              (LLVMTypeRef[]){cg->i64_type, cg->i64_type}, 2, false);
+          LLVMValueRef elem_size = LLVMConstInt(cg->i64_type, 8, false);
+          LLVMValueRef result_arr = LLVMBuildCall2(cg->builder, arr_new_type, fn_array_new,
+              (LLVMValueRef[]){elem_size, len}, 2, "map_result");
+          
+          LLVMValueRef idx_alloca = LLVMBuildAlloca(cg->builder, cg->i64_type, "map_idx");
+          LLVMValueRef res_alloca = LLVMBuildAlloca(cg->builder, cg->i8ptr_type, "map_res");
+          LLVMBuildStore(cg->builder, LLVMConstInt(cg->i64_type, 0, false), idx_alloca);
+          LLVMBuildStore(cg->builder, result_arr, res_alloca);
+          
+          LLVMBasicBlockRef loop_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "pmap.loop");
+          LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "pmap.body");
+          LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "pmap.end");
+          
+          LLVMBuildBr(cg->builder, loop_bb);
+          LLVMPositionBuilderAtEnd(cg->builder, loop_bb);
+          
+          LLVMValueRef idx = LLVMBuildLoad2(cg->builder, cg->i64_type, idx_alloca, "i");
+          LLVMValueRef cond = LLVMBuildICmp(cg->builder, LLVMIntSLT, idx, len, "map_cond");
+          LLVMBuildCondBr(cg->builder, cond, body_bb, end_bb);
+          
+          LLVMPositionBuilderAtEnd(cg->builder, body_bb);
+          
+          LLVMValueRef fn_array_get = LLVMGetNamedFunction(cg->mod, "__qisc_array_get");
+          LLVMTypeRef arr_get_type = LLVMFunctionType(cg->i8ptr_type,
+              (LLVMTypeRef[]){cg->i8ptr_type, cg->i64_type}, 2, false);
+          LLVMValueRef elem_ptr = LLVMBuildCall2(cg->builder, arr_get_type, fn_array_get,
+              (LLVMValueRef[]){left_val, idx}, 2, "elem_ptr");
+          LLVMValueRef elem = LLVMBuildLoad2(cg->builder, cg->i64_type, elem_ptr, "elem");
+          
+          LLVMTypeRef map_fn_type = LLVMFunctionType(cg->i64_type,
+              (LLVMTypeRef[]){cg->i64_type}, 1, false);
+          LLVMValueRef mapped = LLVMBuildCall2(cg->builder, map_fn_type, map_fn,
+              (LLVMValueRef[]){elem}, 1, "mapped");
+          
+          LLVMValueRef val_alloca = LLVMBuildAlloca(cg->builder, cg->i64_type, "map_val");
+          LLVMBuildStore(cg->builder, mapped, val_alloca);
+          
+          LLVMValueRef fn_array_push = LLVMGetNamedFunction(cg->mod, "__qisc_array_push");
+          LLVMTypeRef arr_push_type = LLVMFunctionType(cg->i8ptr_type,
+              (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2, false);
+          LLVMValueRef cur_res = LLVMBuildLoad2(cg->builder, cg->i8ptr_type, res_alloca, "cur_res");
+          LLVMValueRef new_res = LLVMBuildCall2(cg->builder, arr_push_type, fn_array_push,
+              (LLVMValueRef[]){cur_res, val_alloca}, 2, "pushed");
+          LLVMBuildStore(cg->builder, new_res, res_alloca);
+          
+          LLVMValueRef next_idx = LLVMBuildAdd(cg->builder, idx, LLVMConstInt(cg->i64_type, 1, false), "next");
+          LLVMBuildStore(cg->builder, next_idx, idx_alloca);
+          LLVMBuildBr(cg->builder, loop_bb);
+          
+          LLVMPositionBuilderAtEnd(cg->builder, end_bb);
+          return LLVMBuildLoad2(cg->builder, cg->i8ptr_type, res_alloca, "map_final");
+        }
+        
+        if (strcmp(fname, "collect") == 0) {
+          /* collect() just returns the array as-is (materializes lazy stream) */
+          return left_val;
+        }
+        
+        if (strcmp(fname, "reduce") == 0 && rhs->as.call.args.count >= 2) {
+          /* reduce(fn, initial) with left_val as array */
+          LLVMValueRef reduce_fn = emit_expr(cg, rhs->as.call.args.items[0]);
+          LLVMValueRef initial = emit_expr(cg, rhs->as.call.args.items[1]);
+          
+          LLVMValueRef fn_array_len = LLVMGetNamedFunction(cg->mod, "__qisc_array_len");
+          LLVMTypeRef arr_len_type = LLVMFunctionType(cg->i64_type,
+              (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+          LLVMValueRef len = LLVMBuildCall2(cg->builder, arr_len_type, fn_array_len,
+              (LLVMValueRef[]){left_val}, 1, "reduce_len");
+          
+          LLVMValueRef idx_alloca = LLVMBuildAlloca(cg->builder, cg->i64_type, "reduce_idx");
+          LLVMValueRef acc_alloca = LLVMBuildAlloca(cg->builder, cg->i64_type, "reduce_acc");
+          LLVMBuildStore(cg->builder, LLVMConstInt(cg->i64_type, 0, false), idx_alloca);
+          LLVMBuildStore(cg->builder, initial, acc_alloca);
+          
+          LLVMBasicBlockRef loop_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "preduce.loop");
+          LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "preduce.body");
+          LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "preduce.end");
+          
+          LLVMBuildBr(cg->builder, loop_bb);
+          LLVMPositionBuilderAtEnd(cg->builder, loop_bb);
+          
+          LLVMValueRef idx = LLVMBuildLoad2(cg->builder, cg->i64_type, idx_alloca, "i");
+          LLVMValueRef cond = LLVMBuildICmp(cg->builder, LLVMIntSLT, idx, len, "reduce_cond");
+          LLVMBuildCondBr(cg->builder, cond, body_bb, end_bb);
+          
+          LLVMPositionBuilderAtEnd(cg->builder, body_bb);
+          
+          LLVMValueRef fn_array_get = LLVMGetNamedFunction(cg->mod, "__qisc_array_get");
+          LLVMTypeRef arr_get_type = LLVMFunctionType(cg->i8ptr_type,
+              (LLVMTypeRef[]){cg->i8ptr_type, cg->i64_type}, 2, false);
+          LLVMValueRef elem_ptr = LLVMBuildCall2(cg->builder, arr_get_type, fn_array_get,
+              (LLVMValueRef[]){left_val, idx}, 2, "elem_ptr");
+          LLVMValueRef elem = LLVMBuildLoad2(cg->builder, cg->i64_type, elem_ptr, "elem");
+          
+          LLVMValueRef acc = LLVMBuildLoad2(cg->builder, cg->i64_type, acc_alloca, "acc");
+          
+          LLVMTypeRef reduce_fn_type = LLVMFunctionType(cg->i64_type,
+              (LLVMTypeRef[]){cg->i64_type, cg->i64_type}, 2, false);
+          LLVMValueRef new_acc = LLVMBuildCall2(cg->builder, reduce_fn_type, reduce_fn,
+              (LLVMValueRef[]){acc, elem}, 2, "new_acc");
+          
+          LLVMBuildStore(cg->builder, new_acc, acc_alloca);
+          
+          LLVMValueRef next_idx = LLVMBuildAdd(cg->builder, idx, LLVMConstInt(cg->i64_type, 1, false), "next");
+          LLVMBuildStore(cg->builder, next_idx, idx_alloca);
+          LLVMBuildBr(cg->builder, loop_bb);
+          
+          LLVMPositionBuilderAtEnd(cg->builder, end_bb);
+          return LLVMBuildLoad2(cg->builder, cg->i64_type, acc_alloca, "reduce_final");
+        }
+      }
 
       int orig_argc = rhs->as.call.args.count;
       int new_argc = 1 + orig_argc;
@@ -398,6 +1206,11 @@ static LLVMValueRef emit_binary(Codegen *cg, AstNode *node) {
     return LLVMBuildShl(cg->builder, left, right, "shl");
   case OP_RSHIFT:
     return LLVMBuildAShr(cg->builder, left, right, "shr");
+  case OP_HAS:
+    /* 'has _' checks if maybe value is not null/none */
+    /* For now: treat as non-zero check */
+    return LLVMBuildICmp(cg->builder, LLVMIntNE, left, 
+        LLVMConstInt(LLVMTypeOf(left), 0, false), "has");
   default:
     cg_error(cg, "Unsupported binary op: %d", op);
     return LLVMConstInt(cg->i64_type, 0, false);
@@ -616,6 +1429,384 @@ static LLVMValueRef emit_call(Codegen *cg, AstNode *node) {
     return LLVMBuildGlobalStringPtr(cg->builder, "none", "typename");
   }
 
+  /* Handle builtin: len(array) — call __qisc_array_len for runtime length */
+  if (strcmp(fname, "len") == 0) {
+    if (argc >= 1) {
+      LLVMValueRef arr = emit_expr(cg, node->as.call.args.items[0]);
+      LLVMValueRef fn_array_len = LLVMGetNamedFunction(cg->mod, "__qisc_array_len");
+      LLVMTypeRef arr_len_type = LLVMFunctionType(cg->i64_type,
+          (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+      return LLVMBuildCall2(cg->builder, arr_len_type, fn_array_len,
+          (LLVMValueRef[]){arr}, 1, "len");
+    }
+    return LLVMConstInt(cg->i64_type, 0, false);
+  }
+
+  /* Handle builtin: push(array, element) — call __qisc_array_push */
+  if (strcmp(fname, "push") == 0) {
+    if (argc >= 2) {
+      LLVMValueRef arr = emit_expr(cg, node->as.call.args.items[0]);
+      LLVMValueRef elem = emit_expr(cg, node->as.call.args.items[1]);
+      
+      /* Store element value to temp alloca for passing by pointer */
+      LLVMValueRef elem_alloca = LLVMBuildAlloca(cg->builder, cg->i64_type, "push_elem");
+      LLVMBuildStore(cg->builder, elem, elem_alloca);
+      
+      LLVMValueRef fn_array_push = LLVMGetNamedFunction(cg->mod, "__qisc_array_push");
+      LLVMTypeRef arr_push_type = LLVMFunctionType(cg->i8ptr_type,
+          (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2, false);
+      return LLVMBuildCall2(cg->builder, arr_push_type, fn_array_push,
+          (LLVMValueRef[]){arr, elem_alloca}, 2, "pushed");
+    }
+    return LLVMConstNull(cg->i8ptr_type);
+  }
+
+  /* Handle builtin: pop(array) — call __qisc_array_pop and load value */
+  if (strcmp(fname, "pop") == 0) {
+    if (argc >= 1) {
+      LLVMValueRef arr = emit_expr(cg, node->as.call.args.items[0]);
+      LLVMValueRef fn_array_pop = LLVMGetNamedFunction(cg->mod, "__qisc_array_pop");
+      LLVMTypeRef arr_pop_type = LLVMFunctionType(cg->i8ptr_type,
+          (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+      LLVMValueRef elem_ptr = LLVMBuildCall2(cg->builder, arr_pop_type, fn_array_pop,
+          (LLVMValueRef[]){arr}, 1, "pop_ptr");
+      /* Load the i64 value from the returned pointer */
+      return LLVMBuildLoad2(cg->builder, cg->i64_type, elem_ptr, "popped");
+    }
+    return LLVMConstInt(cg->i64_type, 0, false);
+  }
+
+  /* Handle builtin: file_exists(path) — calls access() to check if file exists */
+  if (strcmp(fname, "file_exists") == 0) {
+    if (argc >= 1) {
+      LLVMValueRef path = emit_expr(cg, node->as.call.args.items[0]);
+      
+      /* Declare access() if not already declared */
+      LLVMValueRef fn_access = LLVMGetNamedFunction(cg->mod, "access");
+      if (!fn_access) {
+        LLVMTypeRef access_type = LLVMFunctionType(
+            LLVMInt32TypeInContext(cg->ctx),
+            (LLVMTypeRef[]){cg->i8ptr_type, LLVMInt32TypeInContext(cg->ctx)}, 2, false);
+        fn_access = LLVMAddFunction(cg->mod, "access", access_type);
+      }
+      LLVMTypeRef access_type = LLVMFunctionType(
+          LLVMInt32TypeInContext(cg->ctx),
+          (LLVMTypeRef[]){cg->i8ptr_type, LLVMInt32TypeInContext(cg->ctx)}, 2, false);
+      
+      /* Call access(path, F_OK=0) - returns 0 if file exists */
+      LLVMValueRef f_ok = LLVMConstInt(LLVMInt32TypeInContext(cg->ctx), 0, false);
+      LLVMValueRef result = LLVMBuildCall2(cg->builder, access_type, fn_access,
+          (LLVMValueRef[]){path, f_ok}, 2, "access_result");
+      
+      /* Convert: access returns 0 on success, we want 1 (true) on success */
+      LLVMValueRef zero = LLVMConstInt(LLVMInt32TypeInContext(cg->ctx), 0, false);
+      LLVMValueRef exists = LLVMBuildICmp(cg->builder, LLVMIntEQ, result, zero, "exists");
+      return LLVMBuildZExt(cg->builder, exists, cg->i64_type, "file_exists");
+    }
+    return LLVMConstInt(cg->i64_type, 0, false);
+  }
+
+  /* Handle builtin: range(start, end) — creates an array from start to end-1 with length tracking */
+  if (strcmp(fname, "range") == 0) {
+    if (argc >= 2) {
+      LLVMValueRef start = emit_expr(cg, node->as.call.args.items[0]);
+      LLVMValueRef end = emit_expr(cg, node->as.call.args.items[1]);
+      
+      /* Calculate length = end - start */
+      LLVMValueRef len = LLVMBuildSub(cg->builder, end, start, "range_len");
+      
+      /* Create array using __qisc_array_new(elem_size=8, capacity=len) */
+      LLVMValueRef fn_array_new = LLVMGetNamedFunction(cg->mod, "__qisc_array_new");
+      LLVMTypeRef arr_new_type = LLVMFunctionType(cg->i8ptr_type,
+          (LLVMTypeRef[]){cg->i64_type, cg->i64_type}, 2, false);
+      LLVMValueRef elem_size = LLVMConstInt(cg->i64_type, 8, false);
+      LLVMValueRef arr = LLVMBuildCall2(cg->builder, arr_new_type, fn_array_new,
+          (LLVMValueRef[]){elem_size, len}, 2, "range_arr");
+      
+      /* Fill array with values from start to end-1 using push
+       * Simple loop: for (i = 0; i < len; i++) push(arr, start + i) */
+      LLVMValueRef idx_alloca = LLVMBuildAlloca(cg->builder, cg->i64_type, "ridx");
+      LLVMValueRef arr_alloca = LLVMBuildAlloca(cg->builder, cg->i8ptr_type, "rarr");
+      LLVMBuildStore(cg->builder, LLVMConstInt(cg->i64_type, 0, false), idx_alloca);
+      LLVMBuildStore(cg->builder, arr, arr_alloca);
+      
+      LLVMBasicBlockRef loop_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "range.loop");
+      LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "range.body");
+      LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "range.end");
+      
+      LLVMBuildBr(cg->builder, loop_bb);
+      LLVMPositionBuilderAtEnd(cg->builder, loop_bb);
+      
+      LLVMValueRef idx = LLVMBuildLoad2(cg->builder, cg->i64_type, idx_alloca, "i");
+      LLVMValueRef cond = LLVMBuildICmp(cg->builder, LLVMIntSLT, idx, len, "rcond");
+      LLVMBuildCondBr(cg->builder, cond, body_bb, end_bb);
+      
+      LLVMPositionBuilderAtEnd(cg->builder, body_bb);
+      LLVMValueRef val = LLVMBuildAdd(cg->builder, start, idx, "rval");
+      
+      /* Store val in temp alloca for push */
+      LLVMValueRef val_alloca = LLVMBuildAlloca(cg->builder, cg->i64_type, "rval_tmp");
+      LLVMBuildStore(cg->builder, val, val_alloca);
+      
+      /* Call push(arr, &val) */
+      LLVMValueRef fn_array_push = LLVMGetNamedFunction(cg->mod, "__qisc_array_push");
+      LLVMTypeRef arr_push_type = LLVMFunctionType(cg->i8ptr_type,
+          (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2, false);
+      LLVMValueRef cur_arr = LLVMBuildLoad2(cg->builder, cg->i8ptr_type, arr_alloca, "cur_arr");
+      LLVMValueRef new_arr = LLVMBuildCall2(cg->builder, arr_push_type, fn_array_push,
+          (LLVMValueRef[]){cur_arr, val_alloca}, 2, "pushed");
+      LLVMBuildStore(cg->builder, new_arr, arr_alloca);
+      
+      LLVMValueRef next_idx = LLVMBuildAdd(cg->builder, idx, LLVMConstInt(cg->i64_type, 1, false), "rnext");
+      LLVMBuildStore(cg->builder, next_idx, idx_alloca);
+      LLVMBuildBr(cg->builder, loop_bb);
+      
+      LLVMPositionBuilderAtEnd(cg->builder, end_bb);
+      return LLVMBuildLoad2(cg->builder, cg->i8ptr_type, arr_alloca, "final_arr");
+    }
+    return LLVMConstNull(cg->i8ptr_type);
+  }
+
+  /* Handle builtin: map(array, fn) -> new array with fn applied to each element */
+  if (strcmp(fname, "map") == 0) {
+    if (argc >= 2) {
+      LLVMValueRef arr = emit_expr(cg, node->as.call.args.items[0]);
+      LLVMValueRef fn_ptr = emit_expr(cg, node->as.call.args.items[1]);
+      
+      /* Get array length */
+      LLVMValueRef fn_array_len = LLVMGetNamedFunction(cg->mod, "__qisc_array_len");
+      LLVMTypeRef arr_len_type = LLVMFunctionType(cg->i64_type,
+          (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+      LLVMValueRef len = LLVMBuildCall2(cg->builder, arr_len_type, fn_array_len,
+          (LLVMValueRef[]){arr}, 1, "map_len");
+      
+      /* Create result array using __qisc_array_new(elem_size=8, capacity=len) */
+      LLVMValueRef fn_array_new = LLVMGetNamedFunction(cg->mod, "__qisc_array_new");
+      LLVMTypeRef arr_new_type = LLVMFunctionType(cg->i8ptr_type,
+          (LLVMTypeRef[]){cg->i64_type, cg->i64_type}, 2, false);
+      LLVMValueRef elem_size = LLVMConstInt(cg->i64_type, 8, false);
+      LLVMValueRef result_arr = LLVMBuildCall2(cg->builder, arr_new_type, fn_array_new,
+          (LLVMValueRef[]){elem_size, len}, 2, "map_result");
+      
+      /* Loop: for (i = 0; i < len; i++) { result[i] = fn(arr[i]); } */
+      LLVMValueRef idx_alloca = LLVMBuildAlloca(cg->builder, cg->i64_type, "map_idx");
+      LLVMValueRef res_alloca = LLVMBuildAlloca(cg->builder, cg->i8ptr_type, "map_res");
+      LLVMBuildStore(cg->builder, LLVMConstInt(cg->i64_type, 0, false), idx_alloca);
+      LLVMBuildStore(cg->builder, result_arr, res_alloca);
+      
+      LLVMBasicBlockRef loop_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "map.loop");
+      LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "map.body");
+      LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "map.end");
+      
+      LLVMBuildBr(cg->builder, loop_bb);
+      LLVMPositionBuilderAtEnd(cg->builder, loop_bb);
+      
+      LLVMValueRef idx = LLVMBuildLoad2(cg->builder, cg->i64_type, idx_alloca, "i");
+      LLVMValueRef cond = LLVMBuildICmp(cg->builder, LLVMIntSLT, idx, len, "map_cond");
+      LLVMBuildCondBr(cg->builder, cond, body_bb, end_bb);
+      
+      LLVMPositionBuilderAtEnd(cg->builder, body_bb);
+      
+      /* Get element at index from source array: __qisc_array_get(arr, idx) */
+      LLVMValueRef fn_array_get = LLVMGetNamedFunction(cg->mod, "__qisc_array_get");
+      LLVMTypeRef arr_get_type = LLVMFunctionType(cg->i8ptr_type,
+          (LLVMTypeRef[]){cg->i8ptr_type, cg->i64_type}, 2, false);
+      LLVMValueRef elem_ptr = LLVMBuildCall2(cg->builder, arr_get_type, fn_array_get,
+          (LLVMValueRef[]){arr, idx}, 2, "elem_ptr");
+      LLVMValueRef elem = LLVMBuildLoad2(cg->builder, cg->i64_type, elem_ptr, "elem");
+      
+      /* Call fn(elem) */
+      LLVMTypeRef map_fn_type = LLVMFunctionType(cg->i64_type,
+          (LLVMTypeRef[]){cg->i64_type}, 1, false);
+      LLVMValueRef mapped = LLVMBuildCall2(cg->builder, map_fn_type, fn_ptr,
+          (LLVMValueRef[]){elem}, 1, "mapped");
+      
+      /* Store mapped value in temp alloca for push */
+      LLVMValueRef val_alloca = LLVMBuildAlloca(cg->builder, cg->i64_type, "map_val");
+      LLVMBuildStore(cg->builder, mapped, val_alloca);
+      
+      /* Push to result array */
+      LLVMValueRef fn_array_push = LLVMGetNamedFunction(cg->mod, "__qisc_array_push");
+      LLVMTypeRef arr_push_type = LLVMFunctionType(cg->i8ptr_type,
+          (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2, false);
+      LLVMValueRef cur_res = LLVMBuildLoad2(cg->builder, cg->i8ptr_type, res_alloca, "cur_res");
+      LLVMValueRef new_res = LLVMBuildCall2(cg->builder, arr_push_type, fn_array_push,
+          (LLVMValueRef[]){cur_res, val_alloca}, 2, "pushed");
+      LLVMBuildStore(cg->builder, new_res, res_alloca);
+      
+      /* Increment index */
+      LLVMValueRef next_idx = LLVMBuildAdd(cg->builder, idx, LLVMConstInt(cg->i64_type, 1, false), "map_next");
+      LLVMBuildStore(cg->builder, next_idx, idx_alloca);
+      LLVMBuildBr(cg->builder, loop_bb);
+      
+      LLVMPositionBuilderAtEnd(cg->builder, end_bb);
+      return LLVMBuildLoad2(cg->builder, cg->i8ptr_type, res_alloca, "map_final");
+    }
+    return LLVMConstNull(cg->i8ptr_type);
+  }
+
+  /* Handle builtin: filter(array, predicate) -> array of elements where predicate is true */
+  if (strcmp(fname, "filter") == 0) {
+    if (argc >= 2) {
+      LLVMValueRef arr = emit_expr(cg, node->as.call.args.items[0]);
+      LLVMValueRef pred_fn = emit_expr(cg, node->as.call.args.items[1]);
+      
+      /* Get array length */
+      LLVMValueRef fn_array_len = LLVMGetNamedFunction(cg->mod, "__qisc_array_len");
+      LLVMTypeRef arr_len_type = LLVMFunctionType(cg->i64_type,
+          (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+      LLVMValueRef len = LLVMBuildCall2(cg->builder, arr_len_type, fn_array_len,
+          (LLVMValueRef[]){arr}, 1, "filter_len");
+      
+      /* Create result array (start with capacity = len, will only keep matching) */
+      LLVMValueRef fn_array_new = LLVMGetNamedFunction(cg->mod, "__qisc_array_new");
+      LLVMTypeRef arr_new_type = LLVMFunctionType(cg->i8ptr_type,
+          (LLVMTypeRef[]){cg->i64_type, cg->i64_type}, 2, false);
+      LLVMValueRef elem_size = LLVMConstInt(cg->i64_type, 8, false);
+      LLVMValueRef result_arr = LLVMBuildCall2(cg->builder, arr_new_type, fn_array_new,
+          (LLVMValueRef[]){elem_size, len}, 2, "filter_result");
+      
+      /* Loop variables */
+      LLVMValueRef idx_alloca = LLVMBuildAlloca(cg->builder, cg->i64_type, "filter_idx");
+      LLVMValueRef res_alloca = LLVMBuildAlloca(cg->builder, cg->i8ptr_type, "filter_res");
+      LLVMBuildStore(cg->builder, LLVMConstInt(cg->i64_type, 0, false), idx_alloca);
+      LLVMBuildStore(cg->builder, result_arr, res_alloca);
+      
+      LLVMBasicBlockRef loop_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "filter.loop");
+      LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "filter.body");
+      LLVMBasicBlockRef then_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "filter.then");
+      LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "filter.cont");
+      LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "filter.end");
+      
+      LLVMBuildBr(cg->builder, loop_bb);
+      LLVMPositionBuilderAtEnd(cg->builder, loop_bb);
+      
+      LLVMValueRef idx = LLVMBuildLoad2(cg->builder, cg->i64_type, idx_alloca, "i");
+      LLVMValueRef cond = LLVMBuildICmp(cg->builder, LLVMIntSLT, idx, len, "filter_cond");
+      LLVMBuildCondBr(cg->builder, cond, body_bb, end_bb);
+      
+      LLVMPositionBuilderAtEnd(cg->builder, body_bb);
+      
+      /* Get element at index */
+      LLVMValueRef fn_array_get = LLVMGetNamedFunction(cg->mod, "__qisc_array_get");
+      LLVMTypeRef arr_get_type = LLVMFunctionType(cg->i8ptr_type,
+          (LLVMTypeRef[]){cg->i8ptr_type, cg->i64_type}, 2, false);
+      LLVMValueRef elem_ptr = LLVMBuildCall2(cg->builder, arr_get_type, fn_array_get,
+          (LLVMValueRef[]){arr, idx}, 2, "elem_ptr");
+      LLVMValueRef elem = LLVMBuildLoad2(cg->builder, cg->i64_type, elem_ptr, "elem");
+      
+      /* Call predicate(elem) */
+      LLVMTypeRef pred_fn_type = LLVMFunctionType(cg->i64_type,
+          (LLVMTypeRef[]){cg->i64_type}, 1, false);
+      LLVMValueRef pred_result = LLVMBuildCall2(cg->builder, pred_fn_type, pred_fn,
+          (LLVMValueRef[]){elem}, 1, "pred_result");
+      
+      /* If predicate is truthy (non-zero), add to result */
+      LLVMValueRef is_truthy = LLVMBuildICmp(cg->builder, LLVMIntNE, pred_result,
+          LLVMConstInt(cg->i64_type, 0, false), "is_truthy");
+      LLVMBuildCondBr(cg->builder, is_truthy, then_bb, cont_bb);
+      
+      LLVMPositionBuilderAtEnd(cg->builder, then_bb);
+      
+      /* Push elem to result array */
+      LLVMValueRef val_alloca = LLVMBuildAlloca(cg->builder, cg->i64_type, "filter_val");
+      LLVMBuildStore(cg->builder, elem, val_alloca);
+      
+      LLVMValueRef fn_array_push = LLVMGetNamedFunction(cg->mod, "__qisc_array_push");
+      LLVMTypeRef arr_push_type = LLVMFunctionType(cg->i8ptr_type,
+          (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2, false);
+      LLVMValueRef cur_res = LLVMBuildLoad2(cg->builder, cg->i8ptr_type, res_alloca, "cur_res");
+      LLVMValueRef new_res = LLVMBuildCall2(cg->builder, arr_push_type, fn_array_push,
+          (LLVMValueRef[]){cur_res, val_alloca}, 2, "pushed");
+      LLVMBuildStore(cg->builder, new_res, res_alloca);
+      LLVMBuildBr(cg->builder, cont_bb);
+      
+      LLVMPositionBuilderAtEnd(cg->builder, cont_bb);
+      
+      /* Increment index */
+      LLVMValueRef next_idx = LLVMBuildAdd(cg->builder, idx, LLVMConstInt(cg->i64_type, 1, false), "filter_next");
+      LLVMBuildStore(cg->builder, next_idx, idx_alloca);
+      LLVMBuildBr(cg->builder, loop_bb);
+      
+      LLVMPositionBuilderAtEnd(cg->builder, end_bb);
+      return LLVMBuildLoad2(cg->builder, cg->i8ptr_type, res_alloca, "filter_final");
+    }
+    return LLVMConstNull(cg->i8ptr_type);
+  }
+
+  /* Handle builtin: reduce(array, fn, initial) -> single value */
+  if (strcmp(fname, "reduce") == 0) {
+    if (argc >= 3) {
+      LLVMValueRef arr = emit_expr(cg, node->as.call.args.items[0]);
+      LLVMValueRef reduce_fn = emit_expr(cg, node->as.call.args.items[1]);
+      LLVMValueRef initial = emit_expr(cg, node->as.call.args.items[2]);
+      
+      /* Get array length */
+      LLVMValueRef fn_array_len = LLVMGetNamedFunction(cg->mod, "__qisc_array_len");
+      LLVMTypeRef arr_len_type = LLVMFunctionType(cg->i64_type,
+          (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+      LLVMValueRef len = LLVMBuildCall2(cg->builder, arr_len_type, fn_array_len,
+          (LLVMValueRef[]){arr}, 1, "reduce_len");
+      
+      /* Loop: acc = initial; for (i = 0; i < len; i++) acc = fn(acc, arr[i]); */
+      LLVMValueRef idx_alloca = LLVMBuildAlloca(cg->builder, cg->i64_type, "reduce_idx");
+      LLVMValueRef acc_alloca = LLVMBuildAlloca(cg->builder, cg->i64_type, "reduce_acc");
+      LLVMBuildStore(cg->builder, LLVMConstInt(cg->i64_type, 0, false), idx_alloca);
+      LLVMBuildStore(cg->builder, initial, acc_alloca);
+      
+      LLVMBasicBlockRef loop_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "reduce.loop");
+      LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "reduce.body");
+      LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "reduce.end");
+      
+      LLVMBuildBr(cg->builder, loop_bb);
+      LLVMPositionBuilderAtEnd(cg->builder, loop_bb);
+      
+      LLVMValueRef idx = LLVMBuildLoad2(cg->builder, cg->i64_type, idx_alloca, "i");
+      LLVMValueRef cond = LLVMBuildICmp(cg->builder, LLVMIntSLT, idx, len, "reduce_cond");
+      LLVMBuildCondBr(cg->builder, cond, body_bb, end_bb);
+      
+      LLVMPositionBuilderAtEnd(cg->builder, body_bb);
+      
+      /* Get element at index */
+      LLVMValueRef fn_array_get = LLVMGetNamedFunction(cg->mod, "__qisc_array_get");
+      LLVMTypeRef arr_get_type = LLVMFunctionType(cg->i8ptr_type,
+          (LLVMTypeRef[]){cg->i8ptr_type, cg->i64_type}, 2, false);
+      LLVMValueRef elem_ptr = LLVMBuildCall2(cg->builder, arr_get_type, fn_array_get,
+          (LLVMValueRef[]){arr, idx}, 2, "elem_ptr");
+      LLVMValueRef elem = LLVMBuildLoad2(cg->builder, cg->i64_type, elem_ptr, "elem");
+      
+      /* Load current accumulator */
+      LLVMValueRef acc = LLVMBuildLoad2(cg->builder, cg->i64_type, acc_alloca, "acc");
+      
+      /* Call fn(acc, elem) */
+      LLVMTypeRef reduce_fn_type = LLVMFunctionType(cg->i64_type,
+          (LLVMTypeRef[]){cg->i64_type, cg->i64_type}, 2, false);
+      LLVMValueRef new_acc = LLVMBuildCall2(cg->builder, reduce_fn_type, reduce_fn,
+          (LLVMValueRef[]){acc, elem}, 2, "new_acc");
+      
+      /* Store new accumulator */
+      LLVMBuildStore(cg->builder, new_acc, acc_alloca);
+      
+      /* Increment index */
+      LLVMValueRef next_idx = LLVMBuildAdd(cg->builder, idx, LLVMConstInt(cg->i64_type, 1, false), "reduce_next");
+      LLVMBuildStore(cg->builder, next_idx, idx_alloca);
+      LLVMBuildBr(cg->builder, loop_bb);
+      
+      LLVMPositionBuilderAtEnd(cg->builder, end_bb);
+      return LLVMBuildLoad2(cg->builder, cg->i64_type, acc_alloca, "reduce_final");
+    }
+    return LLVMConstInt(cg->i64_type, 0, false);
+  }
+
+  /* Handle builtin: collect(stream_or_array) -> array (materializes lazy evaluation) */
+  if (strcmp(fname, "collect") == 0) {
+    if (argc >= 1) {
+      /* For now, collect just returns its argument as arrays are already eager */
+      return emit_expr(cg, node->as.call.args.items[0]);
+    }
+    return LLVMConstNull(cg->i8ptr_type);
+  }
+
   /* Regular function call */
   LLVMValueRef fn = LLVMGetNamedFunction(cg->mod, fname);
   if (!fn) {
@@ -673,38 +1864,55 @@ static LLVMValueRef emit_call(Codegen *cg, AstNode *node) {
   return result;
 }
 
-/* Emit array literal: [a, b, c] → malloc + store elements */
+/* Emit array literal: [a, b, c] → __qisc_array_from for length tracking */
 static LLVMValueRef emit_array_literal(Codegen *cg, AstNode *node) {
   int count = node->as.array_literal.elements.count;
 
-  /* Allocate array: malloc(count * sizeof(i64)) */
+  /* Allocate temp stack space for elements */
   LLVMValueRef fn_malloc = LLVMGetNamedFunction(cg->mod, "malloc");
   if (!fn_malloc) {
     LLVMTypeRef mt = LLVMFunctionType(cg->i8ptr_type,
                                       (LLVMTypeRef[]){cg->i64_type}, 1, false);
     fn_malloc = LLVMAddFunction(cg->mod, "malloc", mt);
   }
-  LLVMValueRef size = LLVMConstInt(cg->i64_type, count * 8, false);
+  
+  /* Allocate temporary buffer for element values */
+  LLVMValueRef temp_size = LLVMConstInt(cg->i64_type, count * 8, false);
   LLVMTypeRef mt =
       LLVMFunctionType(cg->i8ptr_type, (LLVMTypeRef[]){cg->i64_type}, 1, false);
-  LLVMValueRef raw = LLVMBuildCall2(cg->builder, mt, fn_malloc,
-                                    (LLVMValueRef[]){size}, 1, "arr_raw");
+  LLVMValueRef temp_buf = LLVMBuildCall2(cg->builder, mt, fn_malloc,
+                                    (LLVMValueRef[]){temp_size}, 1, "temp_buf");
 
-  /* Cast to i64* for indexing */
-  LLVMTypeRef arr_ptr_type = LLVMPointerTypeInContext(cg->ctx, 0);
-  (void)arr_ptr_type;
-
-  /* Store elements */
+  /* Store elements into temp buffer */
   for (int i = 0; i < count; i++) {
     LLVMValueRef val = emit_expr(cg, node->as.array_literal.elements.items[i]);
     LLVMValueRef idx = LLVMConstInt(cg->i64_type, i, false);
     LLVMValueRef ptr =
-        LLVMBuildGEP2(cg->builder, cg->i64_type, raw, &idx, 1, "elem_ptr");
+        LLVMBuildGEP2(cg->builder, cg->i64_type, temp_buf, &idx, 1, "elem_ptr");
     LLVMBuildStore(cg->builder, val, ptr);
   }
 
-  /* Also store the count in the scope for sizeof */
-  return raw;
+  /* Call __qisc_array_from(temp_buf, elem_size=8, count) */
+  LLVMValueRef fn_array_from = LLVMGetNamedFunction(cg->mod, "__qisc_array_from");
+  LLVMTypeRef arr_from_type = LLVMFunctionType(cg->i8ptr_type,
+      (LLVMTypeRef[]){cg->i8ptr_type, cg->i64_type, cg->i64_type}, 3, false);
+  LLVMValueRef elem_size = LLVMConstInt(cg->i64_type, 8, false);
+  LLVMValueRef elem_count = LLVMConstInt(cg->i64_type, count, false);
+  LLVMValueRef arr = LLVMBuildCall2(cg->builder, arr_from_type, fn_array_from,
+      (LLVMValueRef[]){temp_buf, elem_size, elem_count}, 3, "arr");
+
+  /* Free temp buffer */
+  LLVMValueRef fn_free = LLVMGetNamedFunction(cg->mod, "free");
+  if (!fn_free) {
+    LLVMTypeRef free_t = LLVMFunctionType(cg->void_type,
+                                          (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+    fn_free = LLVMAddFunction(cg->mod, "free", free_t);
+  }
+  LLVMTypeRef free_t = LLVMFunctionType(cg->void_type,
+                                        (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+  LLVMBuildCall2(cg->builder, free_t, fn_free, (LLVMValueRef[]){temp_buf}, 1, "");
+
+  return arr;
 }
 
 /* Emit array index: arr[idx] → GEP + load */
@@ -956,6 +2164,56 @@ static void emit_var_decl(Codegen *cg, AstNode *node) {
                      len_alloca);
       cg_define(cg, len_name, len_alloca, cg->i64_type);
     }
+    /* Track array length for pipeline results (filter, map, range, etc.) */
+    else if (var_type == cg->i8ptr_type) {
+      /* Only track length if this looks like an array operation */
+      AstNode *init = node->as.var_decl.initializer;
+      bool is_array_op = false;
+      
+      /* Check for pipeline with array operations */
+      if (init->type == AST_BINARY_OP) {
+        AstNode *rhs = init->as.binary.right;
+        if (rhs && rhs->type == AST_CALL) {
+          const char *fn = NULL;
+          if (rhs->as.call.callee && rhs->as.call.callee->type == AST_IDENTIFIER) {
+            fn = rhs->as.call.callee->as.identifier.name;
+          }
+          if (fn && (strcmp(fn, "filter") == 0 || strcmp(fn, "map") == 0 ||
+                     strcmp(fn, "collect") == 0)) {
+            is_array_op = true;
+          }
+        }
+      }
+      /* Check for direct call to range */
+      else if (init->type == AST_CALL) {
+        if (init->as.call.callee && init->as.call.callee->type == AST_IDENTIFIER) {
+          const char *fn = init->as.call.callee->as.identifier.name;
+          if (fn && strcmp(fn, "range") == 0) {
+            is_array_op = true;
+          }
+        }
+      }
+      
+      if (is_array_op) {
+        char len_name[300];
+        snprintf(len_name, sizeof(len_name), "__%s__len", name);
+        LLVMValueRef len_alloca =
+            LLVMBuildAlloca(cg->builder, cg->i64_type, len_name);
+        
+        /* Call __qisc_array_len(init_val) */
+        LLVMValueRef fn_len = LLVMGetNamedFunction(cg->mod, "__qisc_array_len");
+        if (fn_len) {
+          LLVMTypeRef len_fn_type = LLVMFunctionType(cg->i64_type,
+              (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+          LLVMValueRef runtime_len = LLVMBuildCall2(cg->builder, len_fn_type, fn_len,
+              (LLVMValueRef[]){init_val}, 1, "arr_len");
+          LLVMBuildStore(cg->builder, runtime_len, len_alloca);
+        } else {
+          LLVMBuildStore(cg->builder, LLVMConstInt(cg->i64_type, 0, false), len_alloca);
+        }
+        cg_define(cg, len_name, len_alloca, cg->i64_type);
+      }
+    }
     return;
   }
 
@@ -1050,6 +2308,11 @@ static void emit_give(Codegen *cg, AstNode *node) {
     }
   }
 
+  /* Profile instrumentation: inject exit call before return */
+  if (cg->profile_enabled && cg->fn_profile_exit && cg->current_fn_name) {
+    emit_profile_call(cg, cg->fn_profile_exit, cg->current_fn_name);
+  }
+
   if (val)
     LLVMBuildRet(cg->builder, val);
   else
@@ -1122,15 +2385,21 @@ static void emit_while(Codegen *cg, AstNode *node) {
     cond = LLVMBuildICmp(cg->builder, LLVMIntNE, cond,
                          LLVMConstNull(LLVMTypeOf(cond)), "tobool");
   }
-  LLVMBuildCondBr(cg->builder, cond, body_bb, end_bb);
+  LLVMValueRef cond_br = LLVMBuildCondBr(cg->builder, cond, body_bb, end_bb);
+  
+  /* Apply loop pragma metadata (vectorization, etc.) */
+  cg_apply_loop_pragmas(cg, cond_br);
 
   /* Body */
   LLVMPositionBuilderAtEnd(cg->builder, body_bb);
   cg_push_scope(cg);
   emit_stmt(cg, node->as.while_stmt.body);
   cg_pop_scope(cg);
-  if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(cg->builder)))
-    LLVMBuildBr(cg->builder, cond_bb);
+  if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(cg->builder))) {
+    LLVMValueRef back_edge = LLVMBuildBr(cg->builder, cond_bb);
+    /* Apply loop metadata to back-edge as well */
+    cg_apply_loop_pragmas(cg, back_edge);
+  }
 
   /* End */
   LLVMPositionBuilderAtEnd(cg->builder, end_bb);
@@ -1314,7 +2583,9 @@ static void emit_for(Codegen *cg, AstNode *node) {
         cond = LLVMBuildICmp(cg->builder, LLVMIntNE, cond,
                              LLVMConstNull(LLVMTypeOf(cond)), "tobool");
       }
-      LLVMBuildCondBr(cg->builder, cond, body_bb, end_bb);
+      LLVMValueRef cond_br = LLVMBuildCondBr(cg->builder, cond, body_bb, end_bb);
+      /* Apply loop pragma metadata (vectorization, etc.) */
+      cg_apply_loop_pragmas(cg, cond_br);
     } else {
       LLVMBuildBr(cg->builder, body_bb);
     }
@@ -1330,7 +2601,9 @@ static void emit_for(Codegen *cg, AstNode *node) {
     if (node->as.for_stmt.update) {
       emit_stmt(cg, node->as.for_stmt.update);
     }
-    LLVMBuildBr(cg->builder, cond_bb);
+    LLVMValueRef back_edge = LLVMBuildBr(cg->builder, cond_bb);
+    /* Apply loop pragma metadata to back-edge */
+    cg_apply_loop_pragmas(cg, back_edge);
   }
 
 for_end:
@@ -1363,6 +2636,11 @@ static void emit_stmt(Codegen *cg, AstNode *node) {
   /* Skip if current block is already terminated */
   if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(cg->builder)))
     return;
+
+  /* Check for personality-aware line notes */
+  if (cg->debug_personality_enabled && node->line > 0) {
+    add_line_personality(cg, node->line);
+  }
 
   switch (node->type) {
   case AST_VAR_DECL:
@@ -1593,15 +2871,202 @@ static void emit_stmt(Codegen *cg, AstNode *node) {
     break;
   }
 
-  case AST_TRY:
-  case AST_FAIL:
-    /* Try/catch: for now, just execute the try block */
-    if (node->type == AST_TRY && node->as.try_stmt.try_block) {
+  case AST_TRY: {
+    /* Try/catch using setjmp/longjmp runtime support.
+     * 1. Call __qisc_try_push() to get jump buffer pointer
+     * 2. Call setjmp() on the buffer
+     * 3. If setjmp returns 0: execute try block, then pop and jump to end
+     * 4. If setjmp returns non-zero: execute catch block, then pop and jump to end */
+    
+    LLVMBasicBlockRef try_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "try.body");
+    LLVMBasicBlockRef catch_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "try.catch");
+    LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "try.end");
+    
+    /* Get or declare __qisc_try_push (returns jmp_buf*) */
+    LLVMValueRef fn_try_push = LLVMGetNamedFunction(cg->mod, "__qisc_try_push");
+    if (!fn_try_push) {
+      LLVMTypeRef ret_type = LLVMPointerType(cg->i8_type, 0);
+      LLVMTypeRef fn_type = LLVMFunctionType(ret_type, NULL, 0, false);
+      fn_try_push = LLVMAddFunction(cg->mod, "__qisc_try_push", fn_type);
+    }
+    
+    /* Get or declare __qisc_try_pop */
+    LLVMValueRef fn_try_pop = LLVMGetNamedFunction(cg->mod, "__qisc_try_pop");
+    if (!fn_try_pop) {
+      LLVMTypeRef fn_type = LLVMFunctionType(cg->void_type, NULL, 0, false);
+      fn_try_pop = LLVMAddFunction(cg->mod, "__qisc_try_pop", fn_type);
+    }
+    
+    /* Get or declare setjmp (returns int, takes jmp_buf*) */
+    LLVMValueRef fn_setjmp = LLVMGetNamedFunction(cg->mod, "setjmp");
+    if (!fn_setjmp) {
+      LLVMTypeRef param_types[] = { LLVMPointerType(cg->i8_type, 0) };
+      LLVMTypeRef fn_type = LLVMFunctionType(LLVMInt32TypeInContext(cg->ctx), param_types, 1, false);
+      fn_setjmp = LLVMAddFunction(cg->mod, "setjmp", fn_type);
+      LLVMSetFunctionCallConv(fn_setjmp, LLVMCCallConv);
+      LLVMAddAttributeAtIndex(fn_setjmp, LLVMAttributeFunctionIndex,
+        LLVMCreateEnumAttribute(cg->ctx, LLVMGetEnumAttributeKindForName("returns_twice", 13), 0));
+    }
+    
+    /* Call __qisc_try_push() to get jump buffer */
+    LLVMTypeRef push_fn_type = LLVMFunctionType(LLVMPointerType(cg->i8_type, 0), NULL, 0, false);
+    LLVMValueRef jmp_buf_ptr = LLVMBuildCall2(cg->builder, push_fn_type, fn_try_push, NULL, 0, "jmpbuf");
+    
+    /* Call setjmp(jmp_buf_ptr) */
+    LLVMTypeRef setjmp_param_types[] = { LLVMPointerType(cg->i8_type, 0) };
+    LLVMTypeRef setjmp_fn_type = LLVMFunctionType(LLVMInt32TypeInContext(cg->ctx), setjmp_param_types, 1, false);
+    LLVMValueRef setjmp_args[] = { jmp_buf_ptr };
+    LLVMValueRef setjmp_ret = LLVMBuildCall2(cg->builder, setjmp_fn_type, fn_setjmp, setjmp_args, 1, "setjmp.ret");
+    
+    /* If setjmp returns 0, go to try block; otherwise go to catch */
+    LLVMValueRef zero = LLVMConstInt(LLVMInt32TypeInContext(cg->ctx), 0, false);
+    LLVMValueRef is_try = LLVMBuildICmp(cg->builder, LLVMIntEQ, setjmp_ret, zero, "is.try");
+    LLVMBuildCondBr(cg->builder, is_try, try_bb, catch_bb);
+    
+    /* Try block */
+    LLVMPositionBuilderAtEnd(cg->builder, try_bb);
+    if (node->as.try_stmt.try_block) {
       cg_push_scope(cg);
       emit_stmt(cg, node->as.try_stmt.try_block);
       cg_pop_scope(cg);
     }
+    /* Pop context and jump to end on normal completion */
+    if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(cg->builder))) {
+      LLVMTypeRef pop_fn_type = LLVMFunctionType(cg->void_type, NULL, 0, false);
+      LLVMBuildCall2(cg->builder, pop_fn_type, fn_try_pop, NULL, 0, "");
+      LLVMBuildBr(cg->builder, end_bb);
+    }
+    
+    /* Catch block */
+    LLVMPositionBuilderAtEnd(cg->builder, catch_bb);
+    
+    /* Get or declare __qisc_get_error() to retrieve error message */
+    LLVMValueRef fn_get_error = LLVMGetNamedFunction(cg->mod, "__qisc_get_error");
+    if (!fn_get_error) {
+      LLVMTypeRef ret_type = LLVMPointerType(cg->i8_type, 0);
+      LLVMTypeRef fn_type = LLVMFunctionType(ret_type, NULL, 0, false);
+      fn_get_error = LLVMAddFunction(cg->mod, "__qisc_get_error", fn_type);
+    }
+    
+    for (int i = 0; i < node->as.try_stmt.catches.count; i++) {
+      AstNode *catch_node = node->as.try_stmt.catches.items[i];
+      if (!catch_node) continue;
+      
+      cg_push_scope(cg);
+      
+      /* Extract error variable name from the catch node (stored as condition identifier) */
+      if (catch_node->type == AST_IF && catch_node->as.if_stmt.condition &&
+          catch_node->as.if_stmt.condition->type == AST_IDENTIFIER) {
+        const char *err_var_name = catch_node->as.if_stmt.condition->as.identifier.name;
+        
+        /* Call __qisc_get_error() to get error info pointer (for now just use message) */
+        LLVMTypeRef get_err_fn_type = LLVMFunctionType(LLVMPointerType(cg->i8_type, 0), NULL, 0, false);
+        LLVMValueRef err_ptr = LLVMBuildCall2(cg->builder, get_err_fn_type, fn_get_error, NULL, 0, "err.ptr");
+        
+        /* Define the error variable as a string (pointing to error message in QiscError struct) */
+        LLVMValueRef err_alloca = LLVMBuildAlloca(cg->builder, cg->i8ptr_type, err_var_name);
+        LLVMBuildStore(cg->builder, err_ptr, err_alloca);
+        cg_define(cg, err_var_name, err_alloca, cg->i8ptr_type);
+      }
+      
+      /* Emit the catch body (stored in then_branch) */
+      if (catch_node->type == AST_IF && catch_node->as.if_stmt.then_branch) {
+        emit_stmt(cg, catch_node->as.if_stmt.then_branch);
+      } else {
+        emit_stmt(cg, catch_node);
+      }
+      
+      cg_pop_scope(cg);
+    }
+    /* Pop context and jump to end after catch */
+    if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(cg->builder))) {
+      LLVMTypeRef pop_fn_type = LLVMFunctionType(cg->void_type, NULL, 0, false);
+      LLVMBuildCall2(cg->builder, pop_fn_type, fn_try_pop, NULL, 0, "");
+      LLVMBuildBr(cg->builder, end_bb);
+    }
+    
+    LLVMPositionBuilderAtEnd(cg->builder, end_bb);
     break;
+  }
+
+  case AST_FAIL: {
+    /* fail "message" or fail ErrorType(data) — calls __qisc_fail */
+    
+    /* Get or declare __qisc_fail(const char *message, int code) */
+    LLVMValueRef fn_fail = LLVMGetNamedFunction(cg->mod, "__qisc_fail");
+    if (!fn_fail) {
+      LLVMTypeRef param_types[] = { 
+        LLVMPointerType(cg->i8_type, 0),  /* message */
+        LLVMInt32TypeInContext(cg->ctx)    /* code */
+      };
+      LLVMTypeRef fn_type = LLVMFunctionType(cg->void_type, param_types, 2, false);
+      fn_fail = LLVMAddFunction(cg->mod, "__qisc_fail", fn_type);
+      LLVMAddAttributeAtIndex(fn_fail, LLVMAttributeFunctionIndex,
+        LLVMCreateEnumAttribute(cg->ctx, LLVMGetEnumAttributeKindForName("noreturn", 8), 0));
+    }
+    
+    /* Get the message - handle error type calls like FileNotFound(path) */
+    LLVMValueRef msg;
+    AstNode *err = node->as.fail_stmt.error;
+    if (err && err->type == AST_CALL && err->as.call.callee && 
+        err->as.call.callee->type == AST_IDENTIFIER) {
+      /* fail ErrorType(data) - convert to string message */
+      const char *err_name = err->as.call.callee->as.identifier.name;
+      
+      /* If there's an argument, use it as the message detail */
+      if (err->as.call.args.count > 0) {
+        LLVMValueRef detail = emit_expr(cg, err->as.call.args.items[0]);
+        /* Concatenate error name with detail */
+        char fmt_buf[256];
+        snprintf(fmt_buf, sizeof(fmt_buf), "%s: %%s", err_name);
+        LLVMValueRef fmt = LLVMBuildGlobalStringPtr(cg->builder, fmt_buf, "err.fmt");
+        
+        /* Allocate buffer for full message */
+        LLVMValueRef buf = LLVMBuildArrayAlloca(
+            cg->builder, cg->i8_type,
+            LLVMConstInt(LLVMInt32TypeInContext(cg->ctx), 256, false), "err.buf");
+        
+        /* Call sprintf to format message */
+        LLVMValueRef fn_sprintf = LLVMGetNamedFunction(cg->mod, "sprintf");
+        if (!fn_sprintf) {
+          LLVMTypeRef sprintf_type = LLVMFunctionType(
+              LLVMInt32TypeInContext(cg->ctx),
+              (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2, true);
+          fn_sprintf = LLVMAddFunction(cg->mod, "sprintf", sprintf_type);
+        }
+        LLVMTypeRef sprintf_type = LLVMFunctionType(
+            LLVMInt32TypeInContext(cg->ctx),
+            (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2, true);
+        LLVMValueRef sprintf_args[] = {buf, fmt, detail};
+        LLVMBuildCall2(cg->builder, sprintf_type, fn_sprintf, sprintf_args, 3, "");
+        msg = buf;
+      } else {
+        msg = LLVMBuildGlobalStringPtr(cg->builder, err_name, "err.name");
+      }
+    } else if (err) {
+      msg = emit_expr(cg, err);
+    } else {
+      msg = LLVMBuildGlobalStringPtr(cg->builder, "fail", "fail.msg");
+    }
+    
+    /* Ensure msg is a pointer (strings) */
+    if (LLVMTypeOf(msg) != cg->i8ptr_type) {
+      /* Convert non-string to string representation */
+      msg = emit_str_call(cg, msg);
+    }
+    
+    /* Call __qisc_fail(message, 1) */
+    LLVMTypeRef fail_param_types[] = { 
+      LLVMPointerType(cg->i8_type, 0),
+      LLVMInt32TypeInContext(cg->ctx)
+    };
+    LLVMTypeRef fail_fn_type = LLVMFunctionType(cg->void_type, fail_param_types, 2, false);
+    LLVMValueRef one = LLVMConstInt(LLVMInt32TypeInContext(cg->ctx), 1, false);
+    LLVMValueRef args[] = { msg, one };
+    LLVMBuildCall2(cg->builder, fail_fn_type, fn_fail, args, 2, "");
+    LLVMBuildUnreachable(cg->builder);
+    break;
+  }
 
   case AST_PROC:
     /* Nested proc — handled at top level in emit_program */
@@ -1611,6 +3076,21 @@ static void emit_stmt(Codegen *cg, AstNode *node) {
     cg_error(cg, "Unsupported statement type: %d", node->type);
     break;
   }
+}
+
+/* ======== Profile Instrumentation Helpers ======== */
+
+/* Emit a call to __qisc_profile_fn_enter or __qisc_profile_fn_exit */
+static void emit_profile_call(Codegen *cg, LLVMValueRef fn_profile, 
+                               const char *func_name) {
+  if (!fn_profile) return;
+  
+  /* Create global string constant for function name */
+  LLVMValueRef name_str = LLVMBuildGlobalStringPtr(cg->builder, func_name, "");
+  LLVMTypeRef fn_type = LLVMFunctionType(cg->void_type,
+      (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+  LLVMBuildCall2(cg->builder, fn_type, fn_profile, 
+                 (LLVMValueRef[]){name_str}, 1, "");
 }
 
 /* ======== Procedure Emission ======== */
@@ -1648,12 +3128,27 @@ static void emit_proc(Codegen *cg, AstNode *node) {
   }
   LLVMSetLinkage(fn, LLVMExternalLinkage);
 
+  /* Apply pragma-controlled LLVM attributes to function */
+  cg_apply_pragma_attrs(cg, fn);
+
+  /* Add personality-aware debug comments for this function */
+  if (cg->debug_personality_enabled) {
+    add_function_debug_comments(cg, fn, name);
+    add_debug_personality_comment(cg, name, 4);  /* Function prologue */
+  }
+
   /* Create entry block */
   LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(cg->ctx, fn, "entry");
   LLVMPositionBuilderAtEnd(cg->builder, entry);
 
   cg->current_fn = fn;
+  cg->current_fn_name = name;  /* Track for profile exit calls in give statements */
   cg_push_scope(cg);
+
+  /* Profile instrumentation: inject entry call */
+  if (cg->profile_enabled && cg->fn_profile_enter) {
+    emit_profile_call(cg, cg->fn_profile_enter, name);
+  }
 
   /* Alloca params */
   for (int i = 0; i < param_count; i++) {
@@ -1674,6 +3169,10 @@ static void emit_proc(Codegen *cg, AstNode *node) {
 
   /* Add implicit return if block not terminated */
   if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(cg->builder))) {
+    /* Profile instrumentation: inject exit call before implicit return */
+    if (cg->profile_enabled && cg->fn_profile_exit) {
+      emit_profile_call(cg, cg->fn_profile_exit, name);
+    }
     if (ret_type == cg->void_type)
       LLVMBuildRetVoid(cg->builder);
     else
@@ -1689,11 +3188,118 @@ static void emit_proc(Codegen *cg, AstNode *node) {
   }
 }
 
+/* ======== Pragma Processing ======== */
+
+static void process_pragma(Codegen *cg, AstNode *pragma) {
+  if (!pragma || pragma->type != AST_PRAGMA)
+    return;
+  
+  const char *name = pragma->as.pragma.name;
+  const char *value = pragma->as.pragma.value;
+  
+  if (!name)
+    return;
+  
+  /* Context pragmas */
+  if (strcmp(name, "context") == 0) {
+    if (value) {
+      if (strcmp(value, "cli") == 0)
+        cg->pragma_opts.context = CG_CONTEXT_CLI;
+      else if (strcmp(value, "server") == 0)
+        cg->pragma_opts.context = CG_CONTEXT_SERVER;
+      else if (strcmp(value, "web") == 0)
+        cg->pragma_opts.context = CG_CONTEXT_WEB;
+      else if (strcmp(value, "embedded") == 0)
+        cg->pragma_opts.context = CG_CONTEXT_EMBEDDED;
+      else if (strcmp(value, "notebook") == 0)
+        cg->pragma_opts.context = CG_CONTEXT_NOTEBOOK;
+    }
+  }
+  /* Optimization pragmas */
+  else if (strcmp(name, "optimize") == 0) {
+    if (value) {
+      if (strcmp(value, "latency") == 0)
+        cg->pragma_opts.opt_focus = CG_OPT_LATENCY;
+      else if (strcmp(value, "throughput") == 0)
+        cg->pragma_opts.opt_focus = CG_OPT_THROUGHPUT;
+      else if (strcmp(value, "memory") == 0)
+        cg->pragma_opts.opt_focus = CG_OPT_MEMORY;
+      else if (strcmp(value, "size") == 0)
+        cg->pragma_opts.opt_focus = CG_OPT_SIZE;
+      else if (strcmp(value, "balanced") == 0)
+        cg->pragma_opts.opt_focus = CG_OPT_BALANCED;
+    }
+  }
+  /* Inline control */
+  else if (strcmp(name, "inline") == 0) {
+    if (value) {
+      if (strcmp(value, "always") == 0 || strcmp(value, "yes") == 0)
+        cg->pragma_opts.enable_inline = true;
+      else if (strcmp(value, "never") == 0 || strcmp(value, "no") == 0)
+        cg->pragma_opts.enable_inline = false;
+    }
+  }
+  /* Vectorization */
+  else if (strcmp(name, "vectorize") == 0) {
+    if (value) {
+      if (strcmp(value, "auto") == 0 || strcmp(value, "yes") == 0)
+        cg->pragma_opts.enable_vectorize = true;
+      else if (strcmp(value, "no") == 0)
+        cg->pragma_opts.enable_vectorize = false;
+    }
+  }
+  /* Compiler personality is handled at CLI level, but we note it */
+  else if (strcmp(name, "compiler_personality") == 0) {
+    /* Handled in CLI */
+  }
+  /* Hot path - aggressive optimization */
+  else if (strcmp(name, "hot_path") == 0) {
+    cg->pragma_opts.mark_hot_path = true;
+    cg->pragma_opts.enable_inline = true;  /* Force aggressive inlining */
+  }
+  /* Cold path - skip expensive optimizations */
+  else if (strcmp(name, "cold_path") == 0) {
+    cg->pragma_opts.mark_cold_path = true;
+  }
+  /* Profile directives */
+  else if (strcmp(name, "profile") == 0) {
+    if (value) {
+      if (strcmp(value, "this") == 0)
+        cg->pragma_opts.profile_this = true;
+      else if (strcmp(value, "ignore") == 0)
+        cg->pragma_opts.profile_ignore = true;
+    }
+  }
+  /* Parallel auto-parallelization hint */
+  else if (strcmp(name, "parallel") == 0) {
+    if (value && strcmp(value, "auto") == 0)
+      cg->pragma_opts.enable_parallel = true;
+  }
+  /* Bounds checking control */
+  else if (strcmp(name, "bounds_check") == 0) {
+    if (value && strcmp(value, "off") == 0) {
+      fprintf(stderr, "Warning: bounds_check:off is unsafe, use with caution\n");
+      cg->pragma_opts.disable_bounds = true;
+    }
+  }
+  /* Memoization hint */
+  else if (strcmp(name, "memoize") == 0) {
+    if (value && strcmp(value, "auto") == 0)
+      cg->pragma_opts.enable_memoize = true;
+  }
+}
+
 /* ======== Program Emission ======== */
 
 static void emit_program(Codegen *cg, AstNode *program) {
   if (!program || program->type != AST_PROGRAM)
     return;
+
+  /* Pass 0: Process all pragmas first */
+  for (int i = 0; i < program->as.program.pragmas.count; i++) {
+    AstNode *pragma = program->as.program.pragmas.items[i];
+    process_pragma(cg, pragma);
+  }
 
   /* Pass 1: register struct types (must come before function declarations
    * so that return types like `gives Point` can resolve to struct pointers) */
@@ -1809,6 +3415,12 @@ static void emit_program(Codegen *cg, AstNode *program) {
     if (cg->had_error)
       return;
   }
+
+  /* Add personality-aware compilation metadata */
+  if (cg->debug_personality_enabled) {
+    add_compilation_metadata(cg);
+    add_debug_easter_egg_string(cg);
+  }
 }
 
 /* ======== Public API ======== */
@@ -1834,9 +3446,153 @@ void codegen_init(Codegen *cg, const char *module_name) {
                        (LLVMTypeRef[]){cg->i8ptr_type}, 1, true);
   cg->fn_printf = LLVMAddFunction(cg->mod, "printf", printf_type);
 
+  /* Declare array runtime functions */
+  /* __qisc_array_from(void *elements, size_t elem_size, size_t count) -> void* */
+  LLVMTypeRef arr_from_type = LLVMFunctionType(cg->i8ptr_type,
+      (LLVMTypeRef[]){cg->i8ptr_type, cg->i64_type, cg->i64_type}, 3, false);
+  LLVMAddFunction(cg->mod, "__qisc_array_from", arr_from_type);
+
+  /* __qisc_array_len(void *array) -> size_t */
+  LLVMTypeRef arr_len_type = LLVMFunctionType(cg->i64_type,
+      (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+  LLVMAddFunction(cg->mod, "__qisc_array_len", arr_len_type);
+
+  /* __qisc_array_push(void *array, void *element) -> void* */
+  LLVMTypeRef arr_push_type = LLVMFunctionType(cg->i8ptr_type,
+      (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2, false);
+  LLVMAddFunction(cg->mod, "__qisc_array_push", arr_push_type);
+
+  /* __qisc_array_pop(void *array) -> void* */
+  LLVMTypeRef arr_pop_type = LLVMFunctionType(cg->i8ptr_type,
+      (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+  LLVMAddFunction(cg->mod, "__qisc_array_pop", arr_pop_type);
+
+  /* __qisc_array_new(size_t elem_size, size_t initial_capacity) -> void* */
+  LLVMTypeRef arr_new_type = LLVMFunctionType(cg->i8ptr_type,
+      (LLVMTypeRef[]){cg->i64_type, cg->i64_type}, 2, false);
+  LLVMAddFunction(cg->mod, "__qisc_array_new", arr_new_type);
+
+  /* __qisc_array_get(void *array, size_t index) -> void* (element pointer) */
+  LLVMTypeRef arr_get_type = LLVMFunctionType(cg->i8ptr_type,
+      (LLVMTypeRef[]){cg->i8ptr_type, cg->i64_type}, 2, false);
+  LLVMAddFunction(cg->mod, "__qisc_array_get", arr_get_type);
+
   /* Initialize scope */
   cg->scope_depth = 0;
   cg->scopes[0].count = 0;
+
+  /* Initialize pragma options with defaults */
+  cg->pragma_opts.context = CG_CONTEXT_CLI;
+  cg->pragma_opts.opt_focus = CG_OPT_BALANCED;
+  cg->pragma_opts.enable_inline = true;
+  cg->pragma_opts.enable_vectorize = false;
+  cg->pragma_opts.strict_math = false;
+#ifdef DEBUG
+  cg->pragma_opts.debug_info = true;
+#else
+  cg->pragma_opts.debug_info = false;
+#endif
+
+  /* Profile instrumentation disabled by default */
+  cg->profile_enabled = false;
+  cg->fn_profile_enter = NULL;
+  cg->fn_profile_exit = NULL;
+
+  /* Personality-aware debug info disabled by default */
+  cg->personality = QISC_PERSONALITY_OFF;
+  cg->debug_personality_enabled = false;
+  cg->optimization_count = 0;
+}
+
+void codegen_set_personality(Codegen *cg, QiscPersonality personality) {
+  cg->personality = personality;
+  
+  /* Enable debug personality for cryptic and snarky modes */
+  if (personality == QISC_PERSONALITY_CRYPTIC ||
+      personality == QISC_PERSONALITY_SNARKY) {
+    cg->debug_personality_enabled = true;
+    
+    /* Seed random for easter eggs */
+    srand((unsigned int)time(NULL));
+  }
+}
+
+void codegen_enable_profiling(Codegen *cg) {
+  cg->profile_enabled = true;
+  
+  /* Declare __qisc_profile_fn_enter(const char* name) -> void */
+  LLVMTypeRef enter_type = LLVMFunctionType(cg->void_type,
+      (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+  cg->fn_profile_enter = LLVMAddFunction(cg->mod, "__qisc_profile_fn_enter", enter_type);
+  
+  /* Declare __qisc_profile_fn_exit(const char* name) -> void */
+  LLVMTypeRef exit_type = LLVMFunctionType(cg->void_type,
+      (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+  cg->fn_profile_exit = LLVMAddFunction(cg->mod, "__qisc_profile_fn_exit", exit_type);
+}
+
+void codegen_set_context(Codegen *cg, int context) {
+  if (!cg) return;
+  
+  switch (context) {
+    case CG_CONTEXT_CLI:
+    case CG_CONTEXT_SERVER:
+    case CG_CONTEXT_WEB:
+    case CG_CONTEXT_EMBEDDED:
+    case CG_CONTEXT_NOTEBOOK:
+      cg->pragma_opts.context = context;
+      break;
+    default:
+      cg->pragma_opts.context = CG_CONTEXT_CLI;
+      break;
+  }
+  
+  /* Apply context-specific default options */
+  switch (cg->pragma_opts.context) {
+    case CG_CONTEXT_CLI:
+      cg->pragma_opts.opt_focus = CG_OPT_SIZE;
+      cg->pragma_opts.enable_inline = false;
+      break;
+    case CG_CONTEXT_SERVER:
+      cg->pragma_opts.opt_focus = CG_OPT_THROUGHPUT;
+      cg->pragma_opts.enable_inline = true;
+      cg->pragma_opts.enable_vectorize = true;
+      break;
+    case CG_CONTEXT_EMBEDDED:
+      cg->pragma_opts.opt_focus = CG_OPT_SIZE;
+      cg->pragma_opts.enable_inline = false;
+      cg->pragma_opts.enable_vectorize = false;
+      break;
+    case CG_CONTEXT_WEB:
+      cg->pragma_opts.opt_focus = CG_OPT_SIZE;
+      cg->pragma_opts.enable_inline = false;
+      break;
+    case CG_CONTEXT_NOTEBOOK:
+      cg->pragma_opts.opt_focus = CG_OPT_BALANCED;
+      cg->pragma_opts.debug_info = true;
+      break;
+    default:
+      break;
+  }
+}
+
+const char *codegen_get_context_description(Codegen *cg) {
+  if (!cg) return "unknown";
+  
+  switch (cg->pragma_opts.context) {
+    case CG_CONTEXT_CLI:
+      return "cli (optimize startup, small binary)";
+    case CG_CONTEXT_SERVER:
+      return "server (optimize throughput, aggressive inlining)";
+    case CG_CONTEXT_EMBEDDED:
+      return "embedded (optimize size, energy, minimal features)";
+    case CG_CONTEXT_WEB:
+      return "web (optimize for WASM, small binary, fast startup)";
+    case CG_CONTEXT_NOTEBOOK:
+      return "notebook (optimize for interactive, keep debug info)";
+    default:
+      return "unknown";
+  }
 }
 
 int codegen_emit(Codegen *cg, AstNode *program) {
@@ -1878,8 +3634,31 @@ int codegen_write_object(Codegen *cg, const char *path) {
     return 1;
   }
 
+  /* Get context-specific optimization level */
+  LLVMCodeGenOptLevel opt_level = cg_get_context_opt_level(cg);
+  
+  /* Get context-specific CPU features */
+  const char *cpu_features = "";
+  switch (cg->pragma_opts.context) {
+    case CG_CONTEXT_SERVER:
+      /* Server: enable all available features for throughput */
+      cpu_features = "+sse4.2,+avx";
+      break;
+    case CG_CONTEXT_EMBEDDED:
+      /* Embedded: minimal features for portability */
+      cpu_features = "";
+      break;
+    case CG_CONTEXT_WEB:
+      /* Web: WASM-compatible features */
+      cpu_features = "";
+      break;
+    default:
+      cpu_features = "";
+      break;
+  }
+
   LLVMTargetMachineRef machine = LLVMCreateTargetMachine(
-      target, triple, "generic", "", LLVMCodeGenLevelDefault, LLVMRelocPIC,
+      target, triple, "generic", cpu_features, opt_level, LLVMRelocPIC,
       LLVMCodeModelDefault);
 
   LLVMTargetDataRef data_layout = LLVMCreateTargetDataLayout(machine);
@@ -1909,6 +3688,17 @@ void codegen_free(Codegen *cg) {
       free(cg->scopes[d].symbols[i].name);
     }
   }
+  
+  /* Free syntax-aware IR generation resources */
+  if (cg->syntax_profile) {
+    syntax_profile_free(cg->syntax_profile);
+    cg->syntax_profile = NULL;
+  }
+  if (cg->ir_hints) {
+    ir_hints_free(cg->ir_hints);
+    cg->ir_hints = NULL;
+  }
+  
   LLVMDisposeBuilder(cg->builder);
   LLVMDisposeModule(cg->mod);
   LLVMContextDispose(cg->ctx);

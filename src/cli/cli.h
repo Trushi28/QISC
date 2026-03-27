@@ -14,6 +14,7 @@ typedef enum {
   CLI_CMD_RUN,
   CLI_CMD_VERSION,
   CLI_CMD_HELP,
+  CLI_CMD_ACHIEVEMENTS,
 } CliCommand;
 
 /* Parsed CLI arguments */

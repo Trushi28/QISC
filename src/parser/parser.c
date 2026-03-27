@@ -1553,6 +1553,16 @@ static AstNode *declaration(Parser *parser) {
 
 /* ======== Pragma Parsing ======== */
 
+/* Check if token type can be used as a pragma value (identifiers and keywords) */
+static bool is_pragma_value_token(TokenType type) {
+  /* Accept identifiers */
+  if (type == TOK_IDENT) return true;
+  /* Accept keywords that might be used as pragma values */
+  if (type == TOK_AUTO) return true;  /* for parallel:auto, memoize:auto */
+  if (type == TOK_TRUE || type == TOK_FALSE) return true;
+  return false;
+}
+
 static AstNode *parse_pragma(Parser *parser) {
   /* #pragma consumed, now expect name:value */
   int line = parser->previous.line;
@@ -1563,8 +1573,13 @@ static AstNode *parse_pragma(Parser *parser) {
 
   char *value = NULL;
   if (match(parser, TOK_COLON)) {
-    consume(parser, TOK_IDENT, "Expected pragma value");
-    value = token_string(&parser->previous);
+    /* Accept identifiers or keywords as pragma values */
+    if (is_pragma_value_token(parser->current.type)) {
+      advance(parser);
+      value = token_string(&parser->previous);
+    } else {
+      parser_error_at_current(parser, "Expected pragma value");
+    }
   }
 
   AstNode *pragma = calloc(1, sizeof(AstNode));

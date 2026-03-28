@@ -1,0 +1,9 @@
+proc add(int a, int b) gives int {
+    give a + b;
+}
+
+proc main() gives int {
+    const answer = 1;
+    answer = 2;
+    give add("bad", 1);
+}

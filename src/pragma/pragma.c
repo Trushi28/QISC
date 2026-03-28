@@ -11,7 +11,7 @@
 
 /* Known pragma directives */
 static const char *KNOWN_STYLE_PRAGMAS[] = {
-    "strict", "relaxed", "verbose", "quiet", NULL
+    "pipeline", "functional", "imperative", "brace", "python", "expression", NULL
 };
 
 static const char *KNOWN_CONTEXT_PRAGMAS[] = {
@@ -111,7 +111,7 @@ PragmaValidation pragma_validate_syntax(const char *pragma_text) {
             if (!is_known_directive(value, KNOWN_STYLE_PRAGMAS)) {
                 result.valid = true;
                 result.warning = "Unknown style pragma value";
-                result.suggestion = "Known values: strict, relaxed, verbose, quiet";
+                result.suggestion = "Known values: pipeline, functional, imperative, brace, python, expression";
                 return result;
             }
         } else if (strcmp(directive, "context") == 0) {

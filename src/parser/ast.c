@@ -234,6 +234,12 @@ void ast_free(AstNode *node) {
     type_info_free(node->as.proc.return_type);
     ast_free(node->as.proc.body);
     break;
+  case AST_MODULE:
+    free(node->as.module_decl.name);
+    break;
+  case AST_IMPORT:
+    free(node->as.import_decl.path);
+    break;
   case AST_PROGRAM:
     ast_array_free(&node->as.program.declarations);
     ast_array_free(&node->as.program.pragmas);

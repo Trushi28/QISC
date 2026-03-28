@@ -369,6 +369,377 @@ static CgSymbol *cg_lookup(Codegen *cg, const char *name) {
 
 /* ======== Type Helpers ======== */
 
+typedef enum {
+  CG_STREAM_NONE = 0,
+  CG_STREAM_INT = 1,
+  CG_STREAM_STRING = 2,
+} CgStreamKind;
+
+typedef enum {
+  CG_VALUE_UNKNOWN = 0,
+  CG_VALUE_INT = 1,
+  CG_VALUE_STRING = 2,
+  CG_VALUE_BOOL = 3,
+} CgValueKind;
+
+static LLVMValueRef emit_expr(Codegen *cg, AstNode *node);
+static CgStreamKind cg_stream_kind_from_callable(Codegen *cg, AstNode *node,
+                                                 CgStreamKind input_kind);
+
+static bool cg_expr_is_array_like(Codegen *cg, AstNode *node) {
+  if (!cg || !node)
+    return false;
+
+  switch (node->type) {
+  case AST_ARRAY_LITERAL:
+  case AST_PIPELINE:
+    return true;
+  case AST_IDENTIFIER: {
+    char len_name[300];
+    snprintf(len_name, sizeof(len_name), "__%s__len", node->as.identifier.name);
+    return cg_lookup(cg, len_name) != NULL;
+  }
+  case AST_CALL:
+    if (node->as.call.callee && node->as.call.callee->type == AST_IDENTIFIER) {
+      const char *name = node->as.call.callee->as.identifier.name;
+      return strcmp(name, "range") == 0 || strcmp(name, "map") == 0 ||
+             strcmp(name, "filter") == 0 || strcmp(name, "collect") == 0 ||
+             strcmp(name, "stream_collect") == 0 ||
+             strcmp(name, "stdin_lines") == 0 || strcmp(name, "file_lines") == 0 ||
+             strcmp(name, "take") == 0 || strcmp(name, "skip") == 0;
+    }
+    return false;
+  default:
+    return false;
+  }
+}
+
+static CgStreamKind cg_expr_stream_kind(Codegen *cg, AstNode *node) {
+  if (!cg || !node)
+    return CG_STREAM_NONE;
+
+  switch (node->type) {
+  case AST_IDENTIFIER: {
+    char int_name[300];
+    char string_name[300];
+    snprintf(int_name, sizeof(int_name), "__%s__stream_int",
+             node->as.identifier.name);
+    snprintf(string_name, sizeof(string_name), "__%s__stream_string",
+             node->as.identifier.name);
+    if (cg_lookup(cg, int_name))
+      return CG_STREAM_INT;
+    if (cg_lookup(cg, string_name))
+      return CG_STREAM_STRING;
+    return CG_STREAM_NONE;
+  }
+  case AST_CALL:
+    if (node->as.call.callee && node->as.call.callee->type == AST_IDENTIFIER) {
+      const char *name = node->as.call.callee->as.identifier.name;
+      if (strcmp(name, "stream_range") == 0)
+        return CG_STREAM_INT;
+      if (strcmp(name, "stream_file_lines") == 0)
+        return CG_STREAM_STRING;
+      if ((strcmp(name, "stream_take") == 0 || strcmp(name, "stream_skip") == 0 ||
+           strcmp(name, "stream_filter") == 0) &&
+          node->as.call.args.count >= 1)
+        return cg_expr_stream_kind(cg, node->as.call.args.items[0]);
+      if (strcmp(name, "stream_map") == 0 &&
+          node->as.call.args.count >= 2) {
+        CgStreamKind result_kind =
+            cg_stream_kind_from_callable(cg, node->as.call.args.items[1],
+                                         cg_expr_stream_kind(cg, node->as.call.args.items[0]));
+        if (result_kind != CG_STREAM_NONE)
+          return result_kind;
+        return cg_expr_stream_kind(cg, node->as.call.args.items[0]);
+      }
+    }
+    return CG_STREAM_NONE;
+  case AST_BINARY_OP:
+    if (node->as.binary.op == OP_PIPELINE) {
+      CgStreamKind left_kind = cg_expr_stream_kind(cg, node->as.binary.left);
+      AstNode *rhs = node->as.binary.right;
+      if (left_kind != CG_STREAM_NONE && rhs && rhs->type == AST_CALL &&
+          rhs->as.call.callee &&
+          rhs->as.call.callee->type == AST_IDENTIFIER) {
+        const char *name = rhs->as.call.callee->as.identifier.name;
+        if (strcmp(name, "stream_take") == 0 || strcmp(name, "stream_skip") == 0 ||
+            strcmp(name, "stream_filter") == 0)
+          return left_kind;
+        if (strcmp(name, "stream_map") == 0 && rhs->as.call.args.count >= 1) {
+          CgStreamKind result_kind =
+              cg_stream_kind_from_callable(cg, rhs->as.call.args.items[0],
+                                           left_kind);
+          return result_kind != CG_STREAM_NONE ? result_kind : left_kind;
+        }
+      }
+    }
+    return CG_STREAM_NONE;
+  default:
+    return CG_STREAM_NONE;
+  }
+}
+
+static bool cg_expr_is_stream_like(Codegen *cg, AstNode *node) {
+  return cg_expr_stream_kind(cg, node) != CG_STREAM_NONE;
+}
+
+static CgStreamKind cg_stream_kind_from_type_name(const char *name) {
+  if (!name)
+    return CG_STREAM_NONE;
+  if (strcmp(name, "int") == 0 || strcmp(name, "i64") == 0)
+    return CG_STREAM_INT;
+  if (strcmp(name, "string") == 0)
+    return CG_STREAM_STRING;
+  return CG_STREAM_NONE;
+}
+
+static CgValueKind cg_value_kind_from_type_name(const char *name) {
+  if (!name)
+    return CG_VALUE_UNKNOWN;
+  if (strcmp(name, "int") == 0 || strcmp(name, "i64") == 0)
+    return CG_VALUE_INT;
+  if (strcmp(name, "string") == 0)
+    return CG_VALUE_STRING;
+  if (strcmp(name, "bool") == 0)
+    return CG_VALUE_BOOL;
+  return CG_VALUE_UNKNOWN;
+}
+
+static CgValueKind cg_value_kind_from_stream_kind(CgStreamKind kind) {
+  if (kind == CG_STREAM_INT)
+    return CG_VALUE_INT;
+  if (kind == CG_STREAM_STRING)
+    return CG_VALUE_STRING;
+  return CG_VALUE_UNKNOWN;
+}
+
+static LLVMTypeRef cg_llvm_type_from_value_kind(Codegen *cg, CgValueKind kind) {
+  switch (kind) {
+  case CG_VALUE_INT:
+    return cg->i64_type;
+  case CG_VALUE_STRING:
+    return cg->i8ptr_type;
+  case CG_VALUE_BOOL:
+    return cg->i1_type;
+  default:
+    return NULL;
+  }
+}
+
+static CgValueKind cg_lambda_body_kind(Codegen *cg, AstNode *node,
+                                       const char *param_name,
+                                       CgValueKind param_kind) {
+  if (!cg || !node)
+    return CG_VALUE_UNKNOWN;
+
+  switch (node->type) {
+  case AST_INT_LITERAL:
+    return CG_VALUE_INT;
+  case AST_STRING_LITERAL:
+    return CG_VALUE_STRING;
+  case AST_BOOL_LITERAL:
+    return CG_VALUE_BOOL;
+  case AST_IDENTIFIER:
+    if (param_name && strcmp(node->as.identifier.name, param_name) == 0)
+      return param_kind;
+    return CG_VALUE_UNKNOWN;
+  case AST_UNARY_OP:
+    if (node->as.unary.op == OP_NOT)
+      return CG_VALUE_BOOL;
+    return cg_lambda_body_kind(cg, node->as.unary.operand, param_name,
+                               param_kind);
+  case AST_BINARY_OP: {
+    if (node->as.binary.op == OP_EQ || node->as.binary.op == OP_NE ||
+        node->as.binary.op == OP_LT || node->as.binary.op == OP_GT ||
+        node->as.binary.op == OP_LE || node->as.binary.op == OP_GE ||
+        node->as.binary.op == OP_AND || node->as.binary.op == OP_OR)
+      return CG_VALUE_BOOL;
+
+    CgValueKind left =
+        cg_lambda_body_kind(cg, node->as.binary.left, param_name, param_kind);
+    CgValueKind right =
+        cg_lambda_body_kind(cg, node->as.binary.right, param_name, param_kind);
+
+    if (node->as.binary.op == OP_ADD &&
+        (left == CG_VALUE_STRING || right == CG_VALUE_STRING))
+      return CG_VALUE_STRING;
+    if (left == CG_VALUE_INT && right == CG_VALUE_INT)
+      return CG_VALUE_INT;
+    return CG_VALUE_UNKNOWN;
+  }
+  case AST_CALL:
+    if (node->as.call.callee && node->as.call.callee->type == AST_IDENTIFIER) {
+      const char *name = node->as.call.callee->as.identifier.name;
+      if (strcmp(name, "str") == 0)
+        return CG_VALUE_STRING;
+      if (strcmp(name, "len") == 0)
+        return CG_VALUE_INT;
+      if (strcmp(name, "stdin_text") == 0 || strcmp(name, "read_file") == 0)
+        return CG_VALUE_STRING;
+      if (strcmp(name, "int_parse") == 0)
+        return CG_VALUE_INT;
+      if (strcmp(name, "abs") == 0 || strcmp(name, "min") == 0 ||
+          strcmp(name, "max") == 0)
+        return CG_VALUE_INT;
+      if (cg->program_ast && cg->program_ast->type == AST_PROGRAM) {
+        for (int i = 0; i < cg->program_ast->as.program.declarations.count; i++) {
+          AstNode *decl = cg->program_ast->as.program.declarations.items[i];
+          if (decl->type == AST_PROC && decl->as.proc.name &&
+              strcmp(decl->as.proc.name, name) == 0) {
+            if (!decl->as.proc.return_type)
+              return CG_VALUE_UNKNOWN;
+            return cg_value_kind_from_type_name(decl->as.proc.return_type->name);
+          }
+        }
+      }
+    }
+    return CG_VALUE_UNKNOWN;
+  case AST_BLOCK:
+    return CG_VALUE_UNKNOWN;
+  default:
+    return CG_VALUE_UNKNOWN;
+  }
+}
+
+static CgStreamKind cg_stream_kind_from_callable(Codegen *cg, AstNode *node,
+                                                 CgStreamKind input_kind) {
+  if (!cg || !node)
+    return CG_STREAM_NONE;
+
+  if (node->type == AST_IDENTIFIER && cg->program_ast &&
+      cg->program_ast->type == AST_PROGRAM) {
+    const char *name = node->as.identifier.name;
+    for (int i = 0; i < cg->program_ast->as.program.declarations.count; i++) {
+      AstNode *decl = cg->program_ast->as.program.declarations.items[i];
+      if (decl->type == AST_PROC && decl->as.proc.name &&
+          strcmp(decl->as.proc.name, name) == 0) {
+        if (!decl->as.proc.return_type)
+          return CG_STREAM_NONE;
+        return cg_stream_kind_from_type_name(decl->as.proc.return_type->name);
+      }
+    }
+  }
+
+  if (node->type == AST_LAMBDA) {
+    const char *param_name = NULL;
+    CgValueKind param_kind = cg_value_kind_from_stream_kind(input_kind);
+    CgValueKind body_kind;
+
+    if (node->as.lambda.params.count != 1 || !node->as.lambda.body)
+      return CG_STREAM_NONE;
+
+    AstNode *param = node->as.lambda.params.items[0];
+    if (param->type == AST_VAR_DECL)
+      param_name = param->as.var_decl.name;
+    else if (param->type == AST_IDENTIFIER)
+      param_name = param->as.identifier.name;
+
+    body_kind =
+        cg_lambda_body_kind(cg, node->as.lambda.body, param_name, param_kind);
+    if (body_kind == CG_VALUE_INT)
+      return CG_STREAM_INT;
+    if (body_kind == CG_VALUE_STRING)
+      return CG_STREAM_STRING;
+  }
+
+  return CG_STREAM_NONE;
+}
+
+static LLVMValueRef cg_coerce_value(Codegen *cg, LLVMValueRef value,
+                                    LLVMTypeRef target_type) {
+  LLVMTypeRef source_type;
+
+  if (!cg || !value || !target_type)
+    return value;
+
+  source_type = LLVMTypeOf(value);
+  if (source_type == target_type)
+    return value;
+
+  if (target_type == cg->i1_type) {
+    if (source_type == cg->i64_type)
+      return LLVMBuildICmp(cg->builder, LLVMIntNE, value,
+                           LLVMConstInt(cg->i64_type, 0, false), "boolcast");
+    if (source_type == cg->i8ptr_type)
+      return LLVMBuildICmp(cg->builder, LLVMIntNE, value,
+                           LLVMConstNull(cg->i8ptr_type), "boolcast");
+  }
+
+  if (target_type == cg->i64_type && source_type == cg->i1_type)
+    return LLVMBuildZExt(cg->builder, value, cg->i64_type, "intcast");
+
+  if (target_type == cg->i8ptr_type && source_type == cg->i8ptr_type)
+    return value;
+
+  cg_error(cg, "Unsupported lambda return coercion");
+  return value;
+}
+
+static LLVMValueRef cg_emit_stream_callable(Codegen *cg, AstNode *callable,
+                                            CgStreamKind input_kind,
+                                            LLVMTypeRef expected_return_type) {
+  bool saved_active;
+  LLVMTypeRef saved_param;
+  LLVMTypeRef saved_return;
+  LLVMTypeRef param_type;
+  LLVMValueRef fn;
+
+  if (!cg || !callable)
+    return NULL;
+
+  if (callable->type != AST_LAMBDA)
+    return emit_expr(cg, callable);
+
+  if (callable->as.lambda.params.count != 1) {
+    cg_error(cg, "Lazy stream lambdas must take exactly one parameter");
+    return LLVMConstNull(cg->i8ptr_type);
+  }
+
+  param_type = input_kind == CG_STREAM_STRING ? cg->i8ptr_type : cg->i64_type;
+  saved_active = cg->lambda_hint_active;
+  saved_param = cg->lambda_hint_param_type;
+  saved_return = cg->lambda_hint_return_type;
+
+  cg->lambda_hint_active = true;
+  cg->lambda_hint_param_type = param_type;
+  cg->lambda_hint_return_type = expected_return_type;
+  fn = emit_expr(cg, callable);
+  cg->lambda_hint_active = saved_active;
+  cg->lambda_hint_param_type = saved_param;
+  cg->lambda_hint_return_type = saved_return;
+  return fn;
+}
+
+static const char *cg_stream_map_runtime_name(CgStreamKind source_kind,
+                                              CgStreamKind target_kind) {
+  if (source_kind == CG_STREAM_INT && target_kind == CG_STREAM_STRING)
+    return "__qisc_stream_map_i64_to_strings";
+  if (source_kind == CG_STREAM_STRING && target_kind == CG_STREAM_INT)
+    return "__qisc_stream_map_strings_to_i64";
+  if (source_kind == CG_STREAM_STRING)
+    return "__qisc_stream_map_strings";
+  return "__qisc_stream_map_i64";
+}
+
+static const char *cg_stream_filter_runtime_name(CgStreamKind kind) {
+  return kind == CG_STREAM_STRING ? "__qisc_stream_filter_strings"
+                                  : "__qisc_stream_filter_i64";
+}
+
+static LLVMValueRef cg_emit_strlen(Codegen *cg, LLVMValueRef val) {
+  LLVMValueRef fn_strlen = LLVMGetNamedFunction(cg->mod, "strlen");
+  if (!fn_strlen) {
+    LLVMTypeRef st = LLVMFunctionType(cg->i64_type,
+                                      (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+    fn_strlen = LLVMAddFunction(cg->mod, "strlen", st);
+  }
+
+  LLVMTypeRef st = LLVMFunctionType(cg->i64_type,
+                                    (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+  return LLVMBuildCall2(cg->builder, st, fn_strlen, (LLVMValueRef[]){val}, 1,
+                        "slen");
+}
+
 static LLVMTypeRef cg_type_from_name(Codegen *cg, const char *name) {
   if (!name)
     return cg->i64_type;
@@ -446,6 +817,9 @@ static LLVMValueRef emit_expr(Codegen *cg, AstNode *node);
 static void emit_stmt(Codegen *cg, AstNode *node);
 static void emit_block(Codegen *cg, AstNode *node);
 static void emit_profile_call(Codegen *cg, LLVMValueRef fn_profile, const char *name);
+static void emit_profile_branch_call(Codegen *cg, const char *location, bool taken);
+static void emit_profile_loop_call(Codegen *cg, const char *location,
+                                   LLVMValueRef iterations);
 
 /* ======== Context-Specific Compilation ======== */
 
@@ -465,6 +839,73 @@ static LLVMCodeGenOptLevel cg_get_context_opt_level(Codegen *cg) {
     default:
       return LLVMCodeGenLevelDefault;
   }
+}
+
+void codegen_set_syntax_mode(Codegen *cg, SyntaxProfile *profile) {
+  if (!cg)
+    return;
+
+  if (cg->syntax_profile) {
+    syntax_profile_free(cg->syntax_profile);
+    cg->syntax_profile = NULL;
+  }
+  if (cg->ir_hints) {
+    ir_hints_free(cg->ir_hints);
+    cg->ir_hints = NULL;
+  }
+
+  cg->syntax_mode = CG_SYNTAX_MODE_DEFAULT;
+
+  if (!profile)
+    return;
+
+  cg->syntax_profile = syntax_profile_clone(profile);
+  cg->ir_hints = ir_hints_from_profile(profile);
+
+  if (cg->ir_hints) {
+    switch (cg->ir_hints->mode) {
+    case IR_MODE_STREAM:
+      cg->syntax_mode = CG_SYNTAX_MODE_PIPELINE;
+      break;
+    case IR_MODE_DATAFLOW:
+      cg->syntax_mode = CG_SYNTAX_MODE_FUNCTIONAL;
+      break;
+    case IR_MODE_CONTROLFLOW:
+      cg->syntax_mode = CG_SYNTAX_MODE_IMPERATIVE;
+      break;
+    case IR_MODE_DEFAULT:
+    default:
+      cg->syntax_mode = CG_SYNTAX_MODE_DEFAULT;
+      break;
+    }
+  }
+
+  OptStrategy *strategy = strategy_for_syntax(profile);
+  if (!strategy)
+    return;
+
+  if (strategy->enable_parallel)
+    cg->pragma_opts.enable_parallel = true;
+  if (strategy->enable_vectorization || strategy->enable_simd)
+    cg->pragma_opts.enable_vectorize = true;
+  if (strategy->enable_inlining)
+    cg->pragma_opts.enable_inline = true;
+  if (strategy->enable_memoization)
+    cg->pragma_opts.enable_memoize = true;
+
+  opt_strategy_free(strategy);
+}
+
+void codegen_set_syntax_mode_from_pragma(Codegen *cg, const char *style) {
+  if (!cg || !style)
+    return;
+
+  SyntaxProfile *profile = parse_syntax_pragma("style", style);
+  if (!profile)
+    return;
+
+  codegen_set_syntax_mode(cg, profile);
+  syntax_profile_free(profile);
 }
 
 /* Apply context-specific function attributes */
@@ -808,6 +1249,160 @@ static LLVMValueRef emit_binary(Codegen *cg, AstNode *node) {
       const char *fname = NULL;
       if (rhs->as.call.callee && rhs->as.call.callee->type == AST_IDENTIFIER)
         fname = rhs->as.call.callee->as.identifier.name;
+
+      if (fname && strcmp(fname, "stream_take") == 0 &&
+          rhs->as.call.args.count >= 1) {
+        LLVMValueRef amount = emit_expr(cg, rhs->as.call.args.items[0]);
+        LLVMValueRef fn_stream =
+            LLVMGetNamedFunction(cg->mod, "__qisc_stream_take_i64");
+        if (!fn_stream) {
+          LLVMTypeRef fn_type = LLVMFunctionType(
+              cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type, cg->i64_type}, 2,
+              false);
+          fn_stream =
+              LLVMAddFunction(cg->mod, "__qisc_stream_take_i64", fn_type);
+        }
+        LLVMTypeRef fn_type = LLVMFunctionType(
+            cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type, cg->i64_type}, 2,
+            false);
+        return LLVMBuildCall2(cg->builder, fn_type, fn_stream,
+                              (LLVMValueRef[]){left_val, amount}, 2,
+                              "stream_take");
+      }
+
+      if (fname && strcmp(fname, "stream_skip") == 0 &&
+          rhs->as.call.args.count >= 1) {
+        LLVMValueRef amount = emit_expr(cg, rhs->as.call.args.items[0]);
+        LLVMValueRef fn_stream =
+            LLVMGetNamedFunction(cg->mod, "__qisc_stream_skip_i64");
+        if (!fn_stream) {
+          LLVMTypeRef fn_type = LLVMFunctionType(
+              cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type, cg->i64_type}, 2,
+              false);
+          fn_stream =
+              LLVMAddFunction(cg->mod, "__qisc_stream_skip_i64", fn_type);
+        }
+        LLVMTypeRef fn_type = LLVMFunctionType(
+            cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type, cg->i64_type}, 2,
+            false);
+        return LLVMBuildCall2(cg->builder, fn_type, fn_stream,
+                              (LLVMValueRef[]){left_val, amount}, 2,
+                              "stream_skip");
+      }
+
+      if (fname && strcmp(fname, "stream_map") == 0 &&
+          rhs->as.call.args.count >= 1) {
+        CgStreamKind source_kind = cg_expr_stream_kind(cg, node->as.binary.left);
+        CgStreamKind target_kind = source_kind;
+        if (rhs->as.call.args.count >= 1) {
+          CgStreamKind inferred =
+              cg_stream_kind_from_callable(cg, rhs->as.call.args.items[0],
+                                           source_kind);
+          if (inferred != CG_STREAM_NONE)
+            target_kind = inferred;
+        }
+        LLVMTypeRef target_type =
+            target_kind == CG_STREAM_STRING ? cg->i8ptr_type : cg->i64_type;
+        LLVMValueRef mapper = cg_emit_stream_callable(
+            cg, rhs->as.call.args.items[0], source_kind, target_type);
+        const char *rt_name =
+            cg_stream_map_runtime_name(source_kind, target_kind);
+        LLVMValueRef fn_stream = LLVMGetNamedFunction(cg->mod, rt_name);
+        if (!fn_stream) {
+          LLVMTypeRef fn_type = LLVMFunctionType(
+              cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2,
+              false);
+          fn_stream = LLVMAddFunction(cg->mod, rt_name, fn_type);
+        }
+        LLVMTypeRef fn_type = LLVMFunctionType(
+            cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2,
+            false);
+        return LLVMBuildCall2(cg->builder, fn_type, fn_stream,
+                              (LLVMValueRef[]){left_val, mapper}, 2,
+                              "stream_map");
+      }
+
+      if (fname && strcmp(fname, "stream_filter") == 0 &&
+          rhs->as.call.args.count >= 1) {
+        CgStreamKind kind = cg_expr_stream_kind(cg, node->as.binary.left);
+        LLVMValueRef pred = cg_emit_stream_callable(
+            cg, rhs->as.call.args.items[0], kind, cg->i1_type);
+        const char *rt_name = cg_stream_filter_runtime_name(kind);
+        LLVMValueRef fn_stream = LLVMGetNamedFunction(cg->mod, rt_name);
+        if (!fn_stream) {
+          LLVMTypeRef fn_type = LLVMFunctionType(
+              cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2,
+              false);
+          fn_stream = LLVMAddFunction(cg->mod, rt_name, fn_type);
+        }
+        LLVMTypeRef fn_type = LLVMFunctionType(
+            cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2,
+            false);
+        return LLVMBuildCall2(cg->builder, fn_type, fn_stream,
+                              (LLVMValueRef[]){left_val, pred}, 2,
+                              "stream_filter");
+      }
+
+      if (fname && strcmp(fname, "stream_count") == 0) {
+        LLVMValueRef fn_stream =
+            LLVMGetNamedFunction(cg->mod, "__qisc_stream_count_i64");
+        if (!fn_stream) {
+          LLVMTypeRef fn_type = LLVMFunctionType(
+              cg->i64_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+          fn_stream = LLVMAddFunction(cg->mod, "__qisc_stream_count_i64", fn_type);
+        }
+        LLVMTypeRef fn_type = LLVMFunctionType(
+            cg->i64_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+        return LLVMBuildCall2(cg->builder, fn_type, fn_stream,
+                              (LLVMValueRef[]){left_val}, 1, "stream_count");
+      }
+
+      if (fname && strcmp(fname, "stream_first") == 0) {
+        CgStreamKind kind = cg_expr_stream_kind(cg, node->as.binary.left);
+        if (kind == CG_STREAM_STRING) {
+          LLVMValueRef fn_stream =
+              LLVMGetNamedFunction(cg->mod, "__qisc_stream_first_string");
+          if (!fn_stream) {
+            LLVMTypeRef fn_type = LLVMFunctionType(
+                cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+            fn_stream =
+                LLVMAddFunction(cg->mod, "__qisc_stream_first_string", fn_type);
+          }
+          LLVMTypeRef fn_type = LLVMFunctionType(
+              cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+          return LLVMBuildCall2(cg->builder, fn_type, fn_stream,
+                                (LLVMValueRef[]){left_val}, 1, "stream_first");
+        }
+
+        LLVMValueRef fn_stream =
+            LLVMGetNamedFunction(cg->mod, "__qisc_stream_first_i64");
+        if (!fn_stream) {
+          LLVMTypeRef fn_type = LLVMFunctionType(
+              cg->i64_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+          fn_stream = LLVMAddFunction(cg->mod, "__qisc_stream_first_i64", fn_type);
+        }
+        LLVMTypeRef fn_type = LLVMFunctionType(
+            cg->i64_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+        return LLVMBuildCall2(cg->builder, fn_type, fn_stream,
+                              (LLVMValueRef[]){left_val}, 1, "stream_first");
+      }
+
+      if (fname && strcmp(fname, "stream_collect") == 0) {
+        CgStreamKind kind = cg_expr_stream_kind(cg, node->as.binary.left);
+        const char *rt_name = kind == CG_STREAM_STRING
+                                  ? "__qisc_stream_collect_strings"
+                                  : "__qisc_stream_collect_i64";
+        LLVMValueRef fn_stream = LLVMGetNamedFunction(cg->mod, rt_name);
+        if (!fn_stream) {
+          LLVMTypeRef fn_type = LLVMFunctionType(
+              cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+          fn_stream = LLVMAddFunction(cg->mod, rt_name, fn_type);
+        }
+        LLVMTypeRef fn_type = LLVMFunctionType(
+            cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+        return LLVMBuildCall2(cg->builder, fn_type, fn_stream,
+                              (LLVMValueRef[]){left_val}, 1, "stream_collect");
+      }
 
       /* Check if this is a builtin that takes array as first arg */
       if (fname && (strcmp(fname, "filter") == 0 || strcmp(fname, "map") == 0 || 
@@ -1323,10 +1918,18 @@ static LLVMValueRef emit_str_call(Codegen *cg, LLVMValueRef value) {
   /* If already a string (pointer), return as-is */
   if (LLVMTypeOf(value) == cg->i8ptr_type)
     return value;
-  /* Allocate buffer on stack (64 bytes) */
-  LLVMValueRef buf = LLVMBuildArrayAlloca(
-      cg->builder, cg->i8_type,
-      LLVMConstInt(LLVMInt32TypeInContext(cg->ctx), 64, false), "strbuf");
+  /* Return a heap-backed string so the result can safely escape the caller. */
+  LLVMValueRef fn_malloc = LLVMGetNamedFunction(cg->mod, "malloc");
+  if (!fn_malloc) {
+    LLVMTypeRef malloc_type = LLVMFunctionType(
+        cg->i8ptr_type, (LLVMTypeRef[]){cg->i64_type}, 1, false);
+    fn_malloc = LLVMAddFunction(cg->mod, "malloc", malloc_type);
+  }
+  LLVMTypeRef malloc_type = LLVMFunctionType(
+      cg->i8ptr_type, (LLVMTypeRef[]){cg->i64_type}, 1, false);
+  LLVMValueRef buf = LLVMBuildCall2(
+      cg->builder, malloc_type, fn_malloc,
+      (LLVMValueRef[]){LLVMConstInt(cg->i64_type, 64, false)}, 1, "strbuf");
 
   LLVMTypeRef vtype = LLVMTypeOf(value);
   LLVMValueRef fmt;
@@ -1386,23 +1989,286 @@ static LLVMValueRef emit_call(Codegen *cg, AstNode *node) {
     return LLVMBuildGlobalStringPtr(cg->builder, "", "empty");
   }
 
+  /* Handle builtin: stdin_text() -> string */
+  if (strcmp(fname, "stdin_text") == 0) {
+    LLVMValueRef fn_stdin = LLVMGetNamedFunction(cg->mod, "__qisc_io_read_stdin");
+    if (!fn_stdin) {
+      LLVMTypeRef fn_type = LLVMFunctionType(cg->i8ptr_type, NULL, 0, false);
+      fn_stdin = LLVMAddFunction(cg->mod, "__qisc_io_read_stdin", fn_type);
+    }
+    LLVMTypeRef fn_type = LLVMFunctionType(cg->i8ptr_type, NULL, 0, false);
+    return LLVMBuildCall2(cg->builder, fn_type, fn_stdin, NULL, 0, "stdin_text");
+  }
+
+  /* Handle builtin: stdin_lines() -> array of string pointers */
+  if (strcmp(fname, "stdin_lines") == 0) {
+    LLVMValueRef fn_stdin_lines =
+        LLVMGetNamedFunction(cg->mod, "__qisc_io_read_stdin_lines");
+    if (!fn_stdin_lines) {
+      LLVMTypeRef fn_type = LLVMFunctionType(cg->i8ptr_type, NULL, 0, false);
+      fn_stdin_lines =
+          LLVMAddFunction(cg->mod, "__qisc_io_read_stdin_lines", fn_type);
+    }
+    LLVMTypeRef fn_type = LLVMFunctionType(cg->i8ptr_type, NULL, 0, false);
+    return LLVMBuildCall2(cg->builder, fn_type, fn_stdin_lines, NULL, 0,
+                          "stdin_lines");
+  }
+
+  /* Handle builtin: read_file(path) -> string */
+  if (strcmp(fname, "read_file") == 0) {
+    if (argc >= 1) {
+      LLVMValueRef path = emit_expr(cg, node->as.call.args.items[0]);
+      LLVMValueRef fn_read = LLVMGetNamedFunction(cg->mod, "__qisc_io_read_file");
+      if (!fn_read) {
+        LLVMTypeRef fn_type = LLVMFunctionType(
+            cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+        fn_read = LLVMAddFunction(cg->mod, "__qisc_io_read_file", fn_type);
+      }
+      LLVMTypeRef fn_type = LLVMFunctionType(
+          cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+      return LLVMBuildCall2(cg->builder, fn_type, fn_read, (LLVMValueRef[]){path},
+                            1, "file_text");
+    }
+    return LLVMBuildGlobalStringPtr(cg->builder, "", "empty");
+  }
+
+  /* Handle builtin: file_lines(path) -> array of string pointers */
+  if (strcmp(fname, "file_lines") == 0) {
+    if (argc >= 1) {
+      LLVMValueRef path = emit_expr(cg, node->as.call.args.items[0]);
+      LLVMValueRef fn_lines =
+          LLVMGetNamedFunction(cg->mod, "__qisc_io_read_file_lines");
+      if (!fn_lines) {
+        LLVMTypeRef fn_type = LLVMFunctionType(
+            cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+        fn_lines =
+            LLVMAddFunction(cg->mod, "__qisc_io_read_file_lines", fn_type);
+      }
+      LLVMTypeRef fn_type = LLVMFunctionType(
+          cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+      return LLVMBuildCall2(cg->builder, fn_type, fn_lines,
+                            (LLVMValueRef[]){path}, 1, "file_lines");
+    }
+    return LLVMConstNull(cg->i8ptr_type);
+  }
+
+  /* Handle builtin: stream_range(start, end[, step]) -> lazy int stream */
+  if (strcmp(fname, "stream_range") == 0) {
+    if (argc >= 2) {
+      LLVMValueRef start = emit_expr(cg, node->as.call.args.items[0]);
+      LLVMValueRef end = emit_expr(cg, node->as.call.args.items[1]);
+      LLVMValueRef step =
+          argc >= 3 ? emit_expr(cg, node->as.call.args.items[2])
+                    : LLVMConstInt(cg->i64_type, 1, false);
+      LLVMValueRef fn_stream = LLVMGetNamedFunction(cg->mod, "__qisc_stream_range_i64");
+      if (!fn_stream) {
+        LLVMTypeRef fn_type = LLVMFunctionType(
+            cg->i8ptr_type,
+            (LLVMTypeRef[]){cg->i64_type, cg->i64_type, cg->i64_type}, 3, false);
+        fn_stream = LLVMAddFunction(cg->mod, "__qisc_stream_range_i64", fn_type);
+      }
+      LLVMTypeRef fn_type = LLVMFunctionType(
+          cg->i8ptr_type,
+          (LLVMTypeRef[]){cg->i64_type, cg->i64_type, cg->i64_type}, 3, false);
+      return LLVMBuildCall2(cg->builder, fn_type, fn_stream,
+                            (LLVMValueRef[]){start, end, step}, 3,
+                            "stream_range");
+    }
+    return LLVMConstNull(cg->i8ptr_type);
+  }
+
+  /* Handle builtin: stream_file_lines(path) -> lazy string stream */
+  if (strcmp(fname, "stream_file_lines") == 0) {
+    if (argc >= 1) {
+      LLVMValueRef path = emit_expr(cg, node->as.call.args.items[0]);
+      LLVMValueRef fn_stream =
+          LLVMGetNamedFunction(cg->mod, "__qisc_stream_file_lines_open");
+      if (!fn_stream) {
+        LLVMTypeRef fn_type = LLVMFunctionType(
+            cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+        fn_stream =
+            LLVMAddFunction(cg->mod, "__qisc_stream_file_lines_open", fn_type);
+      }
+      LLVMTypeRef fn_type = LLVMFunctionType(
+          cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+      return LLVMBuildCall2(cg->builder, fn_type, fn_stream,
+                            (LLVMValueRef[]){path}, 1, "stream_lines");
+    }
+    return LLVMConstNull(cg->i8ptr_type);
+  }
+
+  /* Handle builtin: stream_take(stream, n) / stream_skip(stream, n) */
+  if (strcmp(fname, "stream_take") == 0 || strcmp(fname, "stream_skip") == 0) {
+    if (argc >= 2) {
+      LLVMValueRef stream = emit_expr(cg, node->as.call.args.items[0]);
+      LLVMValueRef amount = emit_expr(cg, node->as.call.args.items[1]);
+      const char *rt_name = strcmp(fname, "stream_take") == 0
+                                ? "__qisc_stream_take_i64"
+                                : "__qisc_stream_skip_i64";
+      LLVMValueRef fn_stream = LLVMGetNamedFunction(cg->mod, rt_name);
+      if (!fn_stream) {
+        LLVMTypeRef fn_type = LLVMFunctionType(
+            cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type, cg->i64_type}, 2,
+            false);
+        fn_stream = LLVMAddFunction(cg->mod, rt_name, fn_type);
+      }
+      LLVMTypeRef fn_type = LLVMFunctionType(
+          cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type, cg->i64_type}, 2,
+          false);
+      return LLVMBuildCall2(cg->builder, fn_type, fn_stream,
+                            (LLVMValueRef[]){stream, amount}, 2, fname);
+    }
+    return LLVMConstNull(cg->i8ptr_type);
+  }
+
+  /* Handle builtin: stream_map(stream, fn) / stream_filter(stream, fn) */
+  if (strcmp(fname, "stream_map") == 0 || strcmp(fname, "stream_filter") == 0) {
+    if (argc >= 2) {
+      LLVMValueRef stream = emit_expr(cg, node->as.call.args.items[0]);
+      CgStreamKind kind = cg_expr_stream_kind(cg, node->as.call.args.items[0]);
+      CgStreamKind target_kind = kind;
+      const char *rt_name;
+      LLVMValueRef fn_arg;
+      if (strcmp(fname, "stream_map") == 0) {
+        CgStreamKind inferred =
+            cg_stream_kind_from_callable(cg, node->as.call.args.items[1],
+                                         kind);
+        if (inferred != CG_STREAM_NONE)
+          target_kind = inferred;
+        fn_arg = cg_emit_stream_callable(
+            cg, node->as.call.args.items[1], kind,
+            target_kind == CG_STREAM_STRING ? cg->i8ptr_type : cg->i64_type);
+        rt_name = cg_stream_map_runtime_name(kind, target_kind);
+      } else {
+        fn_arg = cg_emit_stream_callable(cg, node->as.call.args.items[1], kind,
+                                         cg->i1_type);
+        rt_name = cg_stream_filter_runtime_name(kind);
+      }
+      LLVMValueRef fn_stream = LLVMGetNamedFunction(cg->mod, rt_name);
+      if (!fn_stream) {
+        LLVMTypeRef fn_type = LLVMFunctionType(
+            cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2,
+            false);
+        fn_stream = LLVMAddFunction(cg->mod, rt_name, fn_type);
+      }
+      LLVMTypeRef fn_type = LLVMFunctionType(
+          cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2,
+          false);
+      return LLVMBuildCall2(cg->builder, fn_type, fn_stream,
+                            (LLVMValueRef[]){stream, fn_arg}, 2, fname);
+    }
+    return LLVMConstNull(cg->i8ptr_type);
+  }
+
+  /* Handle builtin: stream_count(stream) -> int */
+  if (strcmp(fname, "stream_count") == 0) {
+    if (argc >= 1) {
+      LLVMValueRef stream = emit_expr(cg, node->as.call.args.items[0]);
+      LLVMValueRef fn_stream =
+          LLVMGetNamedFunction(cg->mod, "__qisc_stream_count_i64");
+      if (!fn_stream) {
+        LLVMTypeRef fn_type = LLVMFunctionType(
+            cg->i64_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+        fn_stream = LLVMAddFunction(cg->mod, "__qisc_stream_count_i64", fn_type);
+      }
+      LLVMTypeRef fn_type = LLVMFunctionType(
+          cg->i64_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+      return LLVMBuildCall2(cg->builder, fn_type, fn_stream,
+                            (LLVMValueRef[]){stream}, 1, "stream_count");
+    }
+    return LLVMConstInt(cg->i64_type, 0, false);
+  }
+
+  /* Handle builtin: stream_first(stream) -> first element */
+  if (strcmp(fname, "stream_first") == 0) {
+    if (argc >= 1) {
+      AstNode *stream_node = node->as.call.args.items[0];
+      LLVMValueRef stream = emit_expr(cg, stream_node);
+      CgStreamKind kind = cg_expr_stream_kind(cg, stream_node);
+      if (kind == CG_STREAM_STRING) {
+        LLVMValueRef fn_stream =
+            LLVMGetNamedFunction(cg->mod, "__qisc_stream_first_string");
+        if (!fn_stream) {
+          LLVMTypeRef fn_type = LLVMFunctionType(
+              cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+          fn_stream =
+              LLVMAddFunction(cg->mod, "__qisc_stream_first_string", fn_type);
+        }
+        LLVMTypeRef fn_type = LLVMFunctionType(
+            cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+        return LLVMBuildCall2(cg->builder, fn_type, fn_stream,
+                              (LLVMValueRef[]){stream}, 1, "stream_first");
+      }
+
+      LLVMValueRef fn_stream =
+          LLVMGetNamedFunction(cg->mod, "__qisc_stream_first_i64");
+      if (!fn_stream) {
+        LLVMTypeRef fn_type = LLVMFunctionType(
+            cg->i64_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+        fn_stream = LLVMAddFunction(cg->mod, "__qisc_stream_first_i64", fn_type);
+      }
+      LLVMTypeRef fn_type = LLVMFunctionType(
+          cg->i64_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+      return LLVMBuildCall2(cg->builder, fn_type, fn_stream,
+                            (LLVMValueRef[]){stream}, 1, "stream_first");
+    }
+    return LLVMConstInt(cg->i64_type, 0, false);
+  }
+
+  /* Handle builtin: stream_collect(stream) -> eager array */
+  if (strcmp(fname, "stream_collect") == 0) {
+    if (argc >= 1) {
+      AstNode *stream_node = node->as.call.args.items[0];
+      LLVMValueRef stream = emit_expr(cg, stream_node);
+      CgStreamKind kind = cg_expr_stream_kind(cg, stream_node);
+      const char *rt_name = kind == CG_STREAM_STRING
+                                ? "__qisc_stream_collect_strings"
+                                : "__qisc_stream_collect_i64";
+      LLVMValueRef fn_stream = LLVMGetNamedFunction(cg->mod, rt_name);
+      if (!fn_stream) {
+        LLVMTypeRef fn_type = LLVMFunctionType(
+            cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+        fn_stream = LLVMAddFunction(cg->mod, rt_name, fn_type);
+      }
+      LLVMTypeRef fn_type = LLVMFunctionType(
+          cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+      return LLVMBuildCall2(cg->builder, fn_type, fn_stream,
+                            (LLVMValueRef[]){stream}, 1, "stream_collect");
+    }
+    return LLVMConstNull(cg->i8ptr_type);
+  }
+
+  /* Handle builtin: stdout_write(text), stderr_write(text) */
+  if (strcmp(fname, "stdout_write") == 0 || strcmp(fname, "stderr_write") == 0) {
+    if (argc >= 1) {
+      LLVMValueRef text = emit_expr(cg, node->as.call.args.items[0]);
+      const char *rt_name =
+          strcmp(fname, "stdout_write") == 0 ? "__qisc_io_write_stdout"
+                                             : "__qisc_io_write_stderr";
+      LLVMValueRef fn_write = LLVMGetNamedFunction(cg->mod, rt_name);
+      if (!fn_write) {
+        LLVMTypeRef fn_type = LLVMFunctionType(
+            cg->i64_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+        fn_write = LLVMAddFunction(cg->mod, rt_name, fn_type);
+      }
+      if (LLVMTypeOf(text) != cg->i8ptr_type) {
+        text = emit_str_call(cg, text);
+      }
+      LLVMTypeRef fn_type = LLVMFunctionType(
+          cg->i64_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+      return LLVMBuildCall2(cg->builder, fn_type, fn_write, (LLVMValueRef[]){text},
+                            1, "written");
+    }
+    return LLVMConstInt(cg->i64_type, 0, false);
+  }
+
   /* Handle builtin: sizeof() — return a constant */
   if (strcmp(fname, "sizeof") == 0) {
     if (argc >= 1) {
       LLVMValueRef val = emit_expr(cg, node->as.call.args.items[0]);
       LLVMTypeRef vt = LLVMTypeOf(val);
-      if (vt == cg->i8ptr_type) {
-        /* For strings: call strlen */
-        LLVMValueRef fn_strlen = LLVMGetNamedFunction(cg->mod, "strlen");
-        if (!fn_strlen) {
-          LLVMTypeRef st = LLVMFunctionType(
-              cg->i64_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
-          fn_strlen = LLVMAddFunction(cg->mod, "strlen", st);
-        }
-        LLVMTypeRef st = LLVMFunctionType(
-            cg->i64_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
-        return LLVMBuildCall2(cg->builder, st, fn_strlen, (LLVMValueRef[]){val},
-                              1, "slen");
+      if (vt == cg->i8ptr_type && !cg_expr_is_array_like(cg, node->as.call.args.items[0])) {
+        return cg_emit_strlen(cg, val);
       }
       /* Numeric: return 8 (64-bit) */
       return LLVMConstInt(cg->i64_type, 8, false);
@@ -1432,14 +2298,98 @@ static LLVMValueRef emit_call(Codegen *cg, AstNode *node) {
   /* Handle builtin: len(array) — call __qisc_array_len for runtime length */
   if (strcmp(fname, "len") == 0) {
     if (argc >= 1) {
-      LLVMValueRef arr = emit_expr(cg, node->as.call.args.items[0]);
+      AstNode *arg_node = node->as.call.args.items[0];
+      LLVMValueRef value = emit_expr(cg, arg_node);
+
+      if (!cg_expr_is_array_like(cg, arg_node)) {
+        return cg_emit_strlen(cg, value);
+      }
+
       LLVMValueRef fn_array_len = LLVMGetNamedFunction(cg->mod, "__qisc_array_len");
       LLVMTypeRef arr_len_type = LLVMFunctionType(cg->i64_type,
           (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
       return LLVMBuildCall2(cg->builder, arr_len_type, fn_array_len,
-          (LLVMValueRef[]){arr}, 1, "len");
+          (LLVMValueRef[]){value}, 1, "len");
     }
     return LLVMConstInt(cg->i64_type, 0, false);
+  }
+
+  /* Handle builtin: take(array, n) -> array slice [0, n) */
+  if (strcmp(fname, "take") == 0) {
+    if (argc >= 2) {
+      LLVMValueRef arr = emit_expr(cg, node->as.call.args.items[0]);
+      LLVMValueRef end = emit_expr(cg, node->as.call.args.items[1]);
+      LLVMValueRef zero = LLVMConstInt(cg->i64_type, 0, false);
+      LLVMValueRef fn_array_len =
+          LLVMGetNamedFunction(cg->mod, "__qisc_array_len");
+      LLVMTypeRef arr_len_type = LLVMFunctionType(
+          cg->i64_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+      LLVMValueRef len = LLVMBuildCall2(cg->builder, arr_len_type, fn_array_len,
+                                        (LLVMValueRef[]){arr}, 1, "take_len");
+      LLVMValueRef negative =
+          LLVMBuildICmp(cg->builder, LLVMIntSLT, end, zero, "take_neg");
+      LLVMValueRef clamped_low =
+          LLVMBuildSelect(cg->builder, negative, zero, end, "take_clamped_low");
+      LLVMValueRef too_high =
+          LLVMBuildICmp(cg->builder, LLVMIntSGT, clamped_low, len, "take_high");
+      LLVMValueRef clamped_end =
+          LLVMBuildSelect(cg->builder, too_high, len, clamped_low, "take_end");
+      LLVMValueRef fn_slice =
+          LLVMGetNamedFunction(cg->mod, "__qisc_array_slice");
+      if (!fn_slice) {
+        LLVMTypeRef slice_type = LLVMFunctionType(
+            cg->i8ptr_type,
+            (LLVMTypeRef[]){cg->i8ptr_type, cg->i64_type, cg->i64_type}, 3,
+            false);
+        fn_slice = LLVMAddFunction(cg->mod, "__qisc_array_slice", slice_type);
+      }
+      LLVMTypeRef slice_type = LLVMFunctionType(
+          cg->i8ptr_type,
+          (LLVMTypeRef[]){cg->i8ptr_type, cg->i64_type, cg->i64_type}, 3, false);
+      return LLVMBuildCall2(cg->builder, slice_type, fn_slice,
+                            (LLVMValueRef[]){arr, zero, clamped_end}, 3,
+                            "taken");
+    }
+    return LLVMConstNull(cg->i8ptr_type);
+  }
+
+  /* Handle builtin: skip(array, n) -> array slice [n, len) */
+  if (strcmp(fname, "skip") == 0) {
+    if (argc >= 2) {
+      LLVMValueRef arr = emit_expr(cg, node->as.call.args.items[0]);
+      LLVMValueRef start = emit_expr(cg, node->as.call.args.items[1]);
+      LLVMValueRef zero = LLVMConstInt(cg->i64_type, 0, false);
+      LLVMValueRef fn_array_len =
+          LLVMGetNamedFunction(cg->mod, "__qisc_array_len");
+      LLVMTypeRef arr_len_type = LLVMFunctionType(
+          cg->i64_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+      LLVMValueRef len = LLVMBuildCall2(cg->builder, arr_len_type, fn_array_len,
+                                        (LLVMValueRef[]){arr}, 1, "skip_len");
+      LLVMValueRef negative =
+          LLVMBuildICmp(cg->builder, LLVMIntSLT, start, zero, "skip_neg");
+      LLVMValueRef clamped_low =
+          LLVMBuildSelect(cg->builder, negative, zero, start, "skip_clamped_low");
+      LLVMValueRef too_high =
+          LLVMBuildICmp(cg->builder, LLVMIntSGT, clamped_low, len, "skip_high");
+      LLVMValueRef clamped_start =
+          LLVMBuildSelect(cg->builder, too_high, len, clamped_low, "skip_start");
+      LLVMValueRef fn_slice =
+          LLVMGetNamedFunction(cg->mod, "__qisc_array_slice");
+      if (!fn_slice) {
+        LLVMTypeRef slice_type = LLVMFunctionType(
+            cg->i8ptr_type,
+            (LLVMTypeRef[]){cg->i8ptr_type, cg->i64_type, cg->i64_type}, 3,
+            false);
+        fn_slice = LLVMAddFunction(cg->mod, "__qisc_array_slice", slice_type);
+      }
+      LLVMTypeRef slice_type = LLVMFunctionType(
+          cg->i8ptr_type,
+          (LLVMTypeRef[]){cg->i8ptr_type, cg->i64_type, cg->i64_type}, 3, false);
+      return LLVMBuildCall2(cg->builder, slice_type, fn_slice,
+                            (LLVMValueRef[]){arr, clamped_start, len}, 3,
+                            "skipped");
+    }
+    return LLVMConstNull(cg->i8ptr_type);
   }
 
   /* Handle builtin: push(array, element) — call __qisc_array_push */
@@ -2012,15 +2962,23 @@ static LLVMValueRef emit_expr(Codegen *cg, AstNode *node) {
     char lname[64];
     snprintf(lname, sizeof(lname), "__lambda_%d", lambda_id++);
     int pc = node->as.lambda.params.count;
+    LLVMTypeRef lambda_ret_type =
+        cg->lambda_hint_active && cg->lambda_hint_return_type
+            ? cg->lambda_hint_return_type
+            : cg->i64_type;
+    LLVMTypeRef lambda_param_type =
+        cg->lambda_hint_active && cg->lambda_hint_param_type
+            ? cg->lambda_hint_param_type
+            : cg->i64_type;
 
-    /* All params default to i64 */
+    /* Stream-lowered lambdas receive contextual param/return types. */
     LLVMTypeRef *pts = NULL;
     if (pc > 0) {
       pts = calloc(pc, sizeof(LLVMTypeRef));
       for (int i = 0; i < pc; i++)
-        pts[i] = cg->i64_type;
+        pts[i] = lambda_param_type;
     }
-    LLVMTypeRef fn_type = LLVMFunctionType(cg->i64_type, pts, pc, false);
+    LLVMTypeRef fn_type = LLVMFunctionType(lambda_ret_type, pts, pc, false);
     free(pts);
     LLVMValueRef fn = LLVMAddFunction(cg->mod, lname, fn_type);
     LLVMSetLinkage(fn, LLVMPrivateLinkage);
@@ -2043,9 +3001,10 @@ static LLVMValueRef emit_expr(Codegen *cg, AstNode *node) {
           (p->type == AST_VAR_DECL)
               ? p->as.var_decl.name
               : (p->type == AST_IDENTIFIER ? p->as.identifier.name : "arg");
-      LLVMValueRef alloca = LLVMBuildAlloca(cg->builder, cg->i64_type, pname);
+      LLVMValueRef alloca =
+          LLVMBuildAlloca(cg->builder, lambda_param_type, pname);
       LLVMBuildStore(cg->builder, LLVMGetParam(fn, i), alloca);
-      cg_define(cg, pname, alloca, cg->i64_type);
+      cg_define(cg, pname, alloca, lambda_param_type);
     }
 
     /* Emit body */
@@ -2055,13 +3014,19 @@ static LLVMValueRef emit_expr(Codegen *cg, AstNode *node) {
       else {
         /* Single expression body */
         LLVMValueRef result = emit_expr(cg, node->as.lambda.body);
+        result = cg_coerce_value(cg, result, lambda_ret_type);
         LLVMBuildRet(cg->builder, result);
       }
     }
 
     /* Implicit return if needed */
-    if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(cg->builder)))
-      LLVMBuildRet(cg->builder, LLVMConstInt(cg->i64_type, 0, false));
+    if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(cg->builder))) {
+      LLVMValueRef fallback =
+          lambda_ret_type == cg->i8ptr_type
+              ? LLVMConstNull(cg->i8ptr_type)
+              : LLVMConstInt(lambda_ret_type, 0, false);
+      LLVMBuildRet(cg->builder, fallback);
+    }
 
     cg_pop_scope(cg);
 
@@ -2164,37 +3129,10 @@ static void emit_var_decl(Codegen *cg, AstNode *node) {
                      len_alloca);
       cg_define(cg, len_name, len_alloca, cg->i64_type);
     }
-    /* Track array length for pipeline results (filter, map, range, etc.) */
+    /* Track array length for array-like runtime values */
     else if (var_type == cg->i8ptr_type) {
-      /* Only track length if this looks like an array operation */
       AstNode *init = node->as.var_decl.initializer;
-      bool is_array_op = false;
-      
-      /* Check for pipeline with array operations */
-      if (init->type == AST_BINARY_OP) {
-        AstNode *rhs = init->as.binary.right;
-        if (rhs && rhs->type == AST_CALL) {
-          const char *fn = NULL;
-          if (rhs->as.call.callee && rhs->as.call.callee->type == AST_IDENTIFIER) {
-            fn = rhs->as.call.callee->as.identifier.name;
-          }
-          if (fn && (strcmp(fn, "filter") == 0 || strcmp(fn, "map") == 0 ||
-                     strcmp(fn, "collect") == 0)) {
-            is_array_op = true;
-          }
-        }
-      }
-      /* Check for direct call to range */
-      else if (init->type == AST_CALL) {
-        if (init->as.call.callee && init->as.call.callee->type == AST_IDENTIFIER) {
-          const char *fn = init->as.call.callee->as.identifier.name;
-          if (fn && strcmp(fn, "range") == 0) {
-            is_array_op = true;
-          }
-        }
-      }
-      
-      if (is_array_op) {
+      if (cg_expr_is_array_like(cg, init)) {
         char len_name[300];
         snprintf(len_name, sizeof(len_name), "__%s__len", name);
         LLVMValueRef len_alloca =
@@ -2212,6 +3150,21 @@ static void emit_var_decl(Codegen *cg, AstNode *node) {
           LLVMBuildStore(cg->builder, LLVMConstInt(cg->i64_type, 0, false), len_alloca);
         }
         cg_define(cg, len_name, len_alloca, cg->i64_type);
+      }
+    }
+
+    {
+      CgStreamKind stream_kind =
+          cg_expr_stream_kind(cg, node->as.var_decl.initializer);
+      if (stream_kind != CG_STREAM_NONE) {
+        char marker_name[300];
+        snprintf(marker_name, sizeof(marker_name), "__%s__stream_%s", name,
+                 stream_kind == CG_STREAM_STRING ? "string" : "int");
+        LLVMValueRef marker =
+            LLVMBuildAlloca(cg->builder, cg->i1_type, marker_name);
+        LLVMBuildStore(cg->builder, LLVMConstInt(cg->i1_type, 1, false),
+                       marker);
+        cg_define(cg, marker_name, marker, cg->i1_type);
       }
     }
     return;
@@ -2254,6 +3207,20 @@ static void emit_var_decl(Codegen *cg, AstNode *node) {
     LLVMBuildStore(cg->builder, LLVMConstInt(cg->i64_type, alen, false),
                    len_alloca);
     cg_define(cg, len_name, len_alloca, cg->i64_type);
+  }
+
+  if (node->as.var_decl.initializer) {
+    CgStreamKind stream_kind =
+        cg_expr_stream_kind(cg, node->as.var_decl.initializer);
+    if (stream_kind != CG_STREAM_NONE) {
+      char marker_name[300];
+      snprintf(marker_name, sizeof(marker_name), "__%s__stream_%s", name,
+               stream_kind == CG_STREAM_STRING ? "string" : "int");
+      LLVMValueRef marker =
+          LLVMBuildAlloca(cg->builder, cg->i1_type, marker_name);
+      LLVMBuildStore(cg->builder, LLVMConstInt(cg->i1_type, 1, false), marker);
+      cg_define(cg, marker_name, marker, cg->i1_type);
+    }
   }
 }
 
@@ -2320,6 +3287,8 @@ static void emit_give(Codegen *cg, AstNode *node) {
 }
 
 static void emit_if(Codegen *cg, AstNode *node) {
+  char branch_location[256];
+  const char *fn_name = cg->current_fn_name ? cg->current_fn_name : "module";
   LLVMValueRef cond = emit_expr(cg, node->as.if_stmt.condition);
   if (cg->had_error)
     return;
@@ -2337,10 +3306,15 @@ static void emit_if(Codegen *cg, AstNode *node) {
   LLVMBasicBlockRef merge_bb =
       LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "merge");
 
+  snprintf(branch_location, sizeof(branch_location), "%s:%d", fn_name,
+           node->line);
   LLVMBuildCondBr(cg->builder, cond, then_bb, else_bb);
 
   /* Then */
   LLVMPositionBuilderAtEnd(cg->builder, then_bb);
+  if (cg->profile_enabled) {
+    emit_profile_branch_call(cg, branch_location, true);
+  }
   cg_push_scope(cg);
   emit_stmt(cg, node->as.if_stmt.then_branch);
   cg_pop_scope(cg);
@@ -2350,6 +3324,9 @@ static void emit_if(Codegen *cg, AstNode *node) {
 
   /* Else */
   LLVMPositionBuilderAtEnd(cg->builder, else_bb);
+  if (cg->profile_enabled) {
+    emit_profile_branch_call(cg, branch_location, false);
+  }
   if (node->as.if_stmt.else_branch) {
     cg_push_scope(cg);
     emit_stmt(cg, node->as.if_stmt.else_branch);
@@ -2363,6 +3340,8 @@ static void emit_if(Codegen *cg, AstNode *node) {
 }
 
 static void emit_while(Codegen *cg, AstNode *node) {
+  char loop_location[256];
+  const char *fn_name = cg->current_fn_name ? cg->current_fn_name : "module";
   LLVMBasicBlockRef cond_bb =
       LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "while.cond");
   LLVMBasicBlockRef body_bb =
@@ -2373,8 +3352,17 @@ static void emit_while(Codegen *cg, AstNode *node) {
   /* Save break/continue targets */
   LLVMBasicBlockRef prev_break = cg->break_bb;
   LLVMBasicBlockRef prev_continue = cg->continue_bb;
+  LLVMValueRef loop_counter = NULL;
   cg->break_bb = end_bb;
   cg->continue_bb = cond_bb;
+
+  snprintf(loop_location, sizeof(loop_location), "%s:%d", fn_name, node->line);
+  if (cg->profile_enabled) {
+    loop_counter =
+        LLVMBuildAlloca(cg->builder, cg->i64_type, "__qisc_loop_count");
+    LLVMBuildStore(cg->builder, LLVMConstInt(cg->i64_type, 0, false),
+                   loop_counter);
+  }
 
   LLVMBuildBr(cg->builder, cond_bb);
 
@@ -2392,6 +3380,14 @@ static void emit_while(Codegen *cg, AstNode *node) {
 
   /* Body */
   LLVMPositionBuilderAtEnd(cg->builder, body_bb);
+  if (loop_counter) {
+    LLVMValueRef old_count =
+        LLVMBuildLoad2(cg->builder, cg->i64_type, loop_counter, "loop_count");
+    LLVMValueRef new_count = LLVMBuildAdd(
+        cg->builder, old_count, LLVMConstInt(cg->i64_type, 1, false),
+        "loop_count_next");
+    LLVMBuildStore(cg->builder, new_count, loop_counter);
+  }
   cg_push_scope(cg);
   emit_stmt(cg, node->as.while_stmt.body);
   cg_pop_scope(cg);
@@ -2403,11 +3399,18 @@ static void emit_while(Codegen *cg, AstNode *node) {
 
   /* End */
   LLVMPositionBuilderAtEnd(cg->builder, end_bb);
+  if (loop_counter) {
+    LLVMValueRef iterations =
+        LLVMBuildLoad2(cg->builder, cg->i64_type, loop_counter, "loop_iters");
+    emit_profile_loop_call(cg, loop_location, iterations);
+  }
   cg->break_bb = prev_break;
   cg->continue_bb = prev_continue;
 }
 
 static void emit_for(Codegen *cg, AstNode *node) {
+  char loop_location[256];
+  const char *fn_name = cg->current_fn_name ? cg->current_fn_name : "module";
   LLVMBasicBlockRef cond_bb =
       LLVMAppendBasicBlockInContext(cg->ctx, cg->current_fn, "for.cond");
   LLVMBasicBlockRef body_bb =
@@ -2419,10 +3422,18 @@ static void emit_for(Codegen *cg, AstNode *node) {
 
   LLVMBasicBlockRef prev_break = cg->break_bb;
   LLVMBasicBlockRef prev_continue = cg->continue_bb;
+  LLVMValueRef loop_counter = NULL;
   cg->break_bb = end_bb;
   cg->continue_bb = step_bb;
 
   cg_push_scope(cg);
+  snprintf(loop_location, sizeof(loop_location), "%s:%d", fn_name, node->line);
+  if (cg->profile_enabled) {
+    loop_counter =
+        LLVMBuildAlloca(cg->builder, cg->i64_type, "__qisc_loop_count");
+    LLVMBuildStore(cg->builder, LLVMConstInt(cg->i64_type, 0, false),
+                   loop_counter);
+  }
 
   /* Detect for-in vs C-style for */
   if (node->as.for_stmt.var_name && node->as.for_stmt.iterable) {
@@ -2485,6 +3496,14 @@ static void emit_for(Codegen *cg, AstNode *node) {
 
         /* Body */
         LLVMPositionBuilderAtEnd(cg->builder, body_bb);
+        if (loop_counter) {
+          LLVMValueRef old_count = LLVMBuildLoad2(cg->builder, cg->i64_type,
+                                                  loop_counter, "loop_count");
+          LLVMValueRef new_count = LLVMBuildAdd(
+              cg->builder, old_count, LLVMConstInt(cg->i64_type, 1, false),
+              "loop_count_next");
+          LLVMBuildStore(cg->builder, new_count, loop_counter);
+        }
         LLVMValueRef cur_arr =
             LLVMBuildLoad2(cg->builder, cg->i8ptr_type, arr_alloca, "arr_ptr");
         LLVMValueRef cur_idx =
@@ -2544,6 +3563,14 @@ static void emit_for(Codegen *cg, AstNode *node) {
 
     /* Body: load var = arr[__idx] */
     LLVMPositionBuilderAtEnd(cg->builder, body_bb);
+    if (loop_counter) {
+      LLVMValueRef old_count = LLVMBuildLoad2(cg->builder, cg->i64_type,
+                                              loop_counter, "loop_count");
+      LLVMValueRef new_count = LLVMBuildAdd(
+          cg->builder, old_count, LLVMConstInt(cg->i64_type, 1, false),
+          "loop_count_next");
+      LLVMBuildStore(cg->builder, new_count, loop_counter);
+    }
     LLVMValueRef cur_arr =
         LLVMBuildLoad2(cg->builder, cg->i8ptr_type, arr_alloca, "arr_ptr");
     LLVMValueRef cur_idx =
@@ -2592,6 +3619,14 @@ static void emit_for(Codegen *cg, AstNode *node) {
 
     /* Body */
     LLVMPositionBuilderAtEnd(cg->builder, body_bb);
+    if (loop_counter) {
+      LLVMValueRef old_count = LLVMBuildLoad2(cg->builder, cg->i64_type,
+                                              loop_counter, "loop_count");
+      LLVMValueRef new_count = LLVMBuildAdd(
+          cg->builder, old_count, LLVMConstInt(cg->i64_type, 1, false),
+          "loop_count_next");
+      LLVMBuildStore(cg->builder, new_count, loop_counter);
+    }
     emit_stmt(cg, node->as.for_stmt.body);
     if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(cg->builder)))
       LLVMBuildBr(cg->builder, step_bb);
@@ -2609,6 +3644,11 @@ static void emit_for(Codegen *cg, AstNode *node) {
 for_end:
   /* End */
   LLVMPositionBuilderAtEnd(cg->builder, end_bb);
+  if (loop_counter) {
+    LLVMValueRef iterations =
+        LLVMBuildLoad2(cg->builder, cg->i64_type, loop_counter, "loop_iters");
+    emit_profile_loop_call(cg, loop_location, iterations);
+  }
   cg_pop_scope(cg);
   cg->break_bb = prev_break;
   cg->continue_bb = prev_continue;
@@ -3093,6 +4133,37 @@ static void emit_profile_call(Codegen *cg, LLVMValueRef fn_profile,
                  (LLVMValueRef[]){name_str}, 1, "");
 }
 
+static void emit_profile_branch_call(Codegen *cg, const char *location,
+                                     bool taken) {
+  if (!cg || !cg->fn_profile_branch || !location)
+    return;
+
+  LLVMValueRef location_str =
+      LLVMBuildGlobalStringPtr(cg->builder, location, "");
+  LLVMTypeRef fn_type =
+      LLVMFunctionType(cg->void_type,
+                       (LLVMTypeRef[]){cg->i8ptr_type, cg->i1_type}, 2, false);
+  LLVMValueRef args[] = {
+      location_str,
+      LLVMConstInt(cg->i1_type, taken ? 1 : 0, false),
+  };
+  LLVMBuildCall2(cg->builder, fn_type, cg->fn_profile_branch, args, 2, "");
+}
+
+static void emit_profile_loop_call(Codegen *cg, const char *location,
+                                   LLVMValueRef iterations) {
+  if (!cg || !cg->fn_profile_loop || !location || !iterations)
+    return;
+
+  LLVMValueRef location_str =
+      LLVMBuildGlobalStringPtr(cg->builder, location, "");
+  LLVMTypeRef fn_type =
+      LLVMFunctionType(cg->void_type,
+                       (LLVMTypeRef[]){cg->i8ptr_type, cg->i64_type}, 2, false);
+  LLVMValueRef args[] = {location_str, iterations};
+  LLVMBuildCall2(cg->builder, fn_type, cg->fn_profile_loop, args, 2, "");
+}
+
 /* ======== Procedure Emission ======== */
 
 static void emit_proc(Codegen *cg, AstNode *node) {
@@ -3480,6 +4551,10 @@ void codegen_init(Codegen *cg, const char *module_name) {
   /* Initialize scope */
   cg->scope_depth = 0;
   cg->scopes[0].count = 0;
+  cg->program_ast = NULL;
+  cg->lambda_hint_active = false;
+  cg->lambda_hint_param_type = NULL;
+  cg->lambda_hint_return_type = NULL;
 
   /* Initialize pragma options with defaults */
   cg->pragma_opts.context = CG_CONTEXT_CLI;
@@ -3497,6 +4572,8 @@ void codegen_init(Codegen *cg, const char *module_name) {
   cg->profile_enabled = false;
   cg->fn_profile_enter = NULL;
   cg->fn_profile_exit = NULL;
+  cg->fn_profile_branch = NULL;
+  cg->fn_profile_loop = NULL;
 
   /* Personality-aware debug info disabled by default */
   cg->personality = QISC_PERSONALITY_OFF;
@@ -3529,6 +4606,18 @@ void codegen_enable_profiling(Codegen *cg) {
   LLVMTypeRef exit_type = LLVMFunctionType(cg->void_type,
       (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
   cg->fn_profile_exit = LLVMAddFunction(cg->mod, "__qisc_profile_fn_exit", exit_type);
+
+  /* Declare __qisc_profile_branch(const char* location, bool taken) -> void */
+  LLVMTypeRef branch_type = LLVMFunctionType(
+      cg->void_type, (LLVMTypeRef[]){cg->i8ptr_type, cg->i1_type}, 2, false);
+  cg->fn_profile_branch =
+      LLVMAddFunction(cg->mod, "__qisc_profile_branch", branch_type);
+
+  /* Declare __qisc_profile_loop(const char* location, i64 iterations) -> void */
+  LLVMTypeRef loop_type = LLVMFunctionType(
+      cg->void_type, (LLVMTypeRef[]){cg->i8ptr_type, cg->i64_type}, 2, false);
+  cg->fn_profile_loop =
+      LLVMAddFunction(cg->mod, "__qisc_profile_loop", loop_type);
 }
 
 void codegen_set_context(Codegen *cg, int context) {
@@ -3596,6 +4685,7 @@ const char *codegen_get_context_description(Codegen *cg) {
 }
 
 int codegen_emit(Codegen *cg, AstNode *program) {
+  cg->program_ast = program;
   emit_program(cg, program);
   return cg->had_error ? 1 : 0;
 }

@@ -1,0 +1,11 @@
+proc main() gives int {
+    auto text = read_file("examples/import_math.qisc");
+    if len(text) > 0 {
+        stdout_write("file-bytes=" + str(len(text)));
+        print("");
+        give 0;
+    }
+
+    stderr_write("could not read file");
+    give 1;
+}

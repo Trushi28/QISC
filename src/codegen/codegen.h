@@ -95,6 +95,10 @@ typedef struct {
   LLVMContextRef ctx;
   LLVMModuleRef mod;
   LLVMBuilderRef builder;
+  AstNode *program_ast;
+  bool lambda_hint_active;
+  LLVMTypeRef lambda_hint_param_type;
+  LLVMTypeRef lambda_hint_return_type;
 
   /* Scope stack */
   CgScope scopes[CG_MAX_SCOPES];
@@ -131,6 +135,8 @@ typedef struct {
   bool profile_enabled;           /* Inject profiling calls */
   LLVMValueRef fn_profile_enter;  /* __qisc_profile_fn_enter */
   LLVMValueRef fn_profile_exit;   /* __qisc_profile_fn_exit */
+  LLVMValueRef fn_profile_branch; /* __qisc_profile_branch */
+  LLVMValueRef fn_profile_loop;   /* __qisc_profile_loop */
 
   /* Personality-aware debug info */
   QiscPersonality personality;    /* Compiler personality mode */

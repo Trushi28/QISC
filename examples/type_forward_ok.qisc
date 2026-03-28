@@ -1,0 +1,7 @@
+proc main() gives int {
+    give add_one(41);
+}
+
+proc add_one(int n) gives int {
+    give n + 1;
+}

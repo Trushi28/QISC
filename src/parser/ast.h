@@ -275,6 +275,16 @@ struct AstNode {
       AstNodeArray methods; /* Each is an AST_PROC */
     } extend_decl;
 
+    /* Module declaration */
+    struct {
+      char *name;
+    } module_decl;
+
+    /* Import declaration */
+    struct {
+      char *path;
+    } import_decl;
+
     /* Pragma */
     struct {
       char *name;

@@ -1,0 +1,15 @@
+proc main() gives int {
+    auto i = 0;
+    auto total = 0;
+
+    while i < 3 {
+        if i < 2 {
+            total = total + 1;
+        } else {
+            total = total + 2;
+        }
+        i = i + 1;
+    }
+
+    give total;
+}

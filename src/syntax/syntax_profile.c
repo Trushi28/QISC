@@ -125,6 +125,8 @@ static SyntaxStyle parse_style_value(const char *value) {
         return SYNTAX_STYLE_PIPELINE;
     } else if (strcasecmp(value, "functional") == 0) {
         return SYNTAX_STYLE_FUNCTIONAL;
+    } else if (strcasecmp(value, "expression") == 0) {
+        return SYNTAX_STYLE_FUNCTIONAL;
     } else if (strcasecmp(value, "imperative") == 0) {
         return SYNTAX_STYLE_IMPERATIVE;
     } else if (strcasecmp(value, "brace") == 0) {

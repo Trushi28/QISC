@@ -4,11 +4,133 @@
 
 #define _POSIX_C_SOURCE 200809L
 #include "interpreter.h"
+#include "../runtime/qisc_stream.h"
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+typedef enum {
+  STREAM_KIND_UNKNOWN = 0,
+  STREAM_KIND_INT = 1,
+  STREAM_KIND_STRING = 2,
+} StreamKind;
+
+typedef enum {
+  STREAM_OP_TAKE = 1,
+  STREAM_OP_SKIP = 2,
+  STREAM_OP_MAP = 3,
+  STREAM_OP_FILTER = 4,
+} StreamOpKind;
+
+typedef struct StreamOp {
+  StreamOpKind kind;
+  int64_t amount;
+  int64_t progress;
+  StreamKind result_kind;
+  Value proc;
+  struct StreamOp *next;
+} StreamOp;
+
+typedef struct QiscLazyStream {
+  QiscStream *handle;
+  StreamKind source_kind;
+  StreamKind kind;
+  bool consumed;
+  StreamOp *ops_head;
+  StreamOp *ops_tail;
+} QiscLazyStream;
+
+static Value value_stream(QiscStream *handle, StreamKind kind) {
+  Value v = {.type = VAL_STREAM};
+  QiscLazyStream *stream = malloc(sizeof(QiscLazyStream));
+  if (!stream) {
+    return value_none();
+  }
+  stream->handle = handle;
+  stream->source_kind = kind;
+  stream->kind = kind;
+  stream->consumed = (handle == NULL);
+  stream->ops_head = NULL;
+  stream->ops_tail = NULL;
+  v.as.stream_val = stream;
+  return v;
+}
+
+static QiscLazyStream *value_stream_get(Value *val) {
+  if (!val || val->type != VAL_STREAM || !val->as.stream_val)
+    return NULL;
+  if (val->as.stream_val->consumed || !val->as.stream_val->handle)
+    return NULL;
+  return val->as.stream_val;
+}
+
+static Value call_value(Interpreter *interp, Value *fn, Value *args, int argc);
+static Value runtime_error(Interpreter *interp, const char *format, ...);
+
+static StreamKind stream_proc_result_kind(Value *proc) {
+  AstNode *node;
+
+  if (!proc || proc->type != VAL_PROC)
+    return STREAM_KIND_UNKNOWN;
+
+  node = proc->as.proc_val.proc;
+  if (!node || node->type != AST_PROC || !node->as.proc.return_type)
+    return STREAM_KIND_UNKNOWN;
+
+  if (strcmp(node->as.proc.return_type->name, "int") == 0)
+    return STREAM_KIND_INT;
+  if (strcmp(node->as.proc.return_type->name, "string") == 0)
+    return STREAM_KIND_STRING;
+  return STREAM_KIND_UNKNOWN;
+}
+
+static StreamOp *stream_op_new(StreamOpKind kind) {
+  StreamOp *op = calloc(1, sizeof(StreamOp));
+  if (!op)
+    return NULL;
+  op->kind = kind;
+  return op;
+}
+
+static Value value_stream_with_op(QiscLazyStream *src, StreamOp *op,
+                                  StreamKind result_kind) {
+  Value v = {.type = VAL_STREAM};
+  QiscLazyStream *stream;
+
+  if (!src || !src->handle || !op)
+    return value_none();
+
+  stream = malloc(sizeof(QiscLazyStream));
+  if (!stream) {
+    free(op);
+    return value_none();
+  }
+
+  stream->handle = src->handle;
+  stream->source_kind = src->source_kind;
+  stream->kind = src->kind;
+  stream->consumed = false;
+  stream->ops_head = src->ops_head;
+  stream->ops_tail = src->ops_tail;
+
+  if (stream->ops_tail) {
+    stream->ops_tail->next = op;
+  } else {
+    stream->ops_head = op;
+  }
+  stream->ops_tail = op;
+  stream->kind = result_kind;
+
+  src->handle = NULL;
+  src->consumed = true;
+  src->ops_head = NULL;
+  src->ops_tail = NULL;
+
+  v.as.stream_val = stream;
+  return v;
+}
 
 /* ======== Value Operations ======== */
 
@@ -55,6 +177,9 @@ void value_free(Value *val) {
     free(val->as.string_val.str);
   } else if (val->type == VAL_ERROR) {
     free(val->as.error_val.message);
+  } else if (val->type == VAL_STREAM) {
+    /* Stream wrappers are shared by shallow copies; leave cleanup to process exit
+     * or explicit terminal operations to avoid double-freeing active pipelines. */
   } else if (val->type == VAL_ARRAY) {
     free(val->as.array_val.items);
   } else if (val->type == VAL_STRUCT) {
@@ -85,6 +210,9 @@ void value_print(Value *val) {
     break;
   case VAL_PROC:
     printf("<proc>");
+    break;
+  case VAL_STREAM:
+    printf("<stream>");
     break;
   case VAL_ARRAY:
     printf("[");
@@ -124,6 +252,9 @@ bool value_is_truthy(Value *val) {
     return val->as.float_val != 0.0;
   case VAL_STRING:
     return val->as.string_val.length > 0;
+  case VAL_STREAM:
+    return val->as.stream_val && !val->as.stream_val->consumed &&
+           val->as.stream_val->handle != NULL;
   default:
     return true;
   }
@@ -297,6 +428,488 @@ static Value builtin_str(Interpreter *interp, Value *args, int argc) {
   }
 }
 
+static char *read_all_stream(FILE *fp) {
+  size_t capacity = 4096;
+  size_t length = 0;
+  char *buffer;
+
+  if (!fp)
+    return NULL;
+
+  buffer = malloc(capacity);
+  if (!buffer)
+    return NULL;
+
+  while (!feof(fp)) {
+    size_t remaining = capacity - length;
+    if (remaining < 1024) {
+      char *grown;
+      capacity *= 2;
+      grown = realloc(buffer, capacity);
+      if (!grown) {
+        free(buffer);
+        return NULL;
+      }
+      buffer = grown;
+      remaining = capacity - length;
+    }
+
+    size_t nread = fread(buffer + length, 1, remaining - 1, fp);
+    length += nread;
+    if (ferror(fp)) {
+      free(buffer);
+      return NULL;
+    }
+  }
+
+  buffer[length] = '\0';
+  return buffer;
+}
+
+static Value read_lines_stream(FILE *fp) {
+  Value arr = {.type = VAL_ARRAY};
+  char *line = NULL;
+  size_t capacity = 0;
+  ssize_t nread;
+
+  arr.as.array_val.count = 0;
+  arr.as.array_val.capacity = 8;
+  arr.as.array_val.items = malloc(arr.as.array_val.capacity * sizeof(Value));
+  if (!arr.as.array_val.items) {
+    arr.as.array_val.capacity = 0;
+    return value_none();
+  }
+
+  while ((nread = getline(&line, &capacity, fp)) != -1) {
+    if (nread > 0 && line[nread - 1] == '\n') {
+      nread--;
+      line[nread] = '\0';
+    }
+    if (nread > 0 && line[nread - 1] == '\r') {
+      nread--;
+      line[nread] = '\0';
+    }
+
+    if (arr.as.array_val.count >= arr.as.array_val.capacity) {
+      int new_capacity = arr.as.array_val.capacity * 2;
+      Value *grown =
+          realloc(arr.as.array_val.items, new_capacity * sizeof(Value));
+      if (!grown) {
+        free(line);
+        free(arr.as.array_val.items);
+        return value_none();
+      }
+      arr.as.array_val.items = grown;
+      arr.as.array_val.capacity = new_capacity;
+    }
+
+    arr.as.array_val.items[arr.as.array_val.count++] =
+        value_string(line, (int)nread);
+  }
+
+  free(line);
+  return arr;
+}
+
+static Value builtin_stdin_text(Interpreter *interp, Value *args, int argc) {
+  char *text;
+  (void)interp;
+  (void)args;
+  if (argc != 0)
+    return value_error("stdin_text() takes no arguments");
+
+  text = read_all_stream(stdin);
+  if (!text)
+    return value_string("", 0);
+
+  Value result = value_string(text, (int)strlen(text));
+  free(text);
+  return result;
+}
+
+static Value builtin_read_file(Interpreter *interp, Value *args, int argc) {
+  FILE *fp;
+  char *text;
+  (void)interp;
+  if (argc != 1 || args[0].type != VAL_STRING)
+    return value_none();
+
+  fp = fopen(args[0].as.string_val.str, "rb");
+  if (!fp)
+    return value_none();
+
+  text = read_all_stream(fp);
+  fclose(fp);
+  if (!text)
+    return value_none();
+
+  Value result = value_string(text, (int)strlen(text));
+  free(text);
+  return result;
+}
+
+static Value builtin_stdin_lines(Interpreter *interp, Value *args, int argc) {
+  (void)interp;
+  (void)args;
+  if (argc != 0)
+    return value_error("stdin_lines() takes no arguments");
+  return read_lines_stream(stdin);
+}
+
+static Value builtin_file_lines(Interpreter *interp, Value *args, int argc) {
+  FILE *fp;
+  (void)interp;
+  if (argc != 1 || args[0].type != VAL_STRING)
+    return value_none();
+
+  fp = fopen(args[0].as.string_val.str, "rb");
+  if (!fp)
+    return value_none();
+
+  Value result = read_lines_stream(fp);
+  fclose(fp);
+  return result;
+}
+
+static Value builtin_stdout_write(Interpreter *interp, Value *args, int argc) {
+  (void)interp;
+  if (argc != 1)
+    return value_int(0);
+
+  Value rendered = builtin_str(interp, args, argc);
+  if (rendered.type != VAL_STRING)
+    return value_int(0);
+
+  fwrite(rendered.as.string_val.str, 1, (size_t)rendered.as.string_val.length, stdout);
+  fflush(stdout);
+  Value result = value_int(rendered.as.string_val.length);
+  value_free(&rendered);
+  return result;
+}
+
+static Value builtin_stderr_write(Interpreter *interp, Value *args, int argc) {
+  (void)interp;
+  if (argc != 1)
+    return value_int(0);
+
+  Value rendered = builtin_str(interp, args, argc);
+  if (rendered.type != VAL_STRING)
+    return value_int(0);
+
+  fwrite(rendered.as.string_val.str, 1, (size_t)rendered.as.string_val.length, stderr);
+  fflush(stderr);
+  Value result = value_int(rendered.as.string_val.length);
+  value_free(&rendered);
+  return result;
+}
+
+static Value builtin_take(Interpreter *interp, Value *args, int argc) {
+  int limit;
+  Value result = {.type = VAL_ARRAY};
+  (void)interp;
+  if (argc != 2 || args[0].type != VAL_ARRAY || args[1].type != VAL_INT)
+    return value_none();
+
+  limit = (int)args[1].as.int_val;
+  if (limit < 0)
+    limit = 0;
+  if (limit > args[0].as.array_val.count)
+    limit = args[0].as.array_val.count;
+
+  result.as.array_val.count = limit;
+  result.as.array_val.capacity = limit;
+  result.as.array_val.items = limit > 0 ? malloc(limit * sizeof(Value)) : NULL;
+  for (int i = 0; i < limit; i++) {
+    result.as.array_val.items[i] = args[0].as.array_val.items[i];
+  }
+  return result;
+}
+
+static Value builtin_skip(Interpreter *interp, Value *args, int argc) {
+  int start;
+  int count;
+  Value result = {.type = VAL_ARRAY};
+  (void)interp;
+  if (argc != 2 || args[0].type != VAL_ARRAY || args[1].type != VAL_INT)
+    return value_none();
+
+  start = (int)args[1].as.int_val;
+  if (start < 0)
+    start = 0;
+  if (start > args[0].as.array_val.count)
+    start = args[0].as.array_val.count;
+
+  count = args[0].as.array_val.count - start;
+  result.as.array_val.count = count;
+  result.as.array_val.capacity = count;
+  result.as.array_val.items = count > 0 ? malloc(count * sizeof(Value)) : NULL;
+  for (int i = 0; i < count; i++) {
+    result.as.array_val.items[i] = args[0].as.array_val.items[start + i];
+  }
+  return result;
+}
+
+static bool lazy_stream_next(Interpreter *interp, QiscLazyStream *stream,
+                             Value *out) {
+  if (!stream || !stream->handle || stream->consumed || !out)
+    return false;
+
+  while (stream->handle->state == STREAM_READY) {
+    StreamElement elem = stream->handle->next(stream->handle);
+    Value current;
+
+    if (elem.data == NULL)
+      continue;
+
+    if (stream->source_kind == STREAM_KIND_STRING) {
+      const char *text = (const char *)elem.data;
+      current = value_string(text, (int)strlen(text));
+    } else {
+      current = value_int(*(int64_t *)elem.data);
+    }
+
+    bool discard = false;
+    for (StreamOp *op = stream->ops_head; op; op = op->next) {
+      if (op->kind == STREAM_OP_SKIP) {
+        if (op->progress < op->amount) {
+          op->progress++;
+          discard = true;
+          break;
+        }
+      } else if (op->kind == STREAM_OP_FILTER) {
+        Value test = call_value(interp, &op->proc, &current, 1);
+        if (interp->had_error) {
+          value_free(&current);
+          return false;
+        }
+        bool keep = value_is_truthy(&test);
+        value_free(&test);
+        if (!keep) {
+          value_free(&current);
+          discard = true;
+          break;
+        }
+      } else if (op->kind == STREAM_OP_MAP) {
+        Value mapped = call_value(interp, &op->proc, &current, 1);
+        if (interp->had_error) {
+          value_free(&current);
+          return false;
+        }
+        if ((op->result_kind == STREAM_KIND_INT && mapped.type != VAL_INT) ||
+            (op->result_kind == STREAM_KIND_STRING &&
+             mapped.type != VAL_STRING)) {
+          value_free(&current);
+          value_free(&mapped);
+          runtime_error(interp,
+                        "stream_map must preserve element type for lazy streams");
+          return false;
+        }
+        value_free(&current);
+        current = mapped;
+        if (interp->had_error)
+          return false;
+      } else if (op->kind == STREAM_OP_TAKE) {
+        if (op->progress >= op->amount) {
+          stream_free(stream->handle);
+          stream->handle = NULL;
+          stream->consumed = true;
+          return false;
+        }
+        op->progress++;
+      }
+    }
+
+    if (discard)
+      continue;
+
+    *out = current;
+    return true;
+  }
+
+  if (stream->handle) {
+    stream_free(stream->handle);
+    stream->handle = NULL;
+  }
+  stream->consumed = true;
+  return false;
+}
+
+static Value builtin_stream_range(Interpreter *interp, Value *args, int argc) {
+  int64_t start, end, step;
+  (void)interp;
+  if ((argc != 2 && argc != 3) || args[0].type != VAL_INT ||
+      args[1].type != VAL_INT)
+    return value_none();
+
+  start = args[0].as.int_val;
+  end = args[1].as.int_val;
+  step = (argc == 3 && args[2].type == VAL_INT) ? args[2].as.int_val : 1;
+  return value_stream(stream_range(start, end, step), STREAM_KIND_INT);
+}
+
+static Value builtin_stream_file_lines(Interpreter *interp, Value *args,
+                                       int argc) {
+  (void)interp;
+  if (argc != 1 || args[0].type != VAL_STRING)
+    return value_none();
+  return value_stream(stream_file_lines(args[0].as.string_val.str, 0),
+                      STREAM_KIND_STRING);
+}
+
+static Value builtin_stream_take(Interpreter *interp, Value *args, int argc) {
+  QiscLazyStream *stream;
+  StreamOp *op;
+  (void)interp;
+  if (argc != 2 || args[0].type != VAL_STREAM || args[1].type != VAL_INT)
+    return value_none();
+
+  stream = value_stream_get(&args[0]);
+  if (!stream)
+    return value_none();
+
+  op = stream_op_new(STREAM_OP_TAKE);
+  if (!op)
+    return value_none();
+  op->amount = args[1].as.int_val < 0 ? 0 : args[1].as.int_val;
+  return value_stream_with_op(stream, op, stream->kind);
+}
+
+static Value builtin_stream_skip(Interpreter *interp, Value *args, int argc) {
+  QiscLazyStream *stream;
+  StreamOp *op;
+  (void)interp;
+  if (argc != 2 || args[0].type != VAL_STREAM || args[1].type != VAL_INT)
+    return value_none();
+
+  stream = value_stream_get(&args[0]);
+  if (!stream)
+    return value_none();
+
+  op = stream_op_new(STREAM_OP_SKIP);
+  if (!op)
+    return value_none();
+  op->amount = args[1].as.int_val < 0 ? 0 : args[1].as.int_val;
+  return value_stream_with_op(stream, op, stream->kind);
+}
+
+static Value builtin_stream_map(Interpreter *interp, Value *args, int argc) {
+  QiscLazyStream *stream;
+  StreamOp *op;
+  StreamKind result_kind;
+  (void)interp;
+  if (argc != 2 || args[0].type != VAL_STREAM || args[1].type != VAL_PROC)
+    return value_none();
+
+  stream = value_stream_get(&args[0]);
+  if (!stream)
+    return value_none();
+
+  result_kind = stream_proc_result_kind(&args[1]);
+  if (stream->kind != STREAM_KIND_INT && stream->kind != STREAM_KIND_STRING)
+    return value_none();
+
+  op = stream_op_new(STREAM_OP_MAP);
+  if (!op)
+    return value_none();
+  op->result_kind = result_kind;
+  op->proc = args[1];
+  return value_stream_with_op(stream, op,
+                              result_kind == STREAM_KIND_UNKNOWN ? stream->kind
+                                                                 : result_kind);
+}
+
+static Value builtin_stream_filter(Interpreter *interp, Value *args, int argc) {
+  QiscLazyStream *stream;
+  StreamOp *op;
+  (void)interp;
+  if (argc != 2 || args[0].type != VAL_STREAM || args[1].type != VAL_PROC)
+    return value_none();
+
+  stream = value_stream_get(&args[0]);
+  if (!stream ||
+      (stream->kind != STREAM_KIND_INT && stream->kind != STREAM_KIND_STRING))
+    return value_none();
+
+  op = stream_op_new(STREAM_OP_FILTER);
+  if (!op)
+    return value_none();
+  op->proc = args[1];
+  return value_stream_with_op(stream, op, stream->kind);
+}
+
+static Value builtin_stream_count(Interpreter *interp, Value *args, int argc) {
+  QiscLazyStream *stream;
+  int64_t count = 0;
+  (void)interp;
+  if (argc != 1 || args[0].type != VAL_STREAM)
+    return value_none();
+
+  stream = value_stream_get(&args[0]);
+  if (!stream)
+    return value_int(0);
+
+  Value item;
+  while (lazy_stream_next(interp, stream, &item)) {
+    count++;
+  }
+  return value_int(count);
+}
+
+static Value builtin_stream_first(Interpreter *interp, Value *args, int argc) {
+  QiscLazyStream *stream;
+  Value result = value_none();
+  (void)interp;
+  if (argc != 1 || args[0].type != VAL_STREAM)
+    return value_none();
+
+  stream = value_stream_get(&args[0]);
+  if (!stream)
+    return value_none();
+
+  lazy_stream_next(interp, stream, &result);
+  return result;
+}
+
+static Value builtin_stream_collect(Interpreter *interp, Value *args, int argc) {
+  QiscLazyStream *stream;
+  Value result = {.type = VAL_ARRAY};
+  int capacity = 8;
+  (void)interp;
+  if (argc != 1 || args[0].type != VAL_STREAM)
+    return value_none();
+
+  stream = value_stream_get(&args[0]);
+  if (!stream)
+    return value_none();
+
+  result.as.array_val.count = 0;
+  result.as.array_val.capacity = capacity;
+  result.as.array_val.items = malloc(capacity * sizeof(Value));
+  if (!result.as.array_val.items)
+    return value_none();
+
+  while (1) {
+    Value item;
+    if (!lazy_stream_next(interp, stream, &item))
+      break;
+
+    if (result.as.array_val.count >= result.as.array_val.capacity) {
+      int new_capacity = result.as.array_val.capacity * 2;
+      Value *grown =
+          realloc(result.as.array_val.items, new_capacity * sizeof(Value));
+      if (!grown) {
+        free(result.as.array_val.items);
+        return value_none();
+      }
+      result.as.array_val.items = grown;
+      result.as.array_val.capacity = new_capacity;
+    }
+
+    result.as.array_val.items[result.as.array_val.count++] = item;
+  }
+  return result;
+}
+
 /* Register built-ins */
 static void register_builtins(Interpreter *interp) {
   /* Built-ins are handled specially in call evaluation */
@@ -414,12 +1027,89 @@ static Value eval_binary(Interpreter *interp, AstNode *node) {
         return left;
       }
 
-      if (strcmp(fn_name, "reduce") == 0 && rhs->as.call.args.count >= 2) {
-        /* reduce(init, fn): fold array */
-        Value acc = evaluate(interp, rhs->as.call.args.items[0]);
-        Value fn = evaluate(interp, rhs->as.call.args.items[1]);
+      if (strcmp(fn_name, "take") == 0 && rhs->as.call.args.count >= 1) {
+        Value limit = evaluate(interp, rhs->as.call.args.items[0]);
         if (interp->had_error)
-          return acc;
+          return limit;
+        Value call_args[2] = {left, limit};
+        return builtin_take(interp, call_args, 2);
+      }
+
+      if (strcmp(fn_name, "skip") == 0 && rhs->as.call.args.count >= 1) {
+        Value offset = evaluate(interp, rhs->as.call.args.items[0]);
+        if (interp->had_error)
+          return offset;
+        Value call_args[2] = {left, offset};
+        return builtin_skip(interp, call_args, 2);
+      }
+
+      if (strcmp(fn_name, "stream_take") == 0 && rhs->as.call.args.count >= 1) {
+        Value limit = evaluate(interp, rhs->as.call.args.items[0]);
+        if (interp->had_error)
+          return limit;
+        Value call_args[2] = {left, limit};
+        return builtin_stream_take(interp, call_args, 2);
+      }
+
+      if (strcmp(fn_name, "stream_skip") == 0 && rhs->as.call.args.count >= 1) {
+        Value offset = evaluate(interp, rhs->as.call.args.items[0]);
+        if (interp->had_error)
+          return offset;
+        Value call_args[2] = {left, offset};
+        return builtin_stream_skip(interp, call_args, 2);
+      }
+
+      if (strcmp(fn_name, "stream_map") == 0 && rhs->as.call.args.count >= 1) {
+        Value fn = evaluate(interp, rhs->as.call.args.items[0]);
+        if (interp->had_error)
+          return fn;
+        Value call_args[2] = {left, fn};
+        return builtin_stream_map(interp, call_args, 2);
+      }
+
+      if (strcmp(fn_name, "stream_filter") == 0 &&
+          rhs->as.call.args.count >= 1) {
+        Value fn = evaluate(interp, rhs->as.call.args.items[0]);
+        if (interp->had_error)
+          return fn;
+        Value call_args[2] = {left, fn};
+        return builtin_stream_filter(interp, call_args, 2);
+      }
+
+      if (strcmp(fn_name, "stream_count") == 0) {
+        Value call_args[1] = {left};
+        return builtin_stream_count(interp, call_args, 1);
+      }
+
+      if (strcmp(fn_name, "stream_first") == 0) {
+        Value call_args[1] = {left};
+        return builtin_stream_first(interp, call_args, 1);
+      }
+
+      if (strcmp(fn_name, "stream_collect") == 0) {
+        Value call_args[1] = {left};
+        return builtin_stream_collect(interp, call_args, 1);
+      }
+
+      if (strcmp(fn_name, "reduce") == 0 && rhs->as.call.args.count >= 2) {
+        /* Support both reduce(fn, init) and the older reduce(init, fn) form. */
+        Value first = evaluate(interp, rhs->as.call.args.items[0]);
+        if (interp->had_error)
+          return first;
+        Value second = evaluate(interp, rhs->as.call.args.items[1]);
+        if (interp->had_error)
+          return second;
+
+        Value acc;
+        Value fn;
+        if (first.type == VAL_PROC) {
+          fn = first;
+          acc = second;
+        } else {
+          acc = first;
+          fn = second;
+        }
+
         if (left.type == VAL_ARRAY && fn.type == VAL_PROC) {
           for (int i = 0; i < left.as.array_val.count; i++) {
             Value call_args[2] = {acc, left.as.array_val.items[i]};
@@ -712,6 +1402,40 @@ static Value eval_call(Interpreter *interp, AstNode *node) {
       result = builtin_float(interp, args, argc);
     } else if (strcmp(name, "str") == 0) {
       result = builtin_str(interp, args, argc);
+    } else if (strcmp(name, "stdin_text") == 0) {
+      result = builtin_stdin_text(interp, args, argc);
+    } else if (strcmp(name, "stdin_lines") == 0) {
+      result = builtin_stdin_lines(interp, args, argc);
+    } else if (strcmp(name, "stream_range") == 0) {
+      result = builtin_stream_range(interp, args, argc);
+    } else if (strcmp(name, "stream_file_lines") == 0) {
+      result = builtin_stream_file_lines(interp, args, argc);
+    } else if (strcmp(name, "stream_take") == 0) {
+      result = builtin_stream_take(interp, args, argc);
+    } else if (strcmp(name, "stream_skip") == 0) {
+      result = builtin_stream_skip(interp, args, argc);
+    } else if (strcmp(name, "stream_map") == 0) {
+      result = builtin_stream_map(interp, args, argc);
+    } else if (strcmp(name, "stream_filter") == 0) {
+      result = builtin_stream_filter(interp, args, argc);
+    } else if (strcmp(name, "stream_count") == 0) {
+      result = builtin_stream_count(interp, args, argc);
+    } else if (strcmp(name, "stream_first") == 0) {
+      result = builtin_stream_first(interp, args, argc);
+    } else if (strcmp(name, "stream_collect") == 0) {
+      result = builtin_stream_collect(interp, args, argc);
+    } else if (strcmp(name, "read_file") == 0) {
+      result = builtin_read_file(interp, args, argc);
+    } else if (strcmp(name, "file_lines") == 0) {
+      result = builtin_file_lines(interp, args, argc);
+    } else if (strcmp(name, "stdout_write") == 0) {
+      result = builtin_stdout_write(interp, args, argc);
+    } else if (strcmp(name, "stderr_write") == 0) {
+      result = builtin_stderr_write(interp, args, argc);
+    } else if (strcmp(name, "take") == 0) {
+      result = builtin_take(interp, args, argc);
+    } else if (strcmp(name, "skip") == 0) {
+      result = builtin_skip(interp, args, argc);
     } else if (strcmp(name, "filter") == 0) {
       /* filter(predicate) on array - used in pipelines */
       if (argc >= 1 && args[0].type == VAL_PROC) {
@@ -731,9 +1455,9 @@ static Value eval_call(Interpreter *interp, AstNode *node) {
       /* Collect materializes a pipeline - return input as-is */
       result = argc > 0 ? args[0] : value_none();
     } else if (strcmp(name, "reduce") == 0) {
-      /* reduce(initial, lambda) - fold array */
-      if (argc >= 2 && args[1].type == VAL_PROC) {
-        result = args[0]; /* Will be applied in pipeline */
+      /* Support both reduce(fn, initial) and reduce(initial, fn). */
+      if (argc >= 2 && (args[0].type == VAL_PROC || args[1].type == VAL_PROC)) {
+        result = (args[0].type == VAL_PROC) ? args[1] : args[0];
       } else {
         result = argc > 0 ? args[0] : value_none();
       }
@@ -818,7 +1542,6 @@ static Value eval_call(Interpreter *interp, AstNode *node) {
         result = value_int(0);
       }
     } else if (strcmp(name, "file_exists") == 0 ||
-               strcmp(name, "read_file") == 0 ||
                strcmp(name, "parse_json") == 0 ||
                strcmp(name, "db_connect") == 0) {
       /* I/O stubs - return none */

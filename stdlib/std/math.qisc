@@ -1,0 +1,9 @@
+module std.math;
+
+proc twice(int n) gives int {
+    give n * 2;
+}
+
+proc square(int n) gives int {
+    give n * n;
+}

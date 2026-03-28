@@ -1,0 +1,10 @@
+proc main() gives int {
+    auto lines = stream_file_lines("examples/import_math.qisc") >> stream_take(2);
+    stdout_write("count=" + str(stream_count(lines)));
+    print("");
+
+    auto first_line = stream_first(stream_file_lines("examples/import_math.qisc"));
+    stdout_write("first-bytes=" + str(len(first_line)));
+    print("");
+    give 0;
+}

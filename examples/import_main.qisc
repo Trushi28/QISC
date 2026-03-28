@@ -1,0 +1,8 @@
+import import_math;
+
+proc main() gives int {
+    int base = add_pair(4, 5);
+    int total = triple(base);
+    print("Imported total = {total}");
+    give 0;
+}

@@ -1,0 +1,11 @@
+proc main() gives int {
+    auto trimmed = stream_range(0, 10, 1) >> stream_skip(3) >> stream_take(4);
+    stdout_write("count=" + str(stream_count(trimmed)));
+    print("");
+
+    auto collected = stream_range(0, 6, 1) >> stream_skip(1) >> stream_take(3);
+    auto nums = stream_collect(collected);
+    stdout_write("collected=" + str(len(nums)));
+    print("");
+    give 0;
+}

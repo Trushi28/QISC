@@ -1,0 +1,10 @@
+proc main() gives int {
+    auto lines = stdin_lines();
+    auto preview = take(lines, 2);
+
+    stdout_write("lines=" + str(len(lines)));
+    print("");
+    stdout_write("preview=" + str(len(preview)));
+    print("");
+    give 0;
+}

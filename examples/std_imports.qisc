@@ -1,0 +1,12 @@
+module std_imports;
+import std.math;
+import std.io;
+
+proc main() gives int {
+    auto doubled = twice(9);
+    auto squared = square(5);
+
+    println("twice(9) = " + str(doubled));
+    println("square(5) = " + str(squared));
+    give doubled + squared;
+}

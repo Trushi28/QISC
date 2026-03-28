@@ -1,0 +1,9 @@
+module import_math;
+
+proc add_pair(int a, int b) gives int {
+    give a + b;
+}
+
+proc triple(int n) gives int {
+    give n * 3;
+}

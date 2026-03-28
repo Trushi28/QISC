@@ -1,0 +1,27 @@
+proc is_even(int x) gives bool {
+    give x % 2 == 0;
+}
+
+proc square(int x) gives int {
+    give x * x;
+}
+
+proc main() gives int {
+    auto values = stream_range(0, 10, 1)
+        >> stream_filter(is_even)
+        >> stream_map(square)
+        >> stream_take(3);
+
+    auto nums = stream_collect(values);
+    stdout_write("count=" + str(len(nums)));
+    print("");
+
+    auto first = stream_first(
+        stream_range(0, 10, 1)
+        >> stream_filter(is_even)
+        >> stream_map(square)
+    );
+    stdout_write("first=" + str(first));
+    print("");
+    give 0;
+}

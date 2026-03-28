@@ -15,10 +15,13 @@ typedef enum {
   VAL_BOOL,
   VAL_STRING,
   VAL_PROC,
+  VAL_STREAM,
   VAL_ARRAY,
   VAL_STRUCT,
   VAL_ERROR,
 } ValueType;
+
+struct QiscLazyStream;
 
 /* Runtime value */
 typedef struct Value {
@@ -35,6 +38,7 @@ typedef struct Value {
       AstNode *proc;
       struct Environment *closure;
     } proc_val;
+    struct QiscLazyStream *stream_val;
     struct {
       struct Value *items;
       int count;

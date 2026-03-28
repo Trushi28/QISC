@@ -1,0 +1,24 @@
+proc main() gives int {
+    auto texts = stream_range(1, 5, 1)
+        >> stream_map(x => str(x * 4))
+        >> stream_take(2);
+
+    auto labels = stream_collect(texts);
+    stdout_write("labels=");
+    print(len(labels));
+
+    auto first_text = stream_first(
+        stream_range(1, 5, 1)
+        >> stream_map(x => str(x * 4))
+    );
+    stdout_write(first_text);
+    print("");
+
+    auto first_len = stream_first(
+        stream_file_lines("src/runtime/qisc_stream.h")
+        >> stream_filter(line => len(line) > 20)
+        >> stream_map(line => len(line))
+    );
+    print(first_len);
+    give 0;
+}

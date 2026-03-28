@@ -1,0 +1,13 @@
+proc main() gives int {
+    auto lines = file_lines("examples/import_math.qisc");
+    auto preview = take(lines, 2);
+    auto tail = skip(lines, 1);
+
+    stdout_write("lines=" + str(len(lines)));
+    print("");
+    stdout_write("preview=" + str(len(preview)));
+    print("");
+    stdout_write("tail=" + str(len(tail)));
+    print("");
+    give 0;
+}

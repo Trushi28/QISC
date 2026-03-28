@@ -104,6 +104,43 @@ static char *create_cold_function_name(const char *original, int block_id) {
     return name;
 }
 
+static void apply_loop_unroll_metadata(LivingIR *ir, LLVMBasicBlockRef header,
+                                       int unroll_count) {
+    if (!ir || !header || unroll_count <= 1) return;
+
+    LLVMValueRef terminator = LLVMGetBasicBlockTerminator(header);
+    if (!terminator) return;
+
+    LLVMMetadataRef loop_md[4];
+    unsigned count = 0;
+
+    /* Self-reference placeholder required by LLVM loop metadata. */
+    loop_md[count++] = NULL;
+
+    LLVMMetadataRef enable_key =
+        LLVMMDStringInContext2(ir->context, "llvm.loop.unroll.enable", 23);
+    LLVMMetadataRef enable_val =
+        LLVMValueAsMetadata(LLVMConstInt(LLVMInt1TypeInContext(ir->context), 1, false));
+    LLVMMetadataRef enable_pair[] = {enable_key, enable_val};
+    loop_md[count++] = LLVMMDNodeInContext2(ir->context, enable_pair, 2);
+
+    LLVMMetadataRef count_key =
+        LLVMMDStringInContext2(ir->context, "llvm.loop.unroll.count", 22);
+    LLVMMetadataRef count_val =
+        LLVMValueAsMetadata(LLVMConstInt(LLVMInt32TypeInContext(ir->context),
+                                         (unsigned)unroll_count, false));
+    LLVMMetadataRef count_pair[] = {count_key, count_val};
+    loop_md[count++] = LLVMMDNodeInContext2(ir->context, count_pair, 2);
+
+    LLVMMetadataRef md = LLVMMDNodeInContext2(ir->context, loop_md, count);
+    loop_md[0] = md;
+    md = LLVMMDNodeInContext2(ir->context, loop_md, count);
+
+    unsigned loop_kind = LLVMGetMDKindIDInContext(ir->context, "llvm.loop", 9);
+    LLVMValueRef md_val = LLVMMetadataAsValue(ir->context, md);
+    LLVMSetMetadata(terminator, loop_kind, md_val);
+}
+
 /* ======== Creation and Destruction ======== */
 
 LivingIR *living_ir_create(LLVMModuleRef module, QiscProfile *profile) {
@@ -597,6 +634,8 @@ void living_ir_restructure_loops(LivingIR *ir) {
          */
         
         if (mutation->suggested_unroll > 1) {
+            apply_loop_unroll_metadata(ir, mutation->header,
+                                       mutation->suggested_unroll);
             ir->metrics.loops_unrolled++;
         }
         

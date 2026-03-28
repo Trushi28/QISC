@@ -1,0 +1,46 @@
+proc long_line(string line) gives bool {
+    give len(line) > 20;
+}
+
+proc line_length(string line) gives int {
+    give len(line);
+}
+
+proc int_text(int value) gives string {
+    give str(value * 10);
+}
+
+proc main() gives int {
+    auto lengths = stream_file_lines("src/runtime/qisc_stream.h")
+        >> stream_filter(long_line)
+        >> stream_map(line_length)
+        >> stream_take(3);
+
+    auto nums = stream_collect(lengths);
+    stdout_write("len-count=");
+    print(len(nums));
+
+    auto first_len = stream_first(
+        stream_file_lines("src/runtime/qisc_stream.h")
+        >> stream_filter(long_line)
+        >> stream_map(line_length)
+    );
+    stdout_write("first-len=");
+    print(first_len);
+
+    auto texts = stream_range(2, 6, 1)
+        >> stream_map(int_text)
+        >> stream_take(2);
+
+    auto labels = stream_collect(texts);
+    stdout_write("text-count=");
+    print(len(labels));
+
+    auto first_text = stream_first(
+        stream_range(2, 6, 1)
+        >> stream_map(int_text)
+    );
+    stdout_write(first_text);
+    print("");
+    give 0;
+}

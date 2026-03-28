@@ -1520,19 +1520,48 @@ static AstNode *declaration(Parser *parser) {
     consume(parser, TOK_RBRACE, "Expected '}' after extend body");
     result = node;
   } else if (match(parser, TOK_MODULE)) {
-    /* module Name; — stub: skip module name and semicolon */
+    /* module Name; */
     consume(parser, TOK_IDENT, "Expected module name");
+    char *module_name = token_string(&parser->previous);
+    while (match(parser, TOK_DOT)) {
+      consume(parser, TOK_IDENT, "Expected identifier after '.'");
+      char *part = token_string(&parser->previous);
+      size_t old_len = strlen(module_name);
+      size_t part_len = strlen(part);
+      module_name = realloc(module_name, old_len + part_len + 2);
+      module_name[old_len] = '.';
+      memcpy(module_name + old_len + 1, part, part_len + 1);
+      free(part);
+    }
     match(parser, TOK_SEMICOLON);
-    result = ast_new_none(parser->previous.line, parser->previous.column);
+    AstNode *node = calloc(1, sizeof(AstNode));
+    node->type = AST_MODULE;
+    node->line = parser->previous.line;
+    node->column = parser->previous.column;
+    node->as.module_decl.name = module_name;
+    result = node;
   } else if (match(parser, TOK_IMPORT)) {
-    /* import Name; — stub: skip import path and semicolon */
+    /* import Name; */
     consume(parser, TOK_IDENT, "Expected import name");
+    char *import_path = token_string(&parser->previous);
     /* Handle dotted imports like import std.io */
     while (match(parser, TOK_DOT)) {
       consume(parser, TOK_IDENT, "Expected identifier after '.'");
+      char *part = token_string(&parser->previous);
+      size_t old_len = strlen(import_path);
+      size_t part_len = strlen(part);
+      import_path = realloc(import_path, old_len + part_len + 2);
+      import_path[old_len] = '.';
+      memcpy(import_path + old_len + 1, part, part_len + 1);
+      free(part);
     }
     match(parser, TOK_SEMICOLON);
-    result = ast_new_none(parser->previous.line, parser->previous.column);
+    AstNode *node = calloc(1, sizeof(AstNode));
+    node->type = AST_IMPORT;
+    node->line = parser->previous.line;
+    node->column = parser->previous.column;
+    node->as.import_decl.path = import_path;
+    result = node;
   } else if (match(parser, TOK_EXPORT)) {
     /* export — prefix modifier, parse the next declaration */
     result = declaration(parser);
@@ -1573,12 +1602,41 @@ static AstNode *parse_pragma(Parser *parser) {
 
   char *value = NULL;
   if (match(parser, TOK_COLON)) {
-    /* Accept identifiers or keywords as pragma values */
-    if (is_pragma_value_token(parser->current.type)) {
-      advance(parser);
-      value = token_string(&parser->previous);
-    } else {
+    /*
+     * Pragmas like syntax_profile can carry richer values than a single token.
+     * Capture the remainder of the current source line so commas/percentages
+     * survive parsing.
+     */
+    if (check(parser, TOK_EOF) || parser->current.line != line) {
       parser_error_at_current(parser, "Expected pragma value");
+    } else {
+      const char *start = parser->current.start;
+      const char *end = NULL;
+
+      while (!check(parser, TOK_EOF) && parser->current.line == line) {
+        end = parser->current.start + parser->current.length;
+        advance(parser);
+      }
+
+      if (!end || end <= start) {
+        parser_error_at_current(parser, "Expected pragma value");
+      } else {
+        while (start < end && (*start == ' ' || *start == '\t')) {
+          start++;
+        }
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) {
+          end--;
+        }
+
+        if (end <= start) {
+          parser_error_at_current(parser, "Expected pragma value");
+        } else {
+          size_t len = (size_t)(end - start);
+          value = malloc(len + 1);
+          memcpy(value, start, len);
+          value[len] = '\0';
+        }
+      }
     }
   }
 

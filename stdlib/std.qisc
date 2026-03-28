@@ -1,0 +1,4 @@
+module std;
+
+/* Core builtins live in the compiler/runtime. This module exists so
+ * `import std;` resolves through the real import system. */

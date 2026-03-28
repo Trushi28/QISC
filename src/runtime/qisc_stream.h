@@ -6,9 +6,10 @@
 #ifndef QISC_STREAM_H
 #define QISC_STREAM_H
 
+#include "qisc_array.h"
 #include <stdbool.h>
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /* Stream states */
 typedef enum {
@@ -212,5 +213,27 @@ QiscStream *stream_take_while(QiscStream *source, FilterFunc pred);
 
 /* Create stream that skips elements while predicate is true */
 QiscStream *stream_skip_while(QiscStream *source, FilterFunc pred);
+
+/* ============================================================
+ * QISC Wrapper Entry Points
+ * Used by the compiler and interpreter for explicit lazy streams
+ * ============================================================ */
+
+void *__qisc_stream_range_i64(int64_t start, int64_t end, int64_t step);
+void *__qisc_stream_file_lines_open(const char *path);
+void *__qisc_stream_take_i64(void *stream, int64_t n);
+void *__qisc_stream_skip_i64(void *stream, int64_t n);
+void *__qisc_stream_map_i64(void *stream, void *fn_ptr);
+void *__qisc_stream_filter_i64(void *stream, void *fn_ptr);
+void *__qisc_stream_map_i64_to_strings(void *stream, void *fn_ptr);
+void *__qisc_stream_map_strings(void *stream, void *fn_ptr);
+void *__qisc_stream_filter_strings(void *stream, void *fn_ptr);
+void *__qisc_stream_map_strings_to_i64(void *stream, void *fn_ptr);
+int64_t __qisc_stream_count_i64(void *stream);
+int64_t __qisc_stream_first_i64(void *stream);
+char *__qisc_stream_first_string(void *stream);
+void *__qisc_stream_collect_i64(void *stream);
+void *__qisc_stream_collect_strings(void *stream);
+void __qisc_stream_release(void *stream);
 
 #endif /* QISC_STREAM_H */

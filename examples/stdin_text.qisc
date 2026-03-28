@@ -1,0 +1,6 @@
+proc main() gives int {
+    auto text = stdin_text();
+    stdout_write("stdin-bytes=" + str(len(text)));
+    print("");
+    give len(text);
+}

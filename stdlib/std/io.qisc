@@ -1,0 +1,6 @@
+module std.io;
+
+proc println(string s) gives int {
+    print(s);
+    give 0;
+}

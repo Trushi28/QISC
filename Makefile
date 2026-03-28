@@ -1,7 +1,17 @@
 # QISC Build System
-CC = gcc
+CC ?= cc
 CFLAGS = -Wall -Wextra -std=c11 -I./include $(shell llvm-config --cflags)
-LDFLAGS = $(shell llvm-config --ldflags --libs core) -lm
+
+ifeq ($(OS),Windows_NT)
+	EXE_EXT = .exe
+	THREAD_FLAGS =
+else
+	EXE_EXT =
+	THREAD_FLAGS = -pthread
+endif
+
+CFLAGS += $(THREAD_FLAGS)
+LDFLAGS = $(shell llvm-config --ldflags --libs core) -lm $(THREAD_FLAGS)
 
 # Directories
 SRC_DIR = src
@@ -41,12 +51,16 @@ ARRAY_RUNTIME_OBJ = $(LIB_DIR)/qisc_array.o
 STREAM_SRC = $(SRC_DIR)/runtime/qisc_stream.c
 STREAM_OBJ = $(LIB_DIR)/qisc_stream.o
 
+# Text I/O runtime library (stdin/stdout helpers)
+IO_RUNTIME_SRC = $(SRC_DIR)/runtime/qisc_io.c
+IO_RUNTIME_OBJ = $(LIB_DIR)/qisc_io.o
+
 # Error handling runtime library (try/catch with setjmp/longjmp)
 ERROR_SRC = $(SRC_DIR)/runtime/qisc_error.c
 ERROR_OBJ = $(LIB_DIR)/qisc_error.o
 
 # Output
-TARGET = $(BIN_DIR)/qisc
+TARGET = $(BIN_DIR)/qisc$(EXE_EXT)
 
 # Debug/Release
 DEBUG ?= 1
@@ -58,9 +72,11 @@ endif
 
 .PHONY: all clean test runtime stream error
 
-all: dirs $(TARGET) runtime stream error
+all: dirs $(TARGET) runtime io stream error
 
-runtime: dirs $(RUNTIME_OBJ) $(ARRAY_RUNTIME_OBJ)
+runtime: dirs $(RUNTIME_OBJ) $(ARRAY_RUNTIME_OBJ) $(IO_RUNTIME_OBJ)
+
+io: dirs $(IO_RUNTIME_OBJ)
 
 stream: dirs $(STREAM_OBJ)
 
@@ -75,10 +91,33 @@ $(ARRAY_RUNTIME_OBJ): $(ARRAY_RUNTIME_SRC)
 $(STREAM_OBJ): $(STREAM_SRC)
 	$(CC) -Wall -Wextra -std=c11 -I$(SRC_DIR)/runtime -c $< -o $@
 
+$(IO_RUNTIME_OBJ): $(IO_RUNTIME_SRC)
+	$(CC) -Wall -Wextra -std=c11 -I$(SRC_DIR)/runtime -c $< -o $@
+
 $(ERROR_OBJ): $(ERROR_SRC)
 	$(CC) -Wall -Wextra -std=c11 -I$(SRC_DIR)/runtime -c $< -o $@
 
 dirs:
+ifeq ($(OS),Windows_NT)
+	@if not exist $(BIN_DIR) mkdir $(BIN_DIR)
+	@if not exist $(LIB_DIR) mkdir $(LIB_DIR)
+	@if not exist $(BUILD_DIR) mkdir $(BUILD_DIR)
+	@if not exist $(BUILD_DIR)\lexer mkdir $(BUILD_DIR)\lexer
+	@if not exist $(BUILD_DIR)\parser mkdir $(BUILD_DIR)\parser
+	@if not exist $(BUILD_DIR)\interpreter mkdir $(BUILD_DIR)\interpreter
+	@if not exist $(BUILD_DIR)\typechecker mkdir $(BUILD_DIR)\typechecker
+	@if not exist $(BUILD_DIR)\ir mkdir $(BUILD_DIR)\ir
+	@if not exist $(BUILD_DIR)\types mkdir $(BUILD_DIR)\types
+	@if not exist $(BUILD_DIR)\profile mkdir $(BUILD_DIR)\profile
+	@if not exist $(BUILD_DIR)\achievements mkdir $(BUILD_DIR)\achievements
+	@if not exist $(BUILD_DIR)\codegen mkdir $(BUILD_DIR)\codegen
+	@if not exist $(BUILD_DIR)\cli mkdir $(BUILD_DIR)\cli
+	@if not exist $(BUILD_DIR)\personality mkdir $(BUILD_DIR)\personality
+	@if not exist $(BUILD_DIR)\pragma mkdir $(BUILD_DIR)\pragma
+	@if not exist $(BUILD_DIR)\utils mkdir $(BUILD_DIR)\utils
+	@if not exist $(BUILD_DIR)\optimization mkdir $(BUILD_DIR)\optimization
+	@if not exist $(BUILD_DIR)\syntax mkdir $(BUILD_DIR)\syntax
+else
 	@mkdir -p $(BIN_DIR)
 	@mkdir -p $(LIB_DIR)
 	@mkdir -p $(BUILD_DIR)/lexer
@@ -96,16 +135,23 @@ dirs:
 	@mkdir -p $(BUILD_DIR)/utils
 	@mkdir -p $(BUILD_DIR)/optimization
 	@mkdir -p $(BUILD_DIR)/syntax
+endif
 
-$(TARGET): $(OBJS)
-	$(CC) $(OBJS) -o $@ $(LDFLAGS)
+$(TARGET): $(OBJS) $(STREAM_OBJ) $(ARRAY_RUNTIME_OBJ)
+	$(CC) $(OBJS) $(STREAM_OBJ) $(ARRAY_RUNTIME_OBJ) -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
+ifeq ($(OS),Windows_NT)
+	@if exist $(BUILD_DIR) rmdir /s /q $(BUILD_DIR)
+	@if exist $(BIN_DIR) rmdir /s /q $(BIN_DIR)
+	@if exist $(LIB_DIR) rmdir /s /q $(LIB_DIR)
+else
 	rm -rf $(BUILD_DIR) $(BIN_DIR) $(LIB_DIR)
+endif
 
 test:
 	@echo "Running tests..."

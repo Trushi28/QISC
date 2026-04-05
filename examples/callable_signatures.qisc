@@ -1,0 +1,41 @@
+proc join_score(string prefix, int score) gives string {
+    give prefix + str(score);
+}
+
+proc score_over(int score, int limit) gives bool {
+    give score > limit;
+}
+
+proc main() gives int {
+    auto formatter = join_score;
+    stdout_write(formatter("score=", 9));
+    print("");
+
+    auto make_label = x => {
+        give "n=" + str(x + 1);
+    };
+    stdout_write(make_label(6));
+    print("");
+
+    auto alias = make_label;
+    stdout_write(alias(8));
+    print("");
+
+    auto is_big = x => {
+        give x > 3;
+    };
+    if (is_big(4)) {
+        print(1);
+    } else {
+        print(0);
+    }
+
+    auto checker = score_over;
+    if (checker(10, 7)) {
+        print(2);
+    } else {
+        print(0);
+    }
+
+    give 0;
+}

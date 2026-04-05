@@ -18,6 +18,13 @@ typedef enum {
 } StreamKind;
 
 typedef enum {
+  INFER_KIND_UNKNOWN = 0,
+  INFER_KIND_INT = 1,
+  INFER_KIND_STRING = 2,
+  INFER_KIND_BOOL = 3,
+} InferKind;
+
+typedef enum {
   STREAM_OP_TAKE = 1,
   STREAM_OP_SKIP = 2,
   STREAM_OP_MAP = 3,
@@ -41,6 +48,11 @@ typedef struct QiscLazyStream {
   StreamOp *ops_head;
   StreamOp *ops_tail;
 } QiscLazyStream;
+
+typedef struct {
+  const char *name;
+  InferKind kind;
+} InferLocal;
 
 static Value value_stream(QiscStream *handle, StreamKind kind) {
   Value v = {.type = VAL_STREAM};
@@ -69,21 +81,269 @@ static QiscLazyStream *value_stream_get(Value *val) {
 static Value call_value(Interpreter *interp, Value *fn, Value *args, int argc);
 static Value runtime_error(Interpreter *interp, const char *format, ...);
 
-static StreamKind stream_proc_result_kind(Value *proc) {
+static StreamKind stream_kind_from_infer_kind(InferKind kind) {
+  if (kind == INFER_KIND_INT)
+    return STREAM_KIND_INT;
+  if (kind == INFER_KIND_STRING)
+    return STREAM_KIND_STRING;
+  return STREAM_KIND_UNKNOWN;
+}
+
+static InferKind infer_kind_from_value_type(ValueType type) {
+  if (type == VAL_INT)
+    return INFER_KIND_INT;
+  if (type == VAL_STRING)
+    return INFER_KIND_STRING;
+  if (type == VAL_BOOL)
+    return INFER_KIND_BOOL;
+  return INFER_KIND_UNKNOWN;
+}
+
+static InferKind infer_merge_kind(InferKind left, InferKind right) {
+  if (left == INFER_KIND_UNKNOWN)
+    return right;
+  if (right == INFER_KIND_UNKNOWN)
+    return left;
+  if (left == right)
+    return left;
+  return INFER_KIND_UNKNOWN;
+}
+
+static InferKind infer_lookup_local(InferLocal *locals, int count,
+                                    const char *name) {
+  for (int i = count - 1; i >= 0; i--) {
+    if (locals[i].name && name && strcmp(locals[i].name, name) == 0)
+      return locals[i].kind;
+  }
+  return INFER_KIND_UNKNOWN;
+}
+
+static void infer_add_local(InferLocal *locals, int *count, const char *name,
+                            InferKind kind) {
+  if (!locals || !count || !name || *count >= 64)
+    return;
+  locals[*count].name = name;
+  locals[*count].kind = kind;
+  (*count)++;
+}
+
+static InferKind infer_lambda_node_kind(AstNode *node, const char *param_name,
+                                        InferKind param_kind,
+                                        Environment *closure,
+                                        InferLocal *locals, int local_count);
+
+static StreamKind stream_proc_result_kind(Value *proc, StreamKind param_stream_kind) {
   AstNode *node;
+  InferLocal locals[64];
+  int local_count = 0;
+  const char *param_name = NULL;
+  InferKind param_kind =
+      param_stream_kind == STREAM_KIND_INT
+          ? INFER_KIND_INT
+          : param_stream_kind == STREAM_KIND_STRING ? INFER_KIND_STRING
+                                                    : INFER_KIND_UNKNOWN;
+  InferKind inferred;
 
   if (!proc || proc->type != VAL_PROC)
     return STREAM_KIND_UNKNOWN;
 
   node = proc->as.proc_val.proc;
-  if (!node || node->type != AST_PROC || !node->as.proc.return_type)
+  if (!node)
     return STREAM_KIND_UNKNOWN;
 
-  if (strcmp(node->as.proc.return_type->name, "int") == 0)
-    return STREAM_KIND_INT;
-  if (strcmp(node->as.proc.return_type->name, "string") == 0)
-    return STREAM_KIND_STRING;
-  return STREAM_KIND_UNKNOWN;
+  if (node->type == AST_PROC) {
+    if (!node->as.proc.return_type)
+      return STREAM_KIND_UNKNOWN;
+    if (strcmp(node->as.proc.return_type->name, "int") == 0)
+      return STREAM_KIND_INT;
+    if (strcmp(node->as.proc.return_type->name, "string") == 0)
+      return STREAM_KIND_STRING;
+    return STREAM_KIND_UNKNOWN;
+  }
+
+  if (node->type != AST_LAMBDA || node->as.lambda.params.count != 1 ||
+      !node->as.lambda.body)
+    return STREAM_KIND_UNKNOWN;
+
+  AstNode *param = node->as.lambda.params.items[0];
+  if (param->type == AST_VAR_DECL)
+    param_name = param->as.var_decl.name;
+  else if (param->type == AST_IDENTIFIER)
+    param_name = param->as.identifier.name;
+
+  if (param_name)
+    infer_add_local(locals, &local_count, param_name, param_kind);
+
+  inferred = infer_lambda_node_kind(node->as.lambda.body, param_name,
+                                    param_kind, proc->as.proc_val.closure,
+                                    locals, local_count);
+  return stream_kind_from_infer_kind(inferred);
+}
+
+static InferKind infer_lambda_node_kind(AstNode *node, const char *param_name,
+                                        InferKind param_kind,
+                                        Environment *closure,
+                                        InferLocal *locals, int local_count) {
+  if (!node)
+    return INFER_KIND_UNKNOWN;
+
+  switch (node->type) {
+  case AST_INT_LITERAL:
+    return INFER_KIND_INT;
+  case AST_STRING_LITERAL:
+    return INFER_KIND_STRING;
+  case AST_BOOL_LITERAL:
+    return INFER_KIND_BOOL;
+  case AST_IDENTIFIER: {
+    if (param_name && strcmp(node->as.identifier.name, param_name) == 0)
+      return param_kind;
+    InferKind local_kind =
+        infer_lookup_local(locals, local_count, node->as.identifier.name);
+    if (local_kind != INFER_KIND_UNKNOWN)
+      return local_kind;
+    if (closure) {
+      Value *captured = env_get(closure, node->as.identifier.name);
+      if (captured)
+        return infer_kind_from_value_type(captured->type);
+    }
+    return INFER_KIND_UNKNOWN;
+  }
+  case AST_UNARY_OP:
+    if (node->as.unary.op == OP_NOT)
+      return INFER_KIND_BOOL;
+    return infer_lambda_node_kind(node->as.unary.operand, param_name,
+                                  param_kind, closure, locals, local_count);
+  case AST_BINARY_OP: {
+    if (node->as.binary.op == OP_EQ || node->as.binary.op == OP_NE ||
+        node->as.binary.op == OP_LT || node->as.binary.op == OP_GT ||
+        node->as.binary.op == OP_LE || node->as.binary.op == OP_GE ||
+        node->as.binary.op == OP_AND || node->as.binary.op == OP_OR)
+      return INFER_KIND_BOOL;
+    InferKind left = infer_lambda_node_kind(node->as.binary.left, param_name,
+                                            param_kind, closure, locals,
+                                            local_count);
+    InferKind right = infer_lambda_node_kind(node->as.binary.right, param_name,
+                                             param_kind, closure, locals,
+                                             local_count);
+    if (node->as.binary.op == OP_ADD &&
+        (left == INFER_KIND_STRING || right == INFER_KIND_STRING))
+      return INFER_KIND_STRING;
+    if (left == INFER_KIND_INT && right == INFER_KIND_INT)
+      return INFER_KIND_INT;
+    return INFER_KIND_UNKNOWN;
+  }
+  case AST_CALL:
+    if (node->as.call.callee && node->as.call.callee->type == AST_IDENTIFIER) {
+      const char *name = node->as.call.callee->as.identifier.name;
+      if (strcmp(name, "str") == 0)
+        return INFER_KIND_STRING;
+      if (strcmp(name, "len") == 0 || strcmp(name, "int_parse") == 0 ||
+          strcmp(name, "abs") == 0 || strcmp(name, "min") == 0 ||
+          strcmp(name, "max") == 0)
+        return INFER_KIND_INT;
+      if (strcmp(name, "stdin_text") == 0 || strcmp(name, "read_file") == 0)
+        return INFER_KIND_STRING;
+      if (closure) {
+        Value *callee = env_get(closure, name);
+        if (callee && callee->type == VAL_PROC) {
+          StreamKind callee_kind =
+              stream_proc_result_kind(callee, STREAM_KIND_UNKNOWN);
+          if (callee_kind == STREAM_KIND_INT)
+            return INFER_KIND_INT;
+          if (callee_kind == STREAM_KIND_STRING)
+            return INFER_KIND_STRING;
+        }
+      }
+    }
+    return INFER_KIND_UNKNOWN;
+  case AST_GIVE:
+    return node->as.give_stmt.value
+               ? infer_lambda_node_kind(node->as.give_stmt.value, param_name,
+                                        param_kind, closure, locals, local_count)
+               : INFER_KIND_UNKNOWN;
+  case AST_VAR_DECL: {
+    InferKind init_kind = INFER_KIND_UNKNOWN;
+    if (node->as.var_decl.initializer)
+      init_kind = infer_lambda_node_kind(node->as.var_decl.initializer,
+                                         param_name, param_kind, closure,
+                                         locals, local_count);
+    return init_kind;
+  }
+  case AST_ASSIGN:
+    return infer_lambda_node_kind(node->as.assign.value, param_name, param_kind,
+                                  closure, locals, local_count);
+  case AST_BLOCK: {
+    InferLocal scoped_locals[64];
+    int scoped_count = local_count;
+    InferKind result = INFER_KIND_UNKNOWN;
+    memcpy(scoped_locals, locals, sizeof(scoped_locals));
+    for (int i = 0; i < node->as.block.statements.count; i++) {
+      AstNode *stmt = node->as.block.statements.items[i];
+      if (!stmt)
+        continue;
+      if (stmt->type == AST_VAR_DECL) {
+        InferKind init_kind = INFER_KIND_UNKNOWN;
+        if (stmt->as.var_decl.initializer) {
+          init_kind = infer_lambda_node_kind(
+              stmt->as.var_decl.initializer, param_name, param_kind, closure,
+              scoped_locals, scoped_count);
+        }
+        infer_add_local(scoped_locals, &scoped_count, stmt->as.var_decl.name,
+                        init_kind);
+        continue;
+      }
+      result = infer_merge_kind(
+          result, infer_lambda_node_kind(stmt, param_name, param_kind, closure,
+                                         scoped_locals, scoped_count));
+    }
+    return result;
+  }
+  case AST_IF: {
+    InferKind then_kind = INFER_KIND_UNKNOWN;
+    InferKind else_kind = INFER_KIND_UNKNOWN;
+    if (node->as.if_stmt.then_branch)
+      then_kind = infer_lambda_node_kind(node->as.if_stmt.then_branch,
+                                         param_name, param_kind, closure, locals,
+                                         local_count);
+    if (node->as.if_stmt.else_branch)
+      else_kind = infer_lambda_node_kind(node->as.if_stmt.else_branch,
+                                         param_name, param_kind, closure, locals,
+                                         local_count);
+    return infer_merge_kind(then_kind, else_kind);
+  }
+  case AST_WHILE:
+    return node->as.while_stmt.body
+               ? infer_lambda_node_kind(node->as.while_stmt.body, param_name,
+                                        param_kind, closure, locals, local_count)
+               : INFER_KIND_UNKNOWN;
+  case AST_FOR: {
+    InferLocal scoped_locals[64];
+    int scoped_count = local_count;
+    memcpy(scoped_locals, locals, sizeof(scoped_locals));
+    if (node->as.for_stmt.init && node->as.for_stmt.init->type == AST_VAR_DECL) {
+      InferKind init_kind = INFER_KIND_UNKNOWN;
+      if (node->as.for_stmt.init->as.var_decl.initializer) {
+        init_kind = infer_lambda_node_kind(
+            node->as.for_stmt.init->as.var_decl.initializer, param_name,
+            param_kind, closure, scoped_locals, scoped_count);
+      }
+      infer_add_local(scoped_locals, &scoped_count,
+                      node->as.for_stmt.init->as.var_decl.name, init_kind);
+    }
+    if (node->as.for_stmt.var_name)
+      infer_add_local(scoped_locals, &scoped_count, node->as.for_stmt.var_name,
+                      INFER_KIND_UNKNOWN);
+    return node->as.for_stmt.body
+               ? infer_lambda_node_kind(node->as.for_stmt.body, param_name,
+                                        param_kind, closure, scoped_locals,
+                                        scoped_count)
+               : INFER_KIND_UNKNOWN;
+  }
+  case AST_LAMBDA:
+    return INFER_KIND_UNKNOWN;
+  default:
+    return INFER_KIND_UNKNOWN;
+  }
 }
 
 static StreamOp *stream_op_new(StreamOpKind kind) {
@@ -649,6 +909,79 @@ static Value builtin_skip(Interpreter *interp, Value *args, int argc) {
   return result;
 }
 
+static Value builtin_array_map(Interpreter *interp, Value *args, int argc) {
+  Value result = {.type = VAL_ARRAY};
+  if (argc != 2 || args[0].type != VAL_ARRAY || args[1].type != VAL_PROC)
+    return value_none();
+
+  result.as.array_val.count = args[0].as.array_val.count;
+  result.as.array_val.capacity = args[0].as.array_val.count;
+  result.as.array_val.items =
+      result.as.array_val.count > 0
+          ? malloc(result.as.array_val.count * sizeof(Value))
+          : NULL;
+
+  for (int i = 0; i < args[0].as.array_val.count; i++) {
+    Value elem = args[0].as.array_val.items[i];
+    result.as.array_val.items[i] = call_value(interp, &args[1], &elem, 1);
+    if (interp->had_error)
+      return result;
+  }
+
+  return result;
+}
+
+static Value builtin_array_filter(Interpreter *interp, Value *args, int argc) {
+  Value result = {.type = VAL_ARRAY};
+  if (argc != 2 || args[0].type != VAL_ARRAY || args[1].type != VAL_PROC)
+    return value_none();
+
+  result.as.array_val.capacity = args[0].as.array_val.count;
+  result.as.array_val.count = 0;
+  result.as.array_val.items =
+      result.as.array_val.capacity > 0
+          ? malloc(result.as.array_val.capacity * sizeof(Value))
+          : NULL;
+
+  for (int i = 0; i < args[0].as.array_val.count; i++) {
+    Value elem = args[0].as.array_val.items[i];
+    Value test = call_value(interp, &args[1], &elem, 1);
+    if (interp->had_error)
+      return test;
+    if (value_is_truthy(&test)) {
+      result.as.array_val.items[result.as.array_val.count++] = elem;
+    }
+  }
+
+  return result;
+}
+
+static Value builtin_array_reduce(Interpreter *interp, Value *args, int argc) {
+  if (argc != 3 || args[0].type != VAL_ARRAY)
+    return value_none();
+
+  Value fn;
+  Value acc;
+  if (args[1].type == VAL_PROC) {
+    fn = args[1];
+    acc = args[2];
+  } else if (args[2].type == VAL_PROC) {
+    fn = args[2];
+    acc = args[1];
+  } else {
+    return value_none();
+  }
+
+  for (int i = 0; i < args[0].as.array_val.count; i++) {
+    Value call_args[2] = {acc, args[0].as.array_val.items[i]};
+    acc = call_value(interp, &fn, call_args, 2);
+    if (interp->had_error)
+      return acc;
+  }
+
+  return acc;
+}
+
 static bool lazy_stream_next(Interpreter *interp, QiscLazyStream *stream,
                              Value *out) {
   if (!stream || !stream->handle || stream->consumed || !out)
@@ -804,7 +1137,7 @@ static Value builtin_stream_map(Interpreter *interp, Value *args, int argc) {
   if (!stream)
     return value_none();
 
-  result_kind = stream_proc_result_kind(&args[1]);
+  result_kind = stream_proc_result_kind(&args[1], stream->kind);
   if (stream->kind != STREAM_KIND_INT && stream->kind != STREAM_KIND_STRING)
     return value_none();
 
@@ -908,6 +1241,33 @@ static Value builtin_stream_collect(Interpreter *interp, Value *args, int argc) 
     result.as.array_val.items[result.as.array_val.count++] = item;
   }
   return result;
+}
+
+static Value builtin_stream_reduce(Interpreter *interp, Value *args, int argc) {
+  QiscLazyStream *stream;
+  Value acc;
+
+  if (argc != 3 || args[0].type != VAL_STREAM || args[1].type != VAL_PROC)
+    return value_none();
+
+  stream = value_stream_get(&args[0]);
+  if (!stream)
+    return args[2];
+
+  acc = args[2];
+  while (1) {
+    Value item;
+    Value call_args[2];
+    if (!lazy_stream_next(interp, stream, &item))
+      break;
+    call_args[0] = acc;
+    call_args[1] = item;
+    acc = call_value(interp, &args[1], call_args, 2);
+    value_free(&item);
+    if (interp->had_error)
+      return acc;
+  }
+  return acc;
 }
 
 /* Register built-ins */
@@ -1089,6 +1449,26 @@ static Value eval_binary(Interpreter *interp, AstNode *node) {
       if (strcmp(fn_name, "stream_collect") == 0) {
         Value call_args[1] = {left};
         return builtin_stream_collect(interp, call_args, 1);
+      }
+
+      if (strcmp(fn_name, "stream_reduce") == 0 && rhs->as.call.args.count >= 2) {
+        Value first = evaluate(interp, rhs->as.call.args.items[0]);
+        if (interp->had_error)
+          return first;
+        Value second = evaluate(interp, rhs->as.call.args.items[1]);
+        if (interp->had_error)
+          return second;
+        Value fn;
+        Value initial;
+        if (first.type == VAL_PROC) {
+          fn = first;
+          initial = second;
+        } else {
+          fn = second;
+          initial = first;
+        }
+        Value call_args[3] = {left, fn, initial};
+        return builtin_stream_reduce(interp, call_args, 3);
       }
 
       if (strcmp(fn_name, "reduce") == 0 && rhs->as.call.args.count >= 2) {
@@ -1424,6 +1804,8 @@ static Value eval_call(Interpreter *interp, AstNode *node) {
       result = builtin_stream_first(interp, args, argc);
     } else if (strcmp(name, "stream_collect") == 0) {
       result = builtin_stream_collect(interp, args, argc);
+    } else if (strcmp(name, "stream_reduce") == 0) {
+      result = builtin_stream_reduce(interp, args, argc);
     } else if (strcmp(name, "read_file") == 0) {
       result = builtin_read_file(interp, args, argc);
     } else if (strcmp(name, "file_lines") == 0) {
@@ -1437,16 +1819,17 @@ static Value eval_call(Interpreter *interp, AstNode *node) {
     } else if (strcmp(name, "skip") == 0) {
       result = builtin_skip(interp, args, argc);
     } else if (strcmp(name, "filter") == 0) {
-      /* filter(predicate) on array - used in pipelines */
-      if (argc >= 1 && args[0].type == VAL_PROC) {
-        /* Return the lambda itself; pipeline will apply it */
+      if (argc == 2 && args[0].type == VAL_ARRAY && args[1].type == VAL_PROC) {
+        result = builtin_array_filter(interp, args, argc);
+      } else if (argc >= 1 && args[0].type == VAL_PROC) {
         result = args[0];
       } else {
         result = value_none();
       }
     } else if (strcmp(name, "map") == 0) {
-      /* map(transform) on array - used in pipelines */
-      if (argc >= 1 && args[0].type == VAL_PROC) {
+      if (argc == 2 && args[0].type == VAL_ARRAY && args[1].type == VAL_PROC) {
+        result = builtin_array_map(interp, args, argc);
+      } else if (argc >= 1 && args[0].type == VAL_PROC) {
         result = args[0];
       } else {
         result = value_none();
@@ -1455,8 +1838,11 @@ static Value eval_call(Interpreter *interp, AstNode *node) {
       /* Collect materializes a pipeline - return input as-is */
       result = argc > 0 ? args[0] : value_none();
     } else if (strcmp(name, "reduce") == 0) {
-      /* Support both reduce(fn, initial) and reduce(initial, fn). */
-      if (argc >= 2 && (args[0].type == VAL_PROC || args[1].type == VAL_PROC)) {
+      if (argc == 3 && args[0].type == VAL_ARRAY &&
+          (args[1].type == VAL_PROC || args[2].type == VAL_PROC)) {
+        result = builtin_array_reduce(interp, args, argc);
+      } else if (argc >= 2 &&
+                 (args[0].type == VAL_PROC || args[1].type == VAL_PROC)) {
         result = (args[0].type == VAL_PROC) ? args[1] : args[0];
       } else {
         result = argc > 0 ? args[0] : value_none();
@@ -2283,6 +2669,10 @@ Value interpreter_run(Interpreter *interp, AstNode *program) {
   }
 
   return interp->return_value;
+}
+
+void interpreter_exec(Interpreter *interp, AstNode *node) {
+  execute(interp, node);
 }
 
 Value interpreter_eval(Interpreter *interp, AstNode *expr) {

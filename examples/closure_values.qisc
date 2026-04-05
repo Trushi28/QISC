@@ -1,0 +1,36 @@
+proc main() gives int {
+    auto bias = 5;
+    auto limit = 8;
+    auto add_bias = x => {
+        give x + bias;
+    };
+
+    auto single = add_bias(7);
+    print(single);
+
+    auto nums = [1, 2, 3, 4];
+
+    auto mapped = map(nums, add_bias);
+    print(mapped[1]);
+
+    auto filtered = filter(nums, x => {
+        give x + bias > limit;
+    });
+    print(len(filtered));
+
+    auto total = reduce(nums, (acc, x) => {
+        give acc + x + bias;
+    }, 0);
+    print(total);
+
+    auto pipeline_total = nums
+        >> map(x => {
+            give x + bias;
+        })
+        >> reduce((acc, x) => {
+            give acc + x;
+        }, 0);
+    print(pipeline_total);
+
+    give 0;
+}

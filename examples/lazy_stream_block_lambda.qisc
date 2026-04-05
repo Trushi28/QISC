@@ -1,0 +1,39 @@
+proc main() gives int {
+    auto factor = 5;
+    auto cutoff = 20;
+
+    auto texts = stream_range(1, 5, 1)
+        >> stream_map(x => {
+            auto scaled = x * factor;
+            give str(scaled);
+        })
+        >> stream_take(2);
+
+    auto labels = stream_collect(texts);
+    stdout_write("labels=");
+    print(len(labels));
+
+    auto first_text = stream_first(
+        stream_range(1, 5, 1)
+        >> stream_map(x => {
+            auto scaled = x * factor;
+            give str(scaled);
+        })
+    );
+    stdout_write(first_text);
+    print("");
+
+    auto first_len = stream_first(
+        stream_file_lines("src/runtime/qisc_stream.h")
+        >> stream_filter(line => {
+            auto size = len(line);
+            give size > cutoff;
+        })
+        >> stream_map(line => {
+            auto size = len(line);
+            give size + factor;
+        })
+    );
+    print(first_len);
+    give 0;
+}

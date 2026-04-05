@@ -1,0 +1,27 @@
+%% markdown
+# QISC Notebook Demo
+
+This cell is ignored by the notebook runner.
+
+%%
+auto base = 10
+
+%%
+base + 5
+
+%%
+proc twice(int x) gives int {
+    give x * 2;
+}
+
+%%
+twice(base)
+
+%% md
+More ignored text.
+
+%%
+auto shifted = twice(base) + 3
+
+%%
+shifted

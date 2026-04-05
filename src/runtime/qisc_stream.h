@@ -225,10 +225,25 @@ void *__qisc_stream_take_i64(void *stream, int64_t n);
 void *__qisc_stream_skip_i64(void *stream, int64_t n);
 void *__qisc_stream_map_i64(void *stream, void *fn_ptr);
 void *__qisc_stream_filter_i64(void *stream, void *fn_ptr);
+void *__qisc_stream_map_i64_ctx(void *stream, void *fn_ptr, void *ctx);
+void *__qisc_stream_filter_i64_ctx(void *stream, void *fn_ptr, void *ctx);
 void *__qisc_stream_map_i64_to_strings(void *stream, void *fn_ptr);
+void *__qisc_stream_map_i64_to_strings_ctx(void *stream, void *fn_ptr,
+                                           void *ctx);
 void *__qisc_stream_map_strings(void *stream, void *fn_ptr);
 void *__qisc_stream_filter_strings(void *stream, void *fn_ptr);
+void *__qisc_stream_map_strings_ctx(void *stream, void *fn_ptr, void *ctx);
+void *__qisc_stream_filter_strings_ctx(void *stream, void *fn_ptr, void *ctx);
 void *__qisc_stream_map_strings_to_i64(void *stream, void *fn_ptr);
+void *__qisc_stream_map_strings_to_i64_ctx(void *stream, void *fn_ptr,
+                                           void *ctx);
+int64_t __qisc_stream_reduce_i64(void *stream, void *fn_ptr, int64_t initial);
+int64_t __qisc_stream_reduce_i64_ctx(void *stream, void *fn_ptr, void *ctx,
+                                     int64_t initial);
+int64_t __qisc_stream_reduce_strings_to_i64(void *stream, void *fn_ptr,
+                                            int64_t initial);
+int64_t __qisc_stream_reduce_strings_to_i64_ctx(void *stream, void *fn_ptr,
+                                                void *ctx, int64_t initial);
 int64_t __qisc_stream_count_i64(void *stream);
 int64_t __qisc_stream_first_i64(void *stream);
 char *__qisc_stream_first_string(void *stream);

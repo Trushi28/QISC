@@ -94,6 +94,9 @@ void interpreter_free(Interpreter *interp);
 /* Interpret a program */
 Value interpreter_run(Interpreter *interp, AstNode *program);
 
+/* Execute a node without implicitly calling main() */
+void interpreter_exec(Interpreter *interp, AstNode *node);
+
 /* Interpret a single expression */
 Value interpreter_eval(Interpreter *interp, AstNode *expr);
 

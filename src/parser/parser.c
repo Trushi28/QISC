@@ -197,7 +197,11 @@ static AstNode *primary(Parser *parser) {
     /* Check for lambda: ident => expr */
     if (check(parser, TOK_FATARROW)) {
       advance(parser); /* consume => */
-      AstNode *body = expression(parser);
+      AstNode *body;
+      if (match(parser, TOK_LBRACE))
+        body = block(parser);
+      else
+        body = expression(parser);
       AstNode *lambda = calloc(1, sizeof(AstNode));
       lambda->type = AST_LAMBDA;
       lambda->line = line;
@@ -282,7 +286,10 @@ static AstNode *primary(Parser *parser) {
 
       consume(parser, TOK_RPAREN, "Expected ')' after parameters");
       consume(parser, TOK_FATARROW, "Expected '=>' after parameters");
-      lambda->as.lambda.body = expression(parser);
+      if (match(parser, TOK_LBRACE))
+        lambda->as.lambda.body = block(parser);
+      else
+        lambda->as.lambda.body = expression(parser);
       return lambda;
     }
 
@@ -300,7 +307,10 @@ static AstNode *primary(Parser *parser) {
       param->type = AST_VAR_DECL;
       param->as.var_decl.name = first->as.identifier.name;
       ast_array_push(&lambda->as.lambda.params, param);
-      lambda->as.lambda.body = expression(parser);
+      if (match(parser, TOK_LBRACE))
+        lambda->as.lambda.body = block(parser);
+      else
+        lambda->as.lambda.body = expression(parser);
       return lambda;
     }
 

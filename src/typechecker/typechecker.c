@@ -342,6 +342,13 @@ static void check_call(TypeChecker *tc, AstNode *node) {
     const char *fname = node->as.call.callee->as.identifier.name;
     int idx = tc_lookup_func_idx(tc, fname);
 
+    if (strcmp(fname, "stream_reduce") == 0) {
+      for (int i = 0; i < argc; i++) {
+        check_node(tc, node->as.call.args.items[i]);
+      }
+      return;
+    }
+
     if (idx >= 0) {
       TcFunction *fn = &tc->functions[idx];
       if (argc != fn->param_count) {
@@ -589,6 +596,13 @@ static void check_node(TypeChecker *tc, AstNode *node) {
 
   case AST_LAMBDA: {
     int saved_count = tc->symbol_count;
+    const char *saved_proc_name = tc->current_proc_name;
+    const char *saved_return_type = tc->current_return_type;
+    tc->current_proc_name = "<lambda>";
+    tc->current_return_type =
+        (node->as.lambda.body && node->as.lambda.body->type != AST_BLOCK)
+            ? infer_type(tc, node->as.lambda.body)
+            : "any";
     for (int i = 0; i < node->as.lambda.params.count; i++) {
       AstNode *param = node->as.lambda.params.items[i];
       if (param && param->type == AST_VAR_DECL) {
@@ -597,6 +611,8 @@ static void check_node(TypeChecker *tc, AstNode *node) {
     }
     check_node(tc, node->as.lambda.body);
     tc_restore_symbols(tc, saved_count);
+    tc->current_proc_name = saved_proc_name;
+    tc->current_return_type = saved_return_type;
     break;
   }
 
@@ -626,6 +642,7 @@ static void check_node(TypeChecker *tc, AstNode *node) {
 
 void typechecker_init(TypeChecker *tc) {
   memset(tc, 0, sizeof(TypeChecker));
+  const char *stream_reduce_params[3] = {"any", "proc", "any"};
 
   /* Builtins remain dynamic, but should still count as known callables. */
   tc_define(tc, "print", "proc", false);
@@ -638,6 +655,9 @@ void typechecker_init(TypeChecker *tc) {
   tc_define(tc, "stream_skip", "proc", false);
   tc_define(tc, "stream_map", "proc", false);
   tc_define(tc, "stream_filter", "proc", false);
+  tc_define(tc, "stream_reduce", "proc", false);
+  tc_define_func_signature(tc, "stream_reduce", 3, "any", false,
+                           stream_reduce_params);
   tc_define(tc, "stream_count", "proc", false);
   tc_define(tc, "stream_first", "proc", false);
   tc_define(tc, "stream_collect", "proc", false);

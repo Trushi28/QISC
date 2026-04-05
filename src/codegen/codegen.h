@@ -18,12 +18,17 @@
 /* Max symbols per scope */
 #define CG_MAX_SYMBOLS 512
 #define CG_MAX_SCOPES 64
+#define CG_MAX_CALLABLE_PARAMS 16
 
 /* Symbol entry (variable name → alloca) */
 typedef struct {
   char *name;
   LLVMValueRef alloca;
   LLVMTypeRef type;
+  bool is_callable;
+  int callable_param_count;
+  LLVMTypeRef callable_return_type;
+  LLVMTypeRef callable_param_types[CG_MAX_CALLABLE_PARAMS];
 } CgSymbol;
 
 /* Scope for block-level variable lookup */

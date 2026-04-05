@@ -1,0 +1,15 @@
+proc main() gives int {
+    auto bonus = 2;
+
+    auto total = stream_file_lines("src/runtime/qisc_stream.h")
+        >> stream_filter(line => len(line) > 20)
+        >> stream_take(3)
+        >> stream_reduce((acc, line) => {
+            auto next = acc + len(line) + bonus;
+            give next;
+        }, 0);
+
+    stdout_write("total=");
+    print(total);
+    give 0;
+}

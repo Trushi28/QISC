@@ -353,6 +353,12 @@ static void cg_define(Codegen *cg, const char *name, LLVMValueRef alloca,
   s->symbols[idx].name = strdup(name);
   s->symbols[idx].alloca = alloca;
   s->symbols[idx].type = type;
+  s->symbols[idx].is_callable = false;
+  s->symbols[idx].callable_param_count = 0;
+  s->symbols[idx].callable_return_type = NULL;
+  for (int i = 0; i < CG_MAX_CALLABLE_PARAMS; i++) {
+    s->symbols[idx].callable_param_types[i] = NULL;
+  }
 }
 
 static CgSymbol *cg_lookup(Codegen *cg, const char *name) {
@@ -362,6 +368,36 @@ static CgSymbol *cg_lookup(Codegen *cg, const char *name) {
       if (strcmp(s->symbols[i].name, name) == 0) {
         return &s->symbols[i];
       }
+    }
+  }
+  return NULL;
+}
+
+static void cg_set_callable_metadata(CgSymbol *sym, LLVMTypeRef return_type,
+                                     LLVMTypeRef *param_types,
+                                     int param_count) {
+  if (!sym)
+    return;
+  sym->is_callable = true;
+  sym->callable_param_count =
+      param_count > CG_MAX_CALLABLE_PARAMS ? CG_MAX_CALLABLE_PARAMS : param_count;
+  sym->callable_return_type = return_type;
+  for (int i = 0; i < CG_MAX_CALLABLE_PARAMS; i++) {
+    sym->callable_param_types[i] =
+        i < sym->callable_param_count ? param_types[i] : NULL;
+  }
+}
+
+static AstNode *cg_find_proc_decl(Codegen *cg, const char *name) {
+  if (!cg || !name || !cg->program_ast ||
+      cg->program_ast->type != AST_PROGRAM)
+    return NULL;
+
+  for (int i = 0; i < cg->program_ast->as.program.declarations.count; i++) {
+    AstNode *decl = cg->program_ast->as.program.declarations.items[i];
+    if (decl && decl->type == AST_PROC && decl->as.proc.name &&
+        strcmp(decl->as.proc.name, name) == 0) {
+      return decl;
     }
   }
   return NULL;
@@ -382,9 +418,42 @@ typedef enum {
   CG_VALUE_BOOL = 3,
 } CgValueKind;
 
+typedef struct {
+  const char *name;
+  CgSymbol *symbol;
+} CgLambdaCapture;
+
+typedef struct {
+  const char *name;
+  CgValueKind kind;
+} CgLocalKind;
+
+typedef struct {
+  LLVMValueRef fn;
+  LLVMValueRef ctx;
+  bool uses_ctx;
+} CgStreamCallable;
+
 static LLVMValueRef emit_expr(Codegen *cg, AstNode *node);
+static void emit_block(Codegen *cg, AstNode *node);
+static LLVMTypeRef cg_type_from_name(Codegen *cg, const char *name);
+static LLVMTypeRef cg_return_type(Codegen *cg, AstNode *proc);
+static CgValueKind cg_lambda_body_kind(Codegen *cg, AstNode *node,
+                                       const char *param_name,
+                                       CgValueKind param_kind);
+static LLVMValueRef cg_coerce_value(Codegen *cg, LLVMValueRef value,
+                                    LLVMTypeRef target_type);
 static CgStreamKind cg_stream_kind_from_callable(Codegen *cg, AstNode *node,
                                                  CgStreamKind input_kind);
+static LLVMValueRef cg_emit_general_closure_value(Codegen *cg, AstNode *lambda,
+                                                  LLVMTypeRef *param_types,
+                                                  int param_count,
+                                                  LLVMTypeRef return_type);
+static LLVMValueRef cg_emit_closure_call(Codegen *cg, LLVMValueRef closure,
+                                         LLVMTypeRef *arg_types,
+                                         LLVMValueRef *args, int argc,
+                                         LLVMTypeRef return_type,
+                                         const char *name);
 
 static bool cg_expr_is_array_like(Codegen *cg, AstNode *node) {
   if (!cg || !node)
@@ -483,6 +552,25 @@ static bool cg_expr_is_stream_like(Codegen *cg, AstNode *node) {
   return cg_expr_stream_kind(cg, node) != CG_STREAM_NONE;
 }
 
+static bool cg_ast_is_probably_callable(Codegen *cg, AstNode *node) {
+  if (!cg || !node)
+    return false;
+  if (node->type == AST_LAMBDA)
+    return true;
+  if (node->type == AST_IDENTIFIER) {
+    if (cg->program_ast && cg->program_ast->type == AST_PROGRAM) {
+      for (int i = 0; i < cg->program_ast->as.program.declarations.count; i++) {
+        AstNode *decl = cg->program_ast->as.program.declarations.items[i];
+        if (decl->type == AST_PROC && decl->as.proc.name &&
+            strcmp(decl->as.proc.name, node->as.identifier.name) == 0) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
 static CgStreamKind cg_stream_kind_from_type_name(const char *name) {
   if (!name)
     return CG_STREAM_NONE;
@@ -513,6 +601,62 @@ static CgValueKind cg_value_kind_from_stream_kind(CgStreamKind kind) {
   return CG_VALUE_UNKNOWN;
 }
 
+static CgValueKind cg_value_kind_from_llvm_type(Codegen *cg,
+                                                LLVMTypeRef type) {
+  if (!cg || !type)
+    return CG_VALUE_UNKNOWN;
+  if (type == cg->i64_type)
+    return CG_VALUE_INT;
+  if (type == cg->i8ptr_type)
+    return CG_VALUE_STRING;
+  if (type == cg->i1_type)
+    return CG_VALUE_BOOL;
+  return CG_VALUE_UNKNOWN;
+}
+
+static CgValueKind cg_merge_value_kind(CgValueKind left, CgValueKind right) {
+  if (left == CG_VALUE_UNKNOWN)
+    return right;
+  if (right == CG_VALUE_UNKNOWN)
+    return left;
+  if (left == right)
+    return left;
+  return CG_VALUE_UNKNOWN;
+}
+
+static bool cg_local_kind_present(CgLocalKind *locals, int count,
+                                  const char *name) {
+  for (int i = 0; i < count; i++) {
+    if (locals[i].name && name && strcmp(locals[i].name, name) == 0)
+      return true;
+  }
+  return false;
+}
+
+static CgValueKind cg_lookup_local_kind(CgLocalKind *locals, int count,
+                                        const char *name) {
+  for (int i = count - 1; i >= 0; i--) {
+    if (locals[i].name && name && strcmp(locals[i].name, name) == 0)
+      return locals[i].kind;
+  }
+  return CG_VALUE_UNKNOWN;
+}
+
+static void cg_locals_add(CgLocalKind *locals, int *count, const char *name,
+                          CgValueKind kind) {
+  if (!locals || !count || !name || *count >= 64)
+    return;
+  locals[*count].name = name;
+  locals[*count].kind = kind;
+  (*count)++;
+}
+
+static CgValueKind cg_lambda_stmt_kind(Codegen *cg, AstNode *node,
+                                       const char *param_name,
+                                       CgValueKind param_kind,
+                                       CgLocalKind *locals, int local_count);
+static const char *cg_lambda_param_name(AstNode *param);
+
 static LLVMTypeRef cg_llvm_type_from_value_kind(Codegen *cg, CgValueKind kind) {
   switch (kind) {
   case CG_VALUE_INT:
@@ -526,9 +670,161 @@ static LLVMTypeRef cg_llvm_type_from_value_kind(Codegen *cg, CgValueKind kind) {
   }
 }
 
+static void cg_fill_proc_callable_types(Codegen *cg, AstNode *proc,
+                                        LLVMTypeRef *return_type,
+                                        LLVMTypeRef *param_types,
+                                        int *param_count) {
+  int count = 0;
+
+  if (!cg || !proc || proc->type != AST_PROC)
+    return;
+
+  if (return_type)
+    *return_type = cg_return_type(cg, proc);
+
+  if (param_types && param_count) {
+    count = proc->as.proc.params.count;
+    if (count > CG_MAX_CALLABLE_PARAMS)
+      count = CG_MAX_CALLABLE_PARAMS;
+    for (int i = 0; i < count; i++) {
+      AstNode *param = proc->as.proc.params.items[i];
+      if (param && param->type == AST_VAR_DECL && param->as.var_decl.type_info) {
+        param_types[i] =
+            cg_type_from_name(cg, param->as.var_decl.type_info->name);
+      } else {
+        param_types[i] = cg->i64_type;
+      }
+    }
+    *param_count = count;
+  }
+}
+
+static LLVMTypeRef cg_lambda_general_return_type(Codegen *cg, AstNode *lambda) {
+  const char *param_name = NULL;
+  CgValueKind kind;
+  LLVMTypeRef inferred;
+
+  if (!cg || !lambda || lambda->type != AST_LAMBDA || !lambda->as.lambda.body)
+    return cg ? cg->i64_type : NULL;
+
+  if (lambda->as.lambda.params.count >= 1) {
+    AstNode *param = lambda->as.lambda.params.items[0];
+    param_name = cg_lambda_param_name(param);
+  }
+
+  kind = cg_lambda_body_kind(cg, lambda->as.lambda.body, param_name,
+                             CG_VALUE_INT);
+  inferred = cg_llvm_type_from_value_kind(cg, kind);
+  return inferred ? inferred : cg->i64_type;
+}
+
+static void cg_attach_callable_metadata_from_initializer(Codegen *cg,
+                                                         const char *name,
+                                                         AstNode *initializer) {
+  CgSymbol *sym;
+
+  if (!cg || !name || !initializer)
+    return;
+
+  sym = cg_lookup(cg, name);
+  if (!sym)
+    return;
+
+  if (initializer->type == AST_LAMBDA) {
+    LLVMTypeRef param_types[CG_MAX_CALLABLE_PARAMS];
+    int param_count = initializer->as.lambda.params.count;
+    if (param_count > CG_MAX_CALLABLE_PARAMS)
+      param_count = CG_MAX_CALLABLE_PARAMS;
+    for (int i = 0; i < param_count; i++)
+      param_types[i] = cg->i64_type;
+    cg_set_callable_metadata(sym, cg_lambda_general_return_type(cg, initializer),
+                             param_types, param_count);
+    return;
+  }
+
+  if (initializer->type == AST_IDENTIFIER) {
+    CgSymbol *source_sym = cg_lookup(cg, initializer->as.identifier.name);
+    if (source_sym && source_sym->is_callable) {
+      cg_set_callable_metadata(sym, source_sym->callable_return_type,
+                               source_sym->callable_param_types,
+                               source_sym->callable_param_count);
+      return;
+    }
+
+    AstNode *proc = cg_find_proc_decl(cg, initializer->as.identifier.name);
+    if (proc) {
+      LLVMTypeRef param_types[CG_MAX_CALLABLE_PARAMS];
+      LLVMTypeRef return_type = cg->i64_type;
+      int param_count = 0;
+      cg_fill_proc_callable_types(cg, proc, &return_type, param_types,
+                                  &param_count);
+      cg_set_callable_metadata(sym, return_type, param_types, param_count);
+    }
+  }
+}
+
+static LLVMValueRef cg_emit_symbol_callable_call(Codegen *cg, CgSymbol *sym,
+                                                 LLVMValueRef callable,
+                                                 LLVMValueRef *args, int argc,
+                                                 bool is_closure,
+                                                 const char *call_name) {
+  LLVMTypeRef *param_types;
+  LLVMValueRef *coerced_args;
+  LLVMTypeRef return_type;
+  LLVMValueRef result;
+
+  if (!cg || !sym || !sym->is_callable || !callable)
+    return LLVMConstInt(cg->i64_type, 0, false);
+
+  if (argc != sym->callable_param_count) {
+    cg_error(cg, "Callable '%s' expects %d argument(s) but got %d",
+             sym->name ? sym->name : "<callable>", sym->callable_param_count,
+             argc);
+    return LLVMConstInt(cg->i64_type, 0, false);
+  }
+
+  param_types = argc > 0 ? calloc(argc, sizeof(LLVMTypeRef)) : NULL;
+  coerced_args = argc > 0 ? calloc(argc, sizeof(LLVMValueRef)) : NULL;
+  for (int i = 0; i < argc; i++) {
+    param_types[i] = sym->callable_param_types[i]
+                         ? sym->callable_param_types[i]
+                         : cg->i64_type;
+    coerced_args[i] = cg_coerce_value(cg, args[i], param_types[i]);
+  }
+  return_type = sym->callable_return_type ? sym->callable_return_type
+                                          : cg->i64_type;
+
+  if (is_closure) {
+    result = cg_emit_closure_call(cg, callable, param_types, coerced_args, argc,
+                                  return_type, call_name);
+  } else {
+    LLVMTypeRef fn_type = LLVMFunctionType(return_type, param_types, argc, false);
+    result = LLVMBuildCall2(cg->builder, fn_type, callable, coerced_args, argc,
+                            call_name ? call_name : "");
+  }
+
+  free(param_types);
+  free(coerced_args);
+  return result;
+}
+
 static CgValueKind cg_lambda_body_kind(Codegen *cg, AstNode *node,
                                        const char *param_name,
                                        CgValueKind param_kind) {
+  CgLocalKind locals[64];
+  int local_count = 0;
+
+  if (param_name)
+    cg_locals_add(locals, &local_count, param_name, param_kind);
+
+  return cg_lambda_stmt_kind(cg, node, param_name, param_kind, locals,
+                             local_count);
+}
+
+static CgValueKind cg_lambda_stmt_kind(Codegen *cg, AstNode *node,
+                                       const char *param_name,
+                                       CgValueKind param_kind,
+                                       CgLocalKind *locals, int local_count) {
   if (!cg || !node)
     return CG_VALUE_UNKNOWN;
 
@@ -542,12 +838,21 @@ static CgValueKind cg_lambda_body_kind(Codegen *cg, AstNode *node,
   case AST_IDENTIFIER:
     if (param_name && strcmp(node->as.identifier.name, param_name) == 0)
       return param_kind;
+    {
+      CgValueKind local_kind =
+          cg_lookup_local_kind(locals, local_count, node->as.identifier.name);
+      if (local_kind != CG_VALUE_UNKNOWN)
+        return local_kind;
+      CgSymbol *sym = cg_lookup(cg, node->as.identifier.name);
+      if (sym)
+        return cg_value_kind_from_llvm_type(cg, sym->type);
+    }
     return CG_VALUE_UNKNOWN;
   case AST_UNARY_OP:
     if (node->as.unary.op == OP_NOT)
       return CG_VALUE_BOOL;
-    return cg_lambda_body_kind(cg, node->as.unary.operand, param_name,
-                               param_kind);
+    return cg_lambda_stmt_kind(cg, node->as.unary.operand, param_name,
+                               param_kind, locals, local_count);
   case AST_BINARY_OP: {
     if (node->as.binary.op == OP_EQ || node->as.binary.op == OP_NE ||
         node->as.binary.op == OP_LT || node->as.binary.op == OP_GT ||
@@ -556,9 +861,11 @@ static CgValueKind cg_lambda_body_kind(Codegen *cg, AstNode *node,
       return CG_VALUE_BOOL;
 
     CgValueKind left =
-        cg_lambda_body_kind(cg, node->as.binary.left, param_name, param_kind);
+        cg_lambda_stmt_kind(cg, node->as.binary.left, param_name, param_kind,
+                            locals, local_count);
     CgValueKind right =
-        cg_lambda_body_kind(cg, node->as.binary.right, param_name, param_kind);
+        cg_lambda_stmt_kind(cg, node->as.binary.right, param_name, param_kind,
+                            locals, local_count);
 
     if (node->as.binary.op == OP_ADD &&
         (left == CG_VALUE_STRING || right == CG_VALUE_STRING))
@@ -594,8 +901,87 @@ static CgValueKind cg_lambda_body_kind(Codegen *cg, AstNode *node,
       }
     }
     return CG_VALUE_UNKNOWN;
-  case AST_BLOCK:
+  case AST_GIVE:
+    if (!node->as.give_stmt.value)
+      return CG_VALUE_UNKNOWN;
+    return cg_lambda_stmt_kind(cg, node->as.give_stmt.value, param_name,
+                               param_kind, locals, local_count);
+  case AST_VAR_DECL: {
+    int scoped_count = local_count;
+    CgValueKind init_kind = CG_VALUE_UNKNOWN;
+    if (node->as.var_decl.initializer) {
+      init_kind = cg_lambda_stmt_kind(cg, node->as.var_decl.initializer,
+                                      param_name, param_kind, locals,
+                                      scoped_count);
+    }
+    cg_locals_add(locals, &scoped_count, node->as.var_decl.name, init_kind);
     return CG_VALUE_UNKNOWN;
+  }
+  case AST_ASSIGN:
+    return cg_lambda_stmt_kind(cg, node->as.assign.value, param_name, param_kind,
+                               locals, local_count);
+  case AST_BLOCK: {
+    int scoped_count = local_count;
+    CgValueKind result = CG_VALUE_UNKNOWN;
+    for (int i = 0; i < node->as.block.statements.count; i++) {
+      AstNode *stmt = node->as.block.statements.items[i];
+      if (stmt && stmt->type == AST_VAR_DECL) {
+        CgValueKind init_kind = CG_VALUE_UNKNOWN;
+        if (stmt->as.var_decl.initializer) {
+          init_kind = cg_lambda_stmt_kind(
+              cg, stmt->as.var_decl.initializer, param_name, param_kind, locals,
+              scoped_count);
+        }
+        cg_locals_add(locals, &scoped_count, stmt->as.var_decl.name, init_kind);
+        continue;
+      }
+      result = cg_merge_value_kind(
+          result, cg_lambda_stmt_kind(cg, stmt, param_name, param_kind, locals,
+                                      scoped_count));
+    }
+    return result;
+  }
+  case AST_IF: {
+    CgValueKind then_kind = CG_VALUE_UNKNOWN;
+    CgValueKind else_kind = CG_VALUE_UNKNOWN;
+    if (node->as.if_stmt.then_branch)
+      then_kind = cg_lambda_stmt_kind(cg, node->as.if_stmt.then_branch,
+                                      param_name, param_kind, locals,
+                                      local_count);
+    if (node->as.if_stmt.else_branch)
+      else_kind = cg_lambda_stmt_kind(cg, node->as.if_stmt.else_branch,
+                                      param_name, param_kind, locals,
+                                      local_count);
+    return cg_merge_value_kind(then_kind, else_kind);
+  }
+  case AST_WHILE:
+    if (node->as.while_stmt.body)
+      return cg_lambda_stmt_kind(cg, node->as.while_stmt.body, param_name,
+                                 param_kind, locals, local_count);
+    return CG_VALUE_UNKNOWN;
+  case AST_FOR: {
+    CgLocalKind scoped_locals[64];
+    int scoped_count = local_count;
+    memcpy(scoped_locals, locals, sizeof(scoped_locals));
+    if (node->as.for_stmt.init && node->as.for_stmt.init->type == AST_VAR_DECL) {
+      CgValueKind init_kind = CG_VALUE_UNKNOWN;
+      if (node->as.for_stmt.init->as.var_decl.initializer) {
+        init_kind = cg_lambda_stmt_kind(
+            cg, node->as.for_stmt.init->as.var_decl.initializer, param_name,
+            param_kind, scoped_locals, scoped_count);
+      }
+      cg_locals_add(scoped_locals, &scoped_count,
+                    node->as.for_stmt.init->as.var_decl.name, init_kind);
+    }
+    if (node->as.for_stmt.var_name) {
+      cg_locals_add(scoped_locals, &scoped_count, node->as.for_stmt.var_name,
+                    CG_VALUE_UNKNOWN);
+    }
+    if (node->as.for_stmt.body)
+      return cg_lambda_stmt_kind(cg, node->as.for_stmt.body, param_name,
+                                 param_kind, scoped_locals, scoped_count);
+    return CG_VALUE_UNKNOWN;
+  }
   default:
     return CG_VALUE_UNKNOWN;
   }
@@ -671,28 +1057,591 @@ static LLVMValueRef cg_coerce_value(Codegen *cg, LLVMValueRef value,
   if (target_type == cg->i8ptr_type && source_type == cg->i8ptr_type)
     return value;
 
-  cg_error(cg, "Unsupported lambda return coercion");
+  char *src = LLVMPrintTypeToString(source_type);
+  char *dst = LLVMPrintTypeToString(target_type);
+  cg_error(cg, "Unsupported lambda return coercion (%s -> %s)", src, dst);
+  LLVMDisposeMessage(src);
+  LLVMDisposeMessage(dst);
   return value;
 }
 
-static LLVMValueRef cg_emit_stream_callable(Codegen *cg, AstNode *callable,
-                                            CgStreamKind input_kind,
-                                            LLVMTypeRef expected_return_type) {
+static bool cg_lambda_capture_present(CgLambdaCapture *captures, int count,
+                                      const char *name) {
+  for (int i = 0; i < count; i++) {
+    if (strcmp(captures[i].name, name) == 0)
+      return true;
+  }
+  return false;
+}
+
+static const char *cg_lambda_param_name(AstNode *param) {
+  if (!param)
+    return NULL;
+  if (param->type == AST_VAR_DECL)
+    return param->as.var_decl.name;
+  if (param->type == AST_IDENTIFIER)
+    return param->as.identifier.name;
+  return NULL;
+}
+
+static void cg_collect_lambda_captures_impl(Codegen *cg, AstNode *node,
+                                            CgLambdaCapture *captures,
+                                            int *count, bool *unsupported,
+                                            CgLocalKind *locals,
+                                            int *local_count) {
+  if (!cg || !node || !count || !unsupported || *unsupported)
+    return;
+
+  switch (node->type) {
+  case AST_IDENTIFIER: {
+    const char *name = node->as.identifier.name;
+    CgSymbol *sym;
+    if (!name || cg_local_kind_present(locals, *local_count, name))
+      return;
+    sym = cg_lookup(cg, name);
+    if (!sym)
+      return;
+    if (!cg_lambda_capture_present(captures, *count, name)) {
+      captures[*count].name = name;
+      captures[*count].symbol = sym;
+      (*count)++;
+    }
+    return;
+  }
+  case AST_CALL:
+    if (node->as.call.callee &&
+        node->as.call.callee->type != AST_IDENTIFIER) {
+      cg_collect_lambda_captures_impl(cg, node->as.call.callee, captures, count,
+                                      unsupported, locals, local_count);
+    }
+    for (int i = 0; i < node->as.call.args.count; i++) {
+      cg_collect_lambda_captures_impl(cg, node->as.call.args.items[i], captures,
+                                      count, unsupported, locals, local_count);
+    }
+    return;
+  case AST_BINARY_OP:
+    cg_collect_lambda_captures_impl(cg, node->as.binary.left, captures, count,
+                                    unsupported, locals, local_count);
+    cg_collect_lambda_captures_impl(cg, node->as.binary.right, captures, count,
+                                    unsupported, locals, local_count);
+    return;
+  case AST_UNARY_OP:
+    cg_collect_lambda_captures_impl(cg, node->as.unary.operand, captures, count,
+                                    unsupported, locals, local_count);
+    return;
+  case AST_ARRAY_LITERAL:
+    for (int i = 0; i < node->as.array_literal.elements.count; i++) {
+      cg_collect_lambda_captures_impl(
+          cg, node->as.array_literal.elements.items[i], captures, count,
+          unsupported, locals, local_count);
+    }
+    return;
+  case AST_MEMBER:
+    cg_collect_lambda_captures_impl(cg, node->as.member.object, captures, count,
+                                    unsupported, locals, local_count);
+    return;
+  case AST_INDEX:
+    cg_collect_lambda_captures_impl(cg, node->as.index.object, captures, count,
+                                    unsupported, locals, local_count);
+    cg_collect_lambda_captures_impl(cg, node->as.index.index, captures, count,
+                                    unsupported, locals, local_count);
+    return;
+  case AST_VAR_DECL:
+    if (node->as.var_decl.initializer)
+      cg_collect_lambda_captures_impl(cg, node->as.var_decl.initializer,
+                                      captures, count, unsupported, locals,
+                                      local_count);
+    cg_locals_add(locals, local_count, node->as.var_decl.name,
+                  CG_VALUE_UNKNOWN);
+    return;
+  case AST_ASSIGN:
+    cg_collect_lambda_captures_impl(cg, node->as.assign.target, captures, count,
+                                    unsupported, locals, local_count);
+    cg_collect_lambda_captures_impl(cg, node->as.assign.value, captures, count,
+                                    unsupported, locals, local_count);
+    return;
+  case AST_GIVE:
+    if (node->as.give_stmt.value)
+      cg_collect_lambda_captures_impl(cg, node->as.give_stmt.value, captures,
+                                      count, unsupported, locals, local_count);
+    return;
+  case AST_BLOCK: {
+    int scoped_count = *local_count;
+    for (int i = 0; i < node->as.block.statements.count; i++) {
+      cg_collect_lambda_captures_impl(cg, node->as.block.statements.items[i],
+                                      captures, count, unsupported, locals,
+                                      &scoped_count);
+      if (*unsupported)
+        return;
+    }
+    return;
+  }
+  case AST_IF:
+    if (node->as.if_stmt.condition)
+      cg_collect_lambda_captures_impl(cg, node->as.if_stmt.condition, captures,
+                                      count, unsupported, locals, local_count);
+    if (node->as.if_stmt.then_branch) {
+      int branch_locals = *local_count;
+      cg_collect_lambda_captures_impl(cg, node->as.if_stmt.then_branch, captures,
+                                      count, unsupported, locals,
+                                      &branch_locals);
+    }
+    if (node->as.if_stmt.else_branch) {
+      int branch_locals = *local_count;
+      cg_collect_lambda_captures_impl(cg, node->as.if_stmt.else_branch, captures,
+                                      count, unsupported, locals,
+                                      &branch_locals);
+    }
+    return;
+  case AST_WHILE:
+    if (node->as.while_stmt.condition)
+      cg_collect_lambda_captures_impl(cg, node->as.while_stmt.condition,
+                                      captures, count, unsupported, locals,
+                                      local_count);
+    if (node->as.while_stmt.body) {
+      int body_locals = *local_count;
+      cg_collect_lambda_captures_impl(cg, node->as.while_stmt.body, captures,
+                                      count, unsupported, locals, &body_locals);
+    }
+    return;
+  case AST_FOR: {
+    int scoped_count = *local_count;
+    if (node->as.for_stmt.init)
+      cg_collect_lambda_captures_impl(cg, node->as.for_stmt.init, captures,
+                                      count, unsupported, locals, &scoped_count);
+    if (node->as.for_stmt.var_name)
+      cg_locals_add(locals, &scoped_count, node->as.for_stmt.var_name,
+                    CG_VALUE_UNKNOWN);
+    if (node->as.for_stmt.condition)
+      cg_collect_lambda_captures_impl(cg, node->as.for_stmt.condition, captures,
+                                      count, unsupported, locals, &scoped_count);
+    if (node->as.for_stmt.update)
+      cg_collect_lambda_captures_impl(cg, node->as.for_stmt.update, captures,
+                                      count, unsupported, locals, &scoped_count);
+    if (node->as.for_stmt.iterable)
+      cg_collect_lambda_captures_impl(cg, node->as.for_stmt.iterable, captures,
+                                      count, unsupported, locals, &scoped_count);
+    if (node->as.for_stmt.body)
+      cg_collect_lambda_captures_impl(cg, node->as.for_stmt.body, captures,
+                                      count, unsupported, locals, &scoped_count);
+    return;
+  }
+  case AST_LAMBDA:
+    return;
+  default:
+    return;
+  }
+}
+
+static void cg_collect_lambda_captures(Codegen *cg, AstNode *node,
+                                       const char *param_name,
+                                       CgLambdaCapture *captures, int *count,
+                                       bool *unsupported) {
+  CgLocalKind locals[64];
+  int local_count = 0;
+
+  if (param_name)
+    cg_locals_add(locals, &local_count, param_name, CG_VALUE_UNKNOWN);
+
+  cg_collect_lambda_captures_impl(cg, node, captures, count, unsupported,
+                                  locals, &local_count);
+}
+
+static void cg_collect_lambda_captures_for_params(
+    Codegen *cg, AstNode *node, const char **param_names, int param_count,
+    CgLambdaCapture *captures, int *count, bool *unsupported) {
+  CgLocalKind locals[64];
+  int local_count = 0;
+
+  for (int i = 0; i < param_count; i++) {
+    if (param_names && param_names[i])
+      cg_locals_add(locals, &local_count, param_names[i], CG_VALUE_UNKNOWN);
+  }
+
+  cg_collect_lambda_captures_impl(cg, node, captures, count, unsupported,
+                                  locals, &local_count);
+}
+
+static bool cg_expr_is_closure_like(Codegen *cg, AstNode *node) {
+  if (!cg || !node)
+    return false;
+  if (node->type == AST_LAMBDA)
+    return true;
+  if (node->type == AST_IDENTIFIER) {
+    char marker_name[300];
+    snprintf(marker_name, sizeof(marker_name), "__%s__closure",
+             node->as.identifier.name);
+    return cg_lookup(cg, marker_name) != NULL;
+  }
+  return false;
+}
+
+static LLVMTypeRef cg_closure_struct_type(Codegen *cg) {
+  return LLVMStructTypeInContext(
+      cg->ctx, (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2, false);
+}
+
+static LLVMValueRef cg_build_closure_object(Codegen *cg, LLVMValueRef fn,
+                                            LLVMValueRef ctx) {
+  LLVMTypeRef closure_type;
+  LLVMTypeRef closure_ptr_type;
+  LLVMValueRef fn_malloc;
+  LLVMTypeRef malloc_type;
+  LLVMValueRef raw;
+  LLVMValueRef typed;
+  LLVMValueRef fn_field;
+  LLVMValueRef ctx_field;
+
+  if (!cg || !fn)
+    return LLVMConstNull(cg ? cg->i8ptr_type : LLVMInt8Type());
+
+  closure_type = cg_closure_struct_type(cg);
+  closure_ptr_type = LLVMPointerType(closure_type, 0);
+  fn_malloc = LLVMGetNamedFunction(cg->mod, "malloc");
+  if (!fn_malloc) {
+    malloc_type = LLVMFunctionType(cg->i8ptr_type,
+                                   (LLVMTypeRef[]){cg->i64_type}, 1, false);
+    fn_malloc = LLVMAddFunction(cg->mod, "malloc", malloc_type);
+  }
+  malloc_type = LLVMFunctionType(cg->i8ptr_type, (LLVMTypeRef[]){cg->i64_type},
+                                 1, false);
+  raw = LLVMBuildCall2(cg->builder, malloc_type, fn_malloc,
+                       (LLVMValueRef[]){LLVMSizeOf(closure_type)}, 1,
+                       "closure_mem");
+  typed = LLVMBuildBitCast(cg->builder, raw, closure_ptr_type, "closure");
+  fn_field =
+      LLVMBuildStructGEP2(cg->builder, closure_type, typed, 0, "closure_fn");
+  ctx_field =
+      LLVMBuildStructGEP2(cg->builder, closure_type, typed, 1, "closure_ctx");
+  LLVMBuildStore(cg->builder,
+                 LLVMBuildBitCast(cg->builder, fn, cg->i8ptr_type, "closure_fn_cast"),
+                 fn_field);
+  LLVMBuildStore(cg->builder,
+                 ctx ? ctx : LLVMConstNull(cg->i8ptr_type), ctx_field);
+  return raw;
+}
+
+static LLVMValueRef cg_emit_closure_call(Codegen *cg, LLVMValueRef closure,
+                                         LLVMTypeRef *arg_types,
+                                         LLVMValueRef *args, int argc,
+                                         LLVMTypeRef return_type,
+                                         const char *name) {
+  LLVMTypeRef closure_type;
+  LLVMTypeRef closure_ptr_type;
+  LLVMValueRef typed;
+  LLVMValueRef fn_raw;
+  LLVMValueRef ctx;
+  LLVMTypeRef *param_types;
+  LLVMTypeRef fn_type;
+  LLVMValueRef fn_ptr;
+  LLVMValueRef *call_args;
+  LLVMValueRef result;
+
+  if (!cg || !closure)
+    return LLVMConstInt(cg->i64_type, 0, false);
+
+  closure_type = cg_closure_struct_type(cg);
+  closure_ptr_type = LLVMPointerType(closure_type, 0);
+  typed = LLVMBuildBitCast(cg->builder, closure, closure_ptr_type, "closure_t");
+  fn_raw = LLVMBuildLoad2(
+      cg->builder, cg->i8ptr_type,
+      LLVMBuildStructGEP2(cg->builder, closure_type, typed, 0, "closure_fn_ptr"),
+      "closure_fn");
+  ctx = LLVMBuildLoad2(
+      cg->builder, cg->i8ptr_type,
+      LLVMBuildStructGEP2(cg->builder, closure_type, typed, 1, "closure_ctx_ptr"),
+      "closure_ctx");
+
+  param_types = calloc(argc + 1, sizeof(LLVMTypeRef));
+  param_types[0] = cg->i8ptr_type;
+  for (int i = 0; i < argc; i++)
+    param_types[i + 1] = arg_types[i];
+  fn_type = LLVMFunctionType(return_type, param_types, argc + 1, false);
+  free(param_types);
+  fn_ptr = LLVMBuildBitCast(cg->builder, fn_raw, LLVMPointerType(fn_type, 0),
+                            "closure_call_fn");
+  call_args = calloc(argc + 1, sizeof(LLVMValueRef));
+  call_args[0] = ctx;
+  for (int i = 0; i < argc; i++)
+    call_args[i + 1] = args[i];
+  result = LLVMBuildCall2(cg->builder, fn_type, fn_ptr, call_args, argc + 1,
+                          name ? name : "");
+  free(call_args);
+  return result;
+}
+
+static LLVMValueRef cg_emit_general_closure_value(Codegen *cg, AstNode *lambda,
+                                                  LLVMTypeRef *param_types,
+                                                  int param_count,
+                                                  LLVMTypeRef return_type) {
+  CgLambdaCapture captures[16];
+  int capture_count = 0;
+  bool unsupported = false;
+  const char *param_names[8] = {0};
+  static int closure_lambda_id = 0;
+  char lname[64];
+  LLVMValueRef saved_fn;
+  const char *saved_fn_name;
+  LLVMBasicBlockRef saved_bb;
+  LLVMTypeRef *field_types = NULL;
+  LLVMTypeRef ctx_struct = NULL;
+  LLVMTypeRef ctx_ptr_type = NULL;
+  LLVMValueRef raw_ctx = LLVMConstNull(cg->i8ptr_type);
+  LLVMValueRef fn;
+
+  if (!cg || !lambda || lambda->type != AST_LAMBDA)
+    return LLVMConstNull(cg ? cg->i8ptr_type : LLVMInt8Type());
+
+  if (param_count > 8)
+    param_count = 8;
+  for (int i = 0; i < param_count; i++)
+    param_names[i] = cg_lambda_param_name(lambda->as.lambda.params.items[i]);
+
+  cg_collect_lambda_captures_for_params(cg, lambda->as.lambda.body, param_names,
+                                        param_count, captures, &capture_count,
+                                        &unsupported);
+
+  saved_fn = cg->current_fn;
+  saved_fn_name = cg->current_fn_name;
+  saved_bb = LLVMGetInsertBlock(cg->builder);
+
+  if (capture_count > 0) {
+    field_types = calloc(capture_count, sizeof(LLVMTypeRef));
+    for (int i = 0; i < capture_count; i++)
+      field_types[i] = captures[i].symbol->type;
+    ctx_struct =
+        LLVMStructTypeInContext(cg->ctx, field_types, capture_count, false);
+    free(field_types);
+    ctx_ptr_type = LLVMPointerType(ctx_struct, 0);
+
+    LLVMValueRef fn_malloc = LLVMGetNamedFunction(cg->mod, "malloc");
+    if (!fn_malloc) {
+      LLVMTypeRef malloc_type = LLVMFunctionType(
+          cg->i8ptr_type, (LLVMTypeRef[]){cg->i64_type}, 1, false);
+      fn_malloc = LLVMAddFunction(cg->mod, "malloc", malloc_type);
+    }
+    LLVMTypeRef malloc_type = LLVMFunctionType(
+        cg->i8ptr_type, (LLVMTypeRef[]){cg->i64_type}, 1, false);
+    raw_ctx = LLVMBuildCall2(cg->builder, malloc_type, fn_malloc,
+                             (LLVMValueRef[]){LLVMSizeOf(ctx_struct)}, 1,
+                             "lambda_ctx");
+    LLVMValueRef ctx_alloc =
+        LLVMBuildBitCast(cg->builder, raw_ctx, ctx_ptr_type, "lambda_ctx_t");
+    for (int i = 0; i < capture_count; i++) {
+      LLVMValueRef field =
+          LLVMBuildStructGEP2(cg->builder, ctx_struct, ctx_alloc, i, "cap");
+      LLVMValueRef loaded =
+          LLVMBuildLoad2(cg->builder, captures[i].symbol->type,
+                         captures[i].symbol->alloca, captures[i].name);
+      LLVMBuildStore(cg->builder, loaded, field);
+    }
+  }
+
+  snprintf(lname, sizeof(lname), "__closure_lambda_%d", closure_lambda_id++);
+  LLVMTypeRef *fn_params = calloc(param_count + 1, sizeof(LLVMTypeRef));
+  fn_params[0] = cg->i8ptr_type;
+  for (int i = 0; i < param_count; i++)
+    fn_params[i + 1] = param_types[i];
+  LLVMTypeRef fn_type =
+      LLVMFunctionType(return_type, fn_params, param_count + 1, false);
+  free(fn_params);
+  fn = LLVMAddFunction(cg->mod, lname, fn_type);
+  LLVMSetLinkage(fn, LLVMPrivateLinkage);
+
+  LLVMBasicBlockRef entry =
+      LLVMAppendBasicBlockInContext(cg->ctx, fn, "entry");
+  LLVMPositionBuilderAtEnd(cg->builder, entry);
+  cg->current_fn = fn;
+  cg->current_fn_name = lname;
+  cg_push_scope(cg);
+
+  if (capture_count > 0 && ctx_ptr_type) {
+    LLVMValueRef ctx_arg = LLVMBuildBitCast(cg->builder, LLVMGetParam(fn, 0),
+                                            ctx_ptr_type, "ctx");
+    for (int i = 0; i < capture_count; i++) {
+      LLVMValueRef field =
+          LLVMBuildStructGEP2(cg->builder, ctx_struct, ctx_arg, i, "cap");
+      LLVMValueRef loaded = LLVMBuildLoad2(cg->builder, captures[i].symbol->type,
+                                           field, captures[i].name);
+      LLVMValueRef alloca =
+          LLVMBuildAlloca(cg->builder, captures[i].symbol->type,
+                          captures[i].name);
+      LLVMBuildStore(cg->builder, loaded, alloca);
+      cg_define(cg, captures[i].name, alloca, captures[i].symbol->type);
+    }
+  }
+
+  for (int i = 0; i < param_count; i++) {
+    const char *pname = param_names[i] ? param_names[i] : "arg";
+    LLVMValueRef param_alloc =
+        LLVMBuildAlloca(cg->builder, param_types[i], pname);
+    LLVMBuildStore(cg->builder, LLVMGetParam(fn, i + 1), param_alloc);
+    cg_define(cg, pname, param_alloc, param_types[i]);
+  }
+
+  if (lambda->as.lambda.body && lambda->as.lambda.body->type == AST_BLOCK) {
+    emit_block(cg, lambda->as.lambda.body);
+  } else if (lambda->as.lambda.body) {
+    LLVMValueRef result = emit_expr(cg, lambda->as.lambda.body);
+    result = cg_coerce_value(cg, result, return_type);
+    LLVMBuildRet(cg->builder, result);
+  }
+  if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(cg->builder))) {
+    LLVMValueRef fallback =
+        return_type == cg->i8ptr_type ? LLVMConstNull(cg->i8ptr_type)
+                                      : LLVMConstInt(return_type, 0, false);
+    LLVMBuildRet(cg->builder, fallback);
+  }
+
+  cg_pop_scope(cg);
+  cg->current_fn = saved_fn;
+  cg->current_fn_name = saved_fn_name;
+  LLVMPositionBuilderAtEnd(cg->builder, saved_bb);
+
+  return cg_build_closure_object(cg, fn,
+                                 capture_count > 0 ? raw_ctx
+                                                   : LLVMConstNull(cg->i8ptr_type));
+}
+
+static CgStreamCallable cg_emit_stream_callable(Codegen *cg, AstNode *callable,
+                                                CgStreamKind input_kind,
+                                                LLVMTypeRef expected_return_type) {
+  CgStreamCallable result = {0};
   bool saved_active;
   LLVMTypeRef saved_param;
   LLVMTypeRef saved_return;
   LLVMTypeRef param_type;
-  LLVMValueRef fn;
+  const char *param_name = NULL;
 
   if (!cg || !callable)
-    return NULL;
+    return result;
 
-  if (callable->type != AST_LAMBDA)
-    return emit_expr(cg, callable);
+  if (callable->type != AST_LAMBDA) {
+    result.fn = emit_expr(cg, callable);
+    return result;
+  }
 
   if (callable->as.lambda.params.count != 1) {
     cg_error(cg, "Lazy stream lambdas must take exactly one parameter");
-    return LLVMConstNull(cg->i8ptr_type);
+    result.fn = LLVMConstNull(cg->i8ptr_type);
+    return result;
+  }
+
+  AstNode *param = callable->as.lambda.params.items[0];
+  if (param->type == AST_VAR_DECL)
+    param_name = param->as.var_decl.name;
+  else if (param->type == AST_IDENTIFIER)
+    param_name = param->as.identifier.name;
+
+  if (callable->as.lambda.body) {
+    CgLambdaCapture captures[16];
+    int capture_count = 0;
+    bool unsupported = false;
+    cg_collect_lambda_captures(cg, callable->as.lambda.body, param_name, captures,
+                               &capture_count, &unsupported);
+    if (capture_count > 0 && !unsupported) {
+      static int stream_lambda_id = 0;
+      char lname[64];
+      LLVMValueRef saved_fn = cg->current_fn;
+      const char *saved_fn_name = cg->current_fn_name;
+      LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(cg->builder);
+      LLVMTypeRef *field_types = calloc(capture_count, sizeof(LLVMTypeRef));
+      LLVMTypeRef ctx_struct;
+      LLVMTypeRef ctx_ptr_type;
+      LLVMValueRef fn;
+      LLVMValueRef raw_ctx;
+      LLVMValueRef ctx_arg;
+
+      for (int i = 0; i < capture_count; i++)
+        field_types[i] = captures[i].symbol->type;
+      ctx_struct = LLVMStructTypeInContext(cg->ctx, field_types, capture_count,
+                                           false);
+      free(field_types);
+      ctx_ptr_type = LLVMPointerType(ctx_struct, 0);
+
+      snprintf(lname, sizeof(lname), "__stream_lambda_%d", stream_lambda_id++);
+      param_type = input_kind == CG_STREAM_STRING ? cg->i8ptr_type : cg->i64_type;
+      LLVMTypeRef fn_type =
+          LLVMFunctionType(expected_return_type,
+                           (LLVMTypeRef[]){cg->i8ptr_type, param_type}, 2, false);
+      fn = LLVMAddFunction(cg->mod, lname, fn_type);
+      LLVMSetLinkage(fn, LLVMPrivateLinkage);
+
+      LLVMValueRef fn_malloc = LLVMGetNamedFunction(cg->mod, "malloc");
+      if (!fn_malloc) {
+        LLVMTypeRef malloc_type = LLVMFunctionType(
+            cg->i8ptr_type, (LLVMTypeRef[]){cg->i64_type}, 1, false);
+        fn_malloc = LLVMAddFunction(cg->mod, "malloc", malloc_type);
+      }
+      LLVMTypeRef malloc_type = LLVMFunctionType(
+          cg->i8ptr_type, (LLVMTypeRef[]){cg->i64_type}, 1, false);
+      raw_ctx = LLVMBuildCall2(cg->builder, malloc_type, fn_malloc,
+                               (LLVMValueRef[]){LLVMSizeOf(ctx_struct)}, 1,
+                               "lambda_ctx");
+      LLVMValueRef ctx_alloc =
+          LLVMBuildBitCast(cg->builder, raw_ctx, ctx_ptr_type, "lambda_ctx_t");
+      for (int i = 0; i < capture_count; i++) {
+        LLVMValueRef field =
+            LLVMBuildStructGEP2(cg->builder, ctx_struct, ctx_alloc, i, "cap");
+        LLVMValueRef loaded =
+            LLVMBuildLoad2(cg->builder, captures[i].symbol->type,
+                           captures[i].symbol->alloca, captures[i].name);
+        LLVMBuildStore(cg->builder, loaded, field);
+      }
+
+      LLVMBasicBlockRef entry =
+          LLVMAppendBasicBlockInContext(cg->ctx, fn, "entry");
+      LLVMPositionBuilderAtEnd(cg->builder, entry);
+      cg->current_fn = fn;
+      cg->current_fn_name = lname;
+      cg_push_scope(cg);
+
+      ctx_arg = LLVMBuildBitCast(cg->builder, LLVMGetParam(fn, 0), ctx_ptr_type,
+                                 "ctx");
+      for (int i = 0; i < capture_count; i++) {
+        LLVMValueRef field =
+            LLVMBuildStructGEP2(cg->builder, ctx_struct, ctx_arg, i, "cap");
+        LLVMValueRef loaded = LLVMBuildLoad2(cg->builder, captures[i].symbol->type,
+                                             field, captures[i].name);
+        LLVMValueRef alloca =
+            LLVMBuildAlloca(cg->builder, captures[i].symbol->type,
+                            captures[i].name);
+        LLVMBuildStore(cg->builder, loaded, alloca);
+        cg_define(cg, captures[i].name, alloca, captures[i].symbol->type);
+      }
+
+      const char *pname =
+          (param->type == AST_VAR_DECL)
+              ? param->as.var_decl.name
+              : (param->type == AST_IDENTIFIER ? param->as.identifier.name : "arg");
+      LLVMValueRef param_alloc = LLVMBuildAlloca(cg->builder, param_type, pname);
+      LLVMBuildStore(cg->builder, LLVMGetParam(fn, 1), param_alloc);
+      cg_define(cg, pname, param_alloc, param_type);
+
+      if (callable->as.lambda.body->type == AST_BLOCK) {
+        emit_block(cg, callable->as.lambda.body);
+      } else {
+        LLVMValueRef body_result = emit_expr(cg, callable->as.lambda.body);
+        body_result = cg_coerce_value(cg, body_result, expected_return_type);
+        LLVMBuildRet(cg->builder, body_result);
+      }
+      if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(cg->builder))) {
+        LLVMValueRef fallback =
+            expected_return_type == cg->i8ptr_type
+                ? LLVMConstNull(cg->i8ptr_type)
+                : LLVMConstInt(expected_return_type, 0, false);
+        LLVMBuildRet(cg->builder, fallback);
+      }
+      cg_pop_scope(cg);
+      cg->current_fn = saved_fn;
+      cg->current_fn_name = saved_fn_name;
+      LLVMPositionBuilderAtEnd(cg->builder, saved_bb);
+
+      result.fn = fn;
+      result.ctx = raw_ctx;
+      result.uses_ctx = true;
+      return result;
+    }
   }
 
   param_type = input_kind == CG_STREAM_STRING ? cg->i8ptr_type : cg->i64_type;
@@ -703,15 +1652,214 @@ static LLVMValueRef cg_emit_stream_callable(Codegen *cg, AstNode *callable,
   cg->lambda_hint_active = true;
   cg->lambda_hint_param_type = param_type;
   cg->lambda_hint_return_type = expected_return_type;
-  fn = emit_expr(cg, callable);
+  result.fn = emit_expr(cg, callable);
   cg->lambda_hint_active = saved_active;
   cg->lambda_hint_param_type = saved_param;
   cg->lambda_hint_return_type = saved_return;
-  return fn;
+  return result;
+}
+
+static CgStreamCallable cg_emit_stream_reduce_callable(Codegen *cg,
+                                                       AstNode *callable,
+                                                       CgStreamKind input_kind) {
+  CgStreamCallable result = {0};
+  const char *param_names[2] = {NULL, NULL};
+  LLVMTypeRef elem_type;
+
+  if (!cg || !callable)
+    return result;
+
+  if (callable->type != AST_LAMBDA) {
+    result.fn = emit_expr(cg, callable);
+    return result;
+  }
+
+  if (callable->as.lambda.params.count != 2) {
+    cg_error(cg, "Lazy stream reduce lambdas must take exactly two parameters");
+    result.fn = LLVMConstNull(cg->i8ptr_type);
+    return result;
+  }
+
+  for (int i = 0; i < 2; i++)
+    param_names[i] = cg_lambda_param_name(callable->as.lambda.params.items[i]);
+  elem_type = input_kind == CG_STREAM_STRING ? cg->i8ptr_type : cg->i64_type;
+
+  if (callable->as.lambda.body) {
+    CgLambdaCapture captures[16];
+    int capture_count = 0;
+    bool unsupported = false;
+    cg_collect_lambda_captures_for_params(cg, callable->as.lambda.body,
+                                          param_names, 2, captures,
+                                          &capture_count, &unsupported);
+    if (capture_count > 0 && !unsupported) {
+      static int stream_reduce_lambda_id = 0;
+      char lname[64];
+      LLVMValueRef saved_fn = cg->current_fn;
+      const char *saved_fn_name = cg->current_fn_name;
+      LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(cg->builder);
+      LLVMTypeRef *field_types = calloc(capture_count, sizeof(LLVMTypeRef));
+      LLVMTypeRef ctx_struct;
+      LLVMTypeRef ctx_ptr_type;
+      LLVMValueRef fn;
+      LLVMValueRef raw_ctx;
+      LLVMValueRef ctx_arg;
+
+      for (int i = 0; i < capture_count; i++)
+        field_types[i] = captures[i].symbol->type;
+      ctx_struct = LLVMStructTypeInContext(cg->ctx, field_types, capture_count,
+                                           false);
+      free(field_types);
+      ctx_ptr_type = LLVMPointerType(ctx_struct, 0);
+
+      snprintf(lname, sizeof(lname), "__stream_reduce_lambda_%d",
+               stream_reduce_lambda_id++);
+      LLVMTypeRef fn_type = LLVMFunctionType(
+          cg->i64_type,
+          (LLVMTypeRef[]){cg->i8ptr_type, cg->i64_type, elem_type}, 3,
+          false);
+      fn = LLVMAddFunction(cg->mod, lname, fn_type);
+      LLVMSetLinkage(fn, LLVMPrivateLinkage);
+
+      LLVMValueRef fn_malloc = LLVMGetNamedFunction(cg->mod, "malloc");
+      if (!fn_malloc) {
+        LLVMTypeRef malloc_type = LLVMFunctionType(
+            cg->i8ptr_type, (LLVMTypeRef[]){cg->i64_type}, 1, false);
+        fn_malloc = LLVMAddFunction(cg->mod, "malloc", malloc_type);
+      }
+      LLVMTypeRef malloc_type = LLVMFunctionType(
+          cg->i8ptr_type, (LLVMTypeRef[]){cg->i64_type}, 1, false);
+      raw_ctx = LLVMBuildCall2(cg->builder, malloc_type, fn_malloc,
+                               (LLVMValueRef[]){LLVMSizeOf(ctx_struct)}, 1,
+                               "lambda_ctx");
+      LLVMValueRef ctx_alloc =
+          LLVMBuildBitCast(cg->builder, raw_ctx, ctx_ptr_type, "lambda_ctx_t");
+      for (int i = 0; i < capture_count; i++) {
+        LLVMValueRef field =
+            LLVMBuildStructGEP2(cg->builder, ctx_struct, ctx_alloc, i, "cap");
+        LLVMValueRef loaded =
+            LLVMBuildLoad2(cg->builder, captures[i].symbol->type,
+                           captures[i].symbol->alloca, captures[i].name);
+        LLVMBuildStore(cg->builder, loaded, field);
+      }
+
+      LLVMBasicBlockRef entry =
+          LLVMAppendBasicBlockInContext(cg->ctx, fn, "entry");
+      LLVMPositionBuilderAtEnd(cg->builder, entry);
+      cg->current_fn = fn;
+      cg->current_fn_name = lname;
+      cg_push_scope(cg);
+
+      ctx_arg = LLVMBuildBitCast(cg->builder, LLVMGetParam(fn, 0), ctx_ptr_type,
+                                 "ctx");
+      for (int i = 0; i < capture_count; i++) {
+        LLVMValueRef field =
+            LLVMBuildStructGEP2(cg->builder, ctx_struct, ctx_arg, i, "cap");
+        LLVMValueRef loaded = LLVMBuildLoad2(cg->builder, captures[i].symbol->type,
+                                             field, captures[i].name);
+        LLVMValueRef alloca =
+            LLVMBuildAlloca(cg->builder, captures[i].symbol->type,
+                            captures[i].name);
+        LLVMBuildStore(cg->builder, loaded, alloca);
+        cg_define(cg, captures[i].name, alloca, captures[i].symbol->type);
+      }
+
+      for (int i = 0; i < 2; i++) {
+        const char *pname = param_names[i] ? param_names[i] : "arg";
+        LLVMTypeRef param_type = i == 0 ? cg->i64_type : elem_type;
+        LLVMValueRef param_alloc =
+            LLVMBuildAlloca(cg->builder, param_type, pname);
+        LLVMBuildStore(cg->builder, LLVMGetParam(fn, i + 1), param_alloc);
+        cg_define(cg, pname, param_alloc, param_type);
+      }
+
+      if (callable->as.lambda.body->type == AST_BLOCK) {
+        emit_block(cg, callable->as.lambda.body);
+      } else {
+        LLVMValueRef body_result = emit_expr(cg, callable->as.lambda.body);
+        body_result = cg_coerce_value(cg, body_result, cg->i64_type);
+        LLVMBuildRet(cg->builder, body_result);
+      }
+      if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(cg->builder))) {
+        LLVMBuildRet(cg->builder, LLVMConstInt(cg->i64_type, 0, false));
+      }
+      cg_pop_scope(cg);
+      cg->current_fn = saved_fn;
+      cg->current_fn_name = saved_fn_name;
+      LLVMPositionBuilderAtEnd(cg->builder, saved_bb);
+
+      result.fn = fn;
+      result.ctx = raw_ctx;
+      result.uses_ctx = true;
+      return result;
+    }
+  }
+
+  {
+    static int stream_reduce_lambda_id = 0;
+    char lname[64];
+    LLVMValueRef saved_fn = cg->current_fn;
+    const char *saved_fn_name = cg->current_fn_name;
+    LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(cg->builder);
+    LLVMValueRef fn;
+
+    snprintf(lname, sizeof(lname), "__stream_reduce_lambda_%d",
+             stream_reduce_lambda_id++);
+    LLVMTypeRef fn_type = LLVMFunctionType(
+        cg->i64_type, (LLVMTypeRef[]){cg->i8ptr_type, cg->i64_type, elem_type},
+        3, false);
+    fn = LLVMAddFunction(cg->mod, lname, fn_type);
+    LLVMSetLinkage(fn, LLVMPrivateLinkage);
+
+    LLVMBasicBlockRef entry =
+        LLVMAppendBasicBlockInContext(cg->ctx, fn, "entry");
+    LLVMPositionBuilderAtEnd(cg->builder, entry);
+    cg->current_fn = fn;
+    cg->current_fn_name = lname;
+    cg_push_scope(cg);
+
+    for (int i = 0; i < 2; i++) {
+      const char *pname = param_names[i] ? param_names[i] : "arg";
+      LLVMTypeRef param_type = i == 0 ? cg->i64_type : elem_type;
+      LLVMValueRef param_alloc =
+          LLVMBuildAlloca(cg->builder, param_type, pname);
+      LLVMBuildStore(cg->builder, LLVMGetParam(fn, i + 1), param_alloc);
+      cg_define(cg, pname, param_alloc, param_type);
+    }
+
+    if (callable->as.lambda.body->type == AST_BLOCK) {
+      emit_block(cg, callable->as.lambda.body);
+    } else {
+      LLVMValueRef body_result = emit_expr(cg, callable->as.lambda.body);
+      body_result = cg_coerce_value(cg, body_result, cg->i64_type);
+      LLVMBuildRet(cg->builder, body_result);
+    }
+    if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(cg->builder))) {
+      LLVMBuildRet(cg->builder, LLVMConstInt(cg->i64_type, 0, false));
+    }
+    cg_pop_scope(cg);
+    cg->current_fn = saved_fn;
+    cg->current_fn_name = saved_fn_name;
+    LLVMPositionBuilderAtEnd(cg->builder, saved_bb);
+
+    result.fn = fn;
+    result.ctx = LLVMConstNull(cg->i8ptr_type);
+    result.uses_ctx = true;
+    return result;
+  }
 }
 
 static const char *cg_stream_map_runtime_name(CgStreamKind source_kind,
-                                              CgStreamKind target_kind) {
+                                              CgStreamKind target_kind,
+                                              bool use_ctx) {
+  if (use_ctx) {
+    if (source_kind == CG_STREAM_INT && target_kind == CG_STREAM_STRING)
+      return "__qisc_stream_map_i64_to_strings_ctx";
+    if (source_kind == CG_STREAM_STRING && target_kind == CG_STREAM_INT)
+      return "__qisc_stream_map_strings_to_i64_ctx";
+    if (source_kind == CG_STREAM_STRING)
+      return "__qisc_stream_map_strings_ctx";
+    return "__qisc_stream_map_i64_ctx";
+  }
   if (source_kind == CG_STREAM_INT && target_kind == CG_STREAM_STRING)
     return "__qisc_stream_map_i64_to_strings";
   if (source_kind == CG_STREAM_STRING && target_kind == CG_STREAM_INT)
@@ -721,9 +1869,22 @@ static const char *cg_stream_map_runtime_name(CgStreamKind source_kind,
   return "__qisc_stream_map_i64";
 }
 
-static const char *cg_stream_filter_runtime_name(CgStreamKind kind) {
+static const char *cg_stream_filter_runtime_name(CgStreamKind kind,
+                                                 bool use_ctx) {
+  if (use_ctx)
+    return kind == CG_STREAM_STRING ? "__qisc_stream_filter_strings_ctx"
+                                    : "__qisc_stream_filter_i64_ctx";
   return kind == CG_STREAM_STRING ? "__qisc_stream_filter_strings"
                                   : "__qisc_stream_filter_i64";
+}
+
+static const char *cg_stream_reduce_runtime_name(CgStreamKind input_kind,
+                                                 bool use_ctx) {
+  if (input_kind == CG_STREAM_STRING) {
+    return use_ctx ? "__qisc_stream_reduce_strings_to_i64_ctx"
+                   : "__qisc_stream_reduce_strings_to_i64";
+  }
+  return use_ctx ? "__qisc_stream_reduce_i64_ctx" : "__qisc_stream_reduce_i64";
 }
 
 static LLVMValueRef cg_emit_strlen(Codegen *cg, LLVMValueRef val) {
@@ -1294,6 +2455,7 @@ static LLVMValueRef emit_binary(Codegen *cg, AstNode *node) {
           rhs->as.call.args.count >= 1) {
         CgStreamKind source_kind = cg_expr_stream_kind(cg, node->as.binary.left);
         CgStreamKind target_kind = source_kind;
+        CgStreamCallable mapper;
         if (rhs->as.call.args.count >= 1) {
           CgStreamKind inferred =
               cg_stream_kind_from_callable(cg, rhs->as.call.args.items[0],
@@ -1303,43 +2465,70 @@ static LLVMValueRef emit_binary(Codegen *cg, AstNode *node) {
         }
         LLVMTypeRef target_type =
             target_kind == CG_STREAM_STRING ? cg->i8ptr_type : cg->i64_type;
-        LLVMValueRef mapper = cg_emit_stream_callable(
+        mapper = cg_emit_stream_callable(
             cg, rhs->as.call.args.items[0], source_kind, target_type);
         const char *rt_name =
-            cg_stream_map_runtime_name(source_kind, target_kind);
+            cg_stream_map_runtime_name(source_kind, target_kind,
+                                       mapper.uses_ctx);
         LLVMValueRef fn_stream = LLVMGetNamedFunction(cg->mod, rt_name);
         if (!fn_stream) {
           LLVMTypeRef fn_type = LLVMFunctionType(
-              cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2,
-              false);
+              cg->i8ptr_type,
+              mapper.uses_ctx
+                  ? (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type,
+                                    cg->i8ptr_type}
+                  : (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type},
+              mapper.uses_ctx ? 3 : 2, false);
           fn_stream = LLVMAddFunction(cg->mod, rt_name, fn_type);
+        }
+        if (mapper.uses_ctx) {
+          LLVMTypeRef fn_type = LLVMFunctionType(
+              cg->i8ptr_type,
+              (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type, cg->i8ptr_type},
+              3, false);
+          return LLVMBuildCall2(cg->builder, fn_type, fn_stream,
+                                (LLVMValueRef[]){left_val, mapper.fn, mapper.ctx},
+                                3, "stream_map");
         }
         LLVMTypeRef fn_type = LLVMFunctionType(
             cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2,
             false);
         return LLVMBuildCall2(cg->builder, fn_type, fn_stream,
-                              (LLVMValueRef[]){left_val, mapper}, 2,
+                              (LLVMValueRef[]){left_val, mapper.fn}, 2,
                               "stream_map");
       }
 
       if (fname && strcmp(fname, "stream_filter") == 0 &&
           rhs->as.call.args.count >= 1) {
         CgStreamKind kind = cg_expr_stream_kind(cg, node->as.binary.left);
-        LLVMValueRef pred = cg_emit_stream_callable(
+        CgStreamCallable pred = cg_emit_stream_callable(
             cg, rhs->as.call.args.items[0], kind, cg->i1_type);
-        const char *rt_name = cg_stream_filter_runtime_name(kind);
+        const char *rt_name = cg_stream_filter_runtime_name(kind, pred.uses_ctx);
         LLVMValueRef fn_stream = LLVMGetNamedFunction(cg->mod, rt_name);
         if (!fn_stream) {
           LLVMTypeRef fn_type = LLVMFunctionType(
-              cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2,
-              false);
+              cg->i8ptr_type,
+              pred.uses_ctx
+                  ? (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type,
+                                    cg->i8ptr_type}
+                  : (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type},
+              pred.uses_ctx ? 3 : 2, false);
           fn_stream = LLVMAddFunction(cg->mod, rt_name, fn_type);
+        }
+        if (pred.uses_ctx) {
+          LLVMTypeRef fn_type = LLVMFunctionType(
+              cg->i8ptr_type,
+              (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type, cg->i8ptr_type},
+              3, false);
+          return LLVMBuildCall2(cg->builder, fn_type, fn_stream,
+                                (LLVMValueRef[]){left_val, pred.fn, pred.ctx}, 3,
+                                "stream_filter");
         }
         LLVMTypeRef fn_type = LLVMFunctionType(
             cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2,
             false);
         return LLVMBuildCall2(cg->builder, fn_type, fn_stream,
-                              (LLVMValueRef[]){left_val, pred}, 2,
+                              (LLVMValueRef[]){left_val, pred.fn}, 2,
                               "stream_filter");
       }
 
@@ -1404,6 +2593,59 @@ static LLVMValueRef emit_binary(Codegen *cg, AstNode *node) {
                               (LLVMValueRef[]){left_val}, 1, "stream_collect");
       }
 
+      if (fname && strcmp(fname, "stream_reduce") == 0 &&
+          rhs->as.call.args.count >= 2) {
+        AstNode *fn_arg = rhs->as.call.args.items[0];
+        AstNode *init_arg = rhs->as.call.args.items[1];
+        if (!cg_ast_is_probably_callable(cg, fn_arg) &&
+            cg_ast_is_probably_callable(cg, init_arg)) {
+          fn_arg = rhs->as.call.args.items[1];
+          init_arg = rhs->as.call.args.items[0];
+        }
+        CgStreamKind kind = cg_expr_stream_kind(cg, node->as.binary.left);
+        if (kind != CG_STREAM_INT && kind != CG_STREAM_STRING) {
+          cg_error(cg,
+                   "stream_reduce currently supports int and string streams only");
+          return LLVMConstInt(cg->i64_type, 0, false);
+        }
+        CgStreamCallable reducer =
+            cg_emit_stream_reduce_callable(cg, fn_arg, kind);
+        LLVMValueRef initial = emit_expr(cg, init_arg);
+        initial = cg_coerce_value(cg, initial, cg->i64_type);
+        const char *rt_name =
+            cg_stream_reduce_runtime_name(kind, reducer.uses_ctx);
+        LLVMValueRef fn_stream = LLVMGetNamedFunction(cg->mod, rt_name);
+        if (!fn_stream) {
+          LLVMTypeRef fn_type = LLVMFunctionType(
+              cg->i64_type,
+              reducer.uses_ctx
+                  ? (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type,
+                                    cg->i8ptr_type, cg->i64_type}
+                  : (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type,
+                                    cg->i64_type},
+              reducer.uses_ctx ? 4 : 3, false);
+          fn_stream = LLVMAddFunction(cg->mod, rt_name, fn_type);
+        }
+        if (reducer.uses_ctx) {
+          LLVMTypeRef fn_type = LLVMFunctionType(
+              cg->i64_type,
+              (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type, cg->i8ptr_type,
+                              cg->i64_type},
+              4, false);
+          return LLVMBuildCall2(
+              cg->builder, fn_type, fn_stream,
+              (LLVMValueRef[]){left_val, reducer.fn, reducer.ctx, initial}, 4,
+              "stream_reduce");
+        }
+        LLVMTypeRef fn_type = LLVMFunctionType(
+            cg->i64_type,
+            (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type, cg->i64_type}, 3,
+            false);
+        return LLVMBuildCall2(cg->builder, fn_type, fn_stream,
+                              (LLVMValueRef[]){left_val, reducer.fn, initial},
+                              3, "stream_reduce");
+      }
+
       /* Check if this is a builtin that takes array as first arg */
       if (fname && (strcmp(fname, "filter") == 0 || strcmp(fname, "map") == 0 || 
                     strcmp(fname, "reduce") == 0 || strcmp(fname, "collect") == 0)) {
@@ -1412,7 +2654,20 @@ static LLVMValueRef emit_binary(Codegen *cg, AstNode *node) {
         
         if (strcmp(fname, "filter") == 0 && rhs->as.call.args.count >= 1) {
           /* filter(predicate) with left_val as array */
-          LLVMValueRef pred_fn = emit_expr(cg, rhs->as.call.args.items[0]);
+          AstNode *pred_node = rhs->as.call.args.items[0];
+          bool pred_is_closure = cg_expr_is_closure_like(cg, pred_node);
+          LLVMValueRef pred_fn = LLVMConstNull(cg->i8ptr_type);
+          if (pred_is_closure) {
+            if (pred_node->type == AST_LAMBDA) {
+              LLVMTypeRef param_types[1] = {cg->i64_type};
+              pred_fn = cg_emit_general_closure_value(cg, pred_node, param_types,
+                                                      1, cg->i64_type);
+            } else {
+              pred_fn = emit_expr(cg, pred_node);
+            }
+          } else {
+            pred_fn = emit_expr(cg, pred_node);
+          }
           
           /* Get array length */
           LLVMValueRef fn_array_len = LLVMGetNamedFunction(cg->mod, "__qisc_array_len");
@@ -1459,10 +2714,18 @@ static LLVMValueRef emit_binary(Codegen *cg, AstNode *node) {
           LLVMValueRef elem = LLVMBuildLoad2(cg->builder, cg->i64_type, elem_ptr, "elem");
           
           /* Call predicate(elem) */
-          LLVMTypeRef pred_fn_type = LLVMFunctionType(cg->i64_type,
-              (LLVMTypeRef[]){cg->i64_type}, 1, false);
-          LLVMValueRef pred_result = LLVMBuildCall2(cg->builder, pred_fn_type, pred_fn,
-              (LLVMValueRef[]){elem}, 1, "pred_result");
+          LLVMValueRef pred_result;
+          if (pred_is_closure) {
+            LLVMTypeRef arg_types[1] = {cg->i64_type};
+            LLVMValueRef arg_values[1] = {elem};
+            pred_result = cg_emit_closure_call(cg, pred_fn, arg_types, arg_values,
+                                               1, cg->i64_type, "pred_result");
+          } else {
+            LLVMTypeRef pred_fn_type = LLVMFunctionType(cg->i64_type,
+                (LLVMTypeRef[]){cg->i64_type}, 1, false);
+            pred_result = LLVMBuildCall2(cg->builder, pred_fn_type, pred_fn,
+                (LLVMValueRef[]){elem}, 1, "pred_result");
+          }
           
           LLVMValueRef is_truthy = LLVMBuildICmp(cg->builder, LLVMIntNE, pred_result,
               LLVMConstInt(cg->i64_type, 0, false), "is_truthy");
@@ -1493,7 +2756,20 @@ static LLVMValueRef emit_binary(Codegen *cg, AstNode *node) {
         
         if (strcmp(fname, "map") == 0 && rhs->as.call.args.count >= 1) {
           /* map(fn) with left_val as array */
-          LLVMValueRef map_fn = emit_expr(cg, rhs->as.call.args.items[0]);
+          AstNode *map_node = rhs->as.call.args.items[0];
+          bool map_is_closure = cg_expr_is_closure_like(cg, map_node);
+          LLVMValueRef map_fn = LLVMConstNull(cg->i8ptr_type);
+          if (map_is_closure) {
+            if (map_node->type == AST_LAMBDA) {
+              LLVMTypeRef param_types[1] = {cg->i64_type};
+              map_fn = cg_emit_general_closure_value(cg, map_node, param_types, 1,
+                                                     cg->i64_type);
+            } else {
+              map_fn = emit_expr(cg, map_node);
+            }
+          } else {
+            map_fn = emit_expr(cg, map_node);
+          }
           
           LLVMValueRef fn_array_len = LLVMGetNamedFunction(cg->mod, "__qisc_array_len");
           LLVMTypeRef arr_len_type = LLVMFunctionType(cg->i64_type,
@@ -1533,10 +2809,18 @@ static LLVMValueRef emit_binary(Codegen *cg, AstNode *node) {
               (LLVMValueRef[]){left_val, idx}, 2, "elem_ptr");
           LLVMValueRef elem = LLVMBuildLoad2(cg->builder, cg->i64_type, elem_ptr, "elem");
           
-          LLVMTypeRef map_fn_type = LLVMFunctionType(cg->i64_type,
-              (LLVMTypeRef[]){cg->i64_type}, 1, false);
-          LLVMValueRef mapped = LLVMBuildCall2(cg->builder, map_fn_type, map_fn,
-              (LLVMValueRef[]){elem}, 1, "mapped");
+          LLVMValueRef mapped;
+          if (map_is_closure) {
+            LLVMTypeRef arg_types[1] = {cg->i64_type};
+            LLVMValueRef arg_values[1] = {elem};
+            mapped = cg_emit_closure_call(cg, map_fn, arg_types, arg_values, 1,
+                                          cg->i64_type, "mapped");
+          } else {
+            LLVMTypeRef map_fn_type = LLVMFunctionType(cg->i64_type,
+                (LLVMTypeRef[]){cg->i64_type}, 1, false);
+            mapped = LLVMBuildCall2(cg->builder, map_fn_type, map_fn,
+                (LLVMValueRef[]){elem}, 1, "mapped");
+          }
           
           LLVMValueRef val_alloca = LLVMBuildAlloca(cg->builder, cg->i64_type, "map_val");
           LLVMBuildStore(cg->builder, mapped, val_alloca);
@@ -1564,7 +2848,21 @@ static LLVMValueRef emit_binary(Codegen *cg, AstNode *node) {
         
         if (strcmp(fname, "reduce") == 0 && rhs->as.call.args.count >= 2) {
           /* reduce(fn, initial) with left_val as array */
-          LLVMValueRef reduce_fn = emit_expr(cg, rhs->as.call.args.items[0]);
+          AstNode *reduce_node = rhs->as.call.args.items[0];
+          bool reduce_is_closure = cg_expr_is_closure_like(cg, reduce_node);
+          LLVMValueRef reduce_fn = LLVMConstNull(cg->i8ptr_type);
+          if (reduce_is_closure) {
+            if (reduce_node->type == AST_LAMBDA) {
+              LLVMTypeRef param_types[2] = {cg->i64_type, cg->i64_type};
+              reduce_fn = cg_emit_general_closure_value(cg, reduce_node,
+                                                        param_types, 2,
+                                                        cg->i64_type);
+            } else {
+              reduce_fn = emit_expr(cg, reduce_node);
+            }
+          } else {
+            reduce_fn = emit_expr(cg, reduce_node);
+          }
           LLVMValueRef initial = emit_expr(cg, rhs->as.call.args.items[1]);
           
           LLVMValueRef fn_array_len = LLVMGetNamedFunction(cg->mod, "__qisc_array_len");
@@ -1600,10 +2898,18 @@ static LLVMValueRef emit_binary(Codegen *cg, AstNode *node) {
           
           LLVMValueRef acc = LLVMBuildLoad2(cg->builder, cg->i64_type, acc_alloca, "acc");
           
-          LLVMTypeRef reduce_fn_type = LLVMFunctionType(cg->i64_type,
-              (LLVMTypeRef[]){cg->i64_type, cg->i64_type}, 2, false);
-          LLVMValueRef new_acc = LLVMBuildCall2(cg->builder, reduce_fn_type, reduce_fn,
-              (LLVMValueRef[]){acc, elem}, 2, "new_acc");
+          LLVMValueRef new_acc;
+          if (reduce_is_closure) {
+            LLVMTypeRef arg_types[2] = {cg->i64_type, cg->i64_type};
+            LLVMValueRef arg_values[2] = {acc, elem};
+            new_acc = cg_emit_closure_call(cg, reduce_fn, arg_types, arg_values, 2,
+                                           cg->i64_type, "new_acc");
+          } else {
+            LLVMTypeRef reduce_fn_type = LLVMFunctionType(cg->i64_type,
+                (LLVMTypeRef[]){cg->i64_type, cg->i64_type}, 2, false);
+            new_acc = LLVMBuildCall2(cg->builder, reduce_fn_type, reduce_fn,
+                (LLVMValueRef[]){acc, elem}, 2, "new_acc");
+          }
           
           LLVMBuildStore(cg->builder, new_acc, acc_alloca);
           
@@ -1639,6 +2945,19 @@ static LLVMValueRef emit_binary(Codegen *cg, AstNode *node) {
       if (fname) {
         CgSymbol *sym = cg_lookup(cg, fname);
         if (sym) {
+          bool is_closure = false;
+          char marker_name[300];
+          snprintf(marker_name, sizeof(marker_name), "__%s__closure", fname);
+          is_closure = cg_lookup(cg, marker_name) != NULL;
+          if (sym->is_callable) {
+            LLVMValueRef callable =
+                LLVMBuildLoad2(cg->builder, sym->type, sym->alloca,
+                               is_closure ? "pipe_closure" : "pipe_fn");
+            LLVMValueRef result = cg_emit_symbol_callable_call(
+                cg, sym, callable, args, new_argc, is_closure, "pipe");
+            free(args);
+            return result;
+          }
           LLVMValueRef fn_ptr =
               LLVMBuildLoad2(cg->builder, sym->type, sym->alloca, "pipe_fn");
           LLVMTypeRef *ptypes = calloc(new_argc, sizeof(LLVMTypeRef));
@@ -2128,36 +3447,102 @@ static LLVMValueRef emit_call(Codegen *cg, AstNode *node) {
       CgStreamKind kind = cg_expr_stream_kind(cg, node->as.call.args.items[0]);
       CgStreamKind target_kind = kind;
       const char *rt_name;
-      LLVMValueRef fn_arg;
+      CgStreamCallable callable;
       if (strcmp(fname, "stream_map") == 0) {
         CgStreamKind inferred =
             cg_stream_kind_from_callable(cg, node->as.call.args.items[1],
                                          kind);
         if (inferred != CG_STREAM_NONE)
           target_kind = inferred;
-        fn_arg = cg_emit_stream_callable(
+        callable = cg_emit_stream_callable(
             cg, node->as.call.args.items[1], kind,
             target_kind == CG_STREAM_STRING ? cg->i8ptr_type : cg->i64_type);
-        rt_name = cg_stream_map_runtime_name(kind, target_kind);
+        rt_name =
+            cg_stream_map_runtime_name(kind, target_kind, callable.uses_ctx);
       } else {
-        fn_arg = cg_emit_stream_callable(cg, node->as.call.args.items[1], kind,
-                                         cg->i1_type);
-        rt_name = cg_stream_filter_runtime_name(kind);
+        callable = cg_emit_stream_callable(cg, node->as.call.args.items[1], kind,
+                                           cg->i1_type);
+        rt_name = cg_stream_filter_runtime_name(kind, callable.uses_ctx);
       }
       LLVMValueRef fn_stream = LLVMGetNamedFunction(cg->mod, rt_name);
       if (!fn_stream) {
         LLVMTypeRef fn_type = LLVMFunctionType(
-            cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2,
-            false);
+            cg->i8ptr_type,
+            callable.uses_ctx
+                ? (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type,
+                                  cg->i8ptr_type}
+                : (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type},
+            callable.uses_ctx ? 3 : 2, false);
         fn_stream = LLVMAddFunction(cg->mod, rt_name, fn_type);
+      }
+      if (callable.uses_ctx) {
+        LLVMTypeRef fn_type = LLVMFunctionType(
+            cg->i8ptr_type,
+            (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type, cg->i8ptr_type}, 3,
+            false);
+        return LLVMBuildCall2(cg->builder, fn_type, fn_stream,
+                              (LLVMValueRef[]){stream, callable.fn, callable.ctx},
+                              3, fname);
       }
       LLVMTypeRef fn_type = LLVMFunctionType(
           cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type}, 2,
           false);
       return LLVMBuildCall2(cg->builder, fn_type, fn_stream,
-                            (LLVMValueRef[]){stream, fn_arg}, 2, fname);
+                            (LLVMValueRef[]){stream, callable.fn}, 2, fname);
     }
     return LLVMConstNull(cg->i8ptr_type);
+  }
+
+  /* Handle builtin: stream_reduce(stream, fn, initial) -> int */
+  if (strcmp(fname, "stream_reduce") == 0) {
+    if (argc >= 3) {
+      AstNode *stream_arg = node->as.call.args.items[0];
+      AstNode *fn_arg = node->as.call.args.items[1];
+      AstNode *init_arg = node->as.call.args.items[2];
+      CgStreamKind kind = cg_expr_stream_kind(cg, stream_arg);
+      if (kind != CG_STREAM_INT && kind != CG_STREAM_STRING) {
+        cg_error(cg, "stream_reduce currently supports int and string streams only");
+        return LLVMConstInt(cg->i64_type, 0, false);
+      }
+      LLVMValueRef stream = emit_expr(cg, stream_arg);
+      CgStreamCallable reducer =
+          cg_emit_stream_reduce_callable(cg, fn_arg, kind);
+      LLVMValueRef initial = emit_expr(cg, init_arg);
+      initial = cg_coerce_value(cg, initial, cg->i64_type);
+      const char *rt_name =
+          cg_stream_reduce_runtime_name(kind, reducer.uses_ctx);
+      LLVMValueRef fn_stream = LLVMGetNamedFunction(cg->mod, rt_name);
+      if (!fn_stream) {
+        LLVMTypeRef fn_type = LLVMFunctionType(
+            cg->i64_type,
+            reducer.uses_ctx
+                ? (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type,
+                                  cg->i8ptr_type, cg->i64_type}
+                : (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type,
+                                  cg->i64_type},
+            reducer.uses_ctx ? 4 : 3, false);
+        fn_stream = LLVMAddFunction(cg->mod, rt_name, fn_type);
+      }
+      if (reducer.uses_ctx) {
+        LLVMTypeRef fn_type = LLVMFunctionType(
+            cg->i64_type,
+            (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type, cg->i8ptr_type,
+                            cg->i64_type},
+            4, false);
+        return LLVMBuildCall2(cg->builder, fn_type, fn_stream,
+                              (LLVMValueRef[]){stream, reducer.fn, reducer.ctx,
+                                              initial},
+                              4, "stream_reduce");
+      }
+      LLVMTypeRef fn_type = LLVMFunctionType(
+          cg->i64_type,
+          (LLVMTypeRef[]){cg->i8ptr_type, cg->i8ptr_type, cg->i64_type}, 3,
+          false);
+      return LLVMBuildCall2(cg->builder, fn_type, fn_stream,
+                            (LLVMValueRef[]){stream, reducer.fn, initial}, 3,
+                            "stream_reduce");
+    }
+    return LLVMConstInt(cg->i64_type, 0, false);
   }
 
   /* Handle builtin: stream_count(stream) -> int */
@@ -2521,7 +3906,20 @@ static LLVMValueRef emit_call(Codegen *cg, AstNode *node) {
   if (strcmp(fname, "map") == 0) {
     if (argc >= 2) {
       LLVMValueRef arr = emit_expr(cg, node->as.call.args.items[0]);
-      LLVMValueRef fn_ptr = emit_expr(cg, node->as.call.args.items[1]);
+      AstNode *fn_node = node->as.call.args.items[1];
+      bool fn_is_closure = cg_expr_is_closure_like(cg, fn_node);
+      LLVMValueRef fn_ptr = LLVMConstNull(cg->i8ptr_type);
+      if (fn_is_closure) {
+        if (fn_node->type == AST_LAMBDA) {
+          LLVMTypeRef param_types[1] = {cg->i64_type};
+          fn_ptr = cg_emit_general_closure_value(cg, fn_node, param_types, 1,
+                                                 cg->i64_type);
+        } else {
+          fn_ptr = emit_expr(cg, fn_node);
+        }
+      } else {
+        fn_ptr = emit_expr(cg, fn_node);
+      }
       
       /* Get array length */
       LLVMValueRef fn_array_len = LLVMGetNamedFunction(cg->mod, "__qisc_array_len");
@@ -2566,10 +3964,18 @@ static LLVMValueRef emit_call(Codegen *cg, AstNode *node) {
       LLVMValueRef elem = LLVMBuildLoad2(cg->builder, cg->i64_type, elem_ptr, "elem");
       
       /* Call fn(elem) */
-      LLVMTypeRef map_fn_type = LLVMFunctionType(cg->i64_type,
-          (LLVMTypeRef[]){cg->i64_type}, 1, false);
-      LLVMValueRef mapped = LLVMBuildCall2(cg->builder, map_fn_type, fn_ptr,
-          (LLVMValueRef[]){elem}, 1, "mapped");
+      LLVMValueRef mapped;
+      if (fn_is_closure) {
+        LLVMTypeRef arg_types[1] = {cg->i64_type};
+        LLVMValueRef arg_values[1] = {elem};
+        mapped = cg_emit_closure_call(cg, fn_ptr, arg_types, arg_values, 1,
+                                      cg->i64_type, "mapped");
+      } else {
+        LLVMTypeRef map_fn_type = LLVMFunctionType(cg->i64_type,
+            (LLVMTypeRef[]){cg->i64_type}, 1, false);
+        mapped = LLVMBuildCall2(cg->builder, map_fn_type, fn_ptr,
+            (LLVMValueRef[]){elem}, 1, "mapped");
+      }
       
       /* Store mapped value in temp alloca for push */
       LLVMValueRef val_alloca = LLVMBuildAlloca(cg->builder, cg->i64_type, "map_val");
@@ -2599,7 +4005,20 @@ static LLVMValueRef emit_call(Codegen *cg, AstNode *node) {
   if (strcmp(fname, "filter") == 0) {
     if (argc >= 2) {
       LLVMValueRef arr = emit_expr(cg, node->as.call.args.items[0]);
-      LLVMValueRef pred_fn = emit_expr(cg, node->as.call.args.items[1]);
+      AstNode *pred_node = node->as.call.args.items[1];
+      bool pred_is_closure = cg_expr_is_closure_like(cg, pred_node);
+      LLVMValueRef pred_fn = LLVMConstNull(cg->i8ptr_type);
+      if (pred_is_closure) {
+        if (pred_node->type == AST_LAMBDA) {
+          LLVMTypeRef param_types[1] = {cg->i64_type};
+          pred_fn = cg_emit_general_closure_value(cg, pred_node, param_types, 1,
+                                                  cg->i64_type);
+        } else {
+          pred_fn = emit_expr(cg, pred_node);
+        }
+      } else {
+        pred_fn = emit_expr(cg, pred_node);
+      }
       
       /* Get array length */
       LLVMValueRef fn_array_len = LLVMGetNamedFunction(cg->mod, "__qisc_array_len");
@@ -2646,10 +4065,18 @@ static LLVMValueRef emit_call(Codegen *cg, AstNode *node) {
       LLVMValueRef elem = LLVMBuildLoad2(cg->builder, cg->i64_type, elem_ptr, "elem");
       
       /* Call predicate(elem) */
-      LLVMTypeRef pred_fn_type = LLVMFunctionType(cg->i64_type,
-          (LLVMTypeRef[]){cg->i64_type}, 1, false);
-      LLVMValueRef pred_result = LLVMBuildCall2(cg->builder, pred_fn_type, pred_fn,
-          (LLVMValueRef[]){elem}, 1, "pred_result");
+      LLVMValueRef pred_result;
+      if (pred_is_closure) {
+        LLVMTypeRef arg_types[1] = {cg->i64_type};
+        LLVMValueRef arg_values[1] = {elem};
+        pred_result = cg_emit_closure_call(cg, pred_fn, arg_types, arg_values, 1,
+                                           cg->i64_type, "pred_result");
+      } else {
+        LLVMTypeRef pred_fn_type = LLVMFunctionType(cg->i64_type,
+            (LLVMTypeRef[]){cg->i64_type}, 1, false);
+        pred_result = LLVMBuildCall2(cg->builder, pred_fn_type, pred_fn,
+            (LLVMValueRef[]){elem}, 1, "pred_result");
+      }
       
       /* If predicate is truthy (non-zero), add to result */
       LLVMValueRef is_truthy = LLVMBuildICmp(cg->builder, LLVMIntNE, pred_result,
@@ -2688,7 +4115,20 @@ static LLVMValueRef emit_call(Codegen *cg, AstNode *node) {
   if (strcmp(fname, "reduce") == 0) {
     if (argc >= 3) {
       LLVMValueRef arr = emit_expr(cg, node->as.call.args.items[0]);
-      LLVMValueRef reduce_fn = emit_expr(cg, node->as.call.args.items[1]);
+      AstNode *reduce_node = node->as.call.args.items[1];
+      bool reduce_is_closure = cg_expr_is_closure_like(cg, reduce_node);
+      LLVMValueRef reduce_fn = LLVMConstNull(cg->i8ptr_type);
+      if (reduce_is_closure) {
+        if (reduce_node->type == AST_LAMBDA) {
+          LLVMTypeRef param_types[2] = {cg->i64_type, cg->i64_type};
+          reduce_fn = cg_emit_general_closure_value(cg, reduce_node, param_types,
+                                                    2, cg->i64_type);
+        } else {
+          reduce_fn = emit_expr(cg, reduce_node);
+        }
+      } else {
+        reduce_fn = emit_expr(cg, reduce_node);
+      }
       LLVMValueRef initial = emit_expr(cg, node->as.call.args.items[2]);
       
       /* Get array length */
@@ -2729,10 +4169,18 @@ static LLVMValueRef emit_call(Codegen *cg, AstNode *node) {
       LLVMValueRef acc = LLVMBuildLoad2(cg->builder, cg->i64_type, acc_alloca, "acc");
       
       /* Call fn(acc, elem) */
-      LLVMTypeRef reduce_fn_type = LLVMFunctionType(cg->i64_type,
-          (LLVMTypeRef[]){cg->i64_type, cg->i64_type}, 2, false);
-      LLVMValueRef new_acc = LLVMBuildCall2(cg->builder, reduce_fn_type, reduce_fn,
-          (LLVMValueRef[]){acc, elem}, 2, "new_acc");
+      LLVMValueRef new_acc;
+      if (reduce_is_closure) {
+        LLVMTypeRef arg_types[2] = {cg->i64_type, cg->i64_type};
+        LLVMValueRef arg_values[2] = {acc, elem};
+        new_acc = cg_emit_closure_call(cg, reduce_fn, arg_types, arg_values, 2,
+                                       cg->i64_type, "new_acc");
+      } else {
+        LLVMTypeRef reduce_fn_type = LLVMFunctionType(cg->i64_type,
+            (LLVMTypeRef[]){cg->i64_type, cg->i64_type}, 2, false);
+        new_acc = LLVMBuildCall2(cg->builder, reduce_fn_type, reduce_fn,
+            (LLVMValueRef[]){acc, elem}, 2, "new_acc");
+      }
       
       /* Store new accumulator */
       LLVMBuildStore(cg->builder, new_acc, acc_alloca);
@@ -2763,6 +4211,24 @@ static LLVMValueRef emit_call(Codegen *cg, AstNode *node) {
     /* Maybe it's a lambda variable (function pointer) */
     CgSymbol *sym = cg_lookup(cg, fname);
     if (sym) {
+      char marker_name[300];
+      snprintf(marker_name, sizeof(marker_name), "__%s__closure", fname);
+      bool is_closure = cg_lookup(cg, marker_name) != NULL;
+      if (sym->is_callable) {
+        LLVMValueRef *args = NULL;
+        if (argc > 0) {
+          args = calloc(argc, sizeof(LLVMValueRef));
+          for (int i = 0; i < argc; i++)
+            args[i] = emit_expr(cg, node->as.call.args.items[i]);
+        }
+        LLVMValueRef callable =
+            LLVMBuildLoad2(cg->builder, sym->type, sym->alloca,
+                           is_closure ? "closure_ptr" : "fn_ptr");
+        LLVMValueRef result = cg_emit_symbol_callable_call(
+            cg, sym, callable, args, argc, is_closure, "lcall");
+        free(args);
+        return result;
+      }
       /* Load the function pointer from the variable */
       LLVMValueRef fn_ptr =
           LLVMBuildLoad2(cg->builder, sym->type, sym->alloca, "fn_ptr");
@@ -3101,6 +4567,11 @@ static LLVMValueRef emit_expr(Codegen *cg, AstNode *node) {
 
 static void emit_var_decl(Codegen *cg, AstNode *node) {
   const char *name = node->as.var_decl.name;
+  AstNode *initializer = node->as.var_decl.initializer;
+  bool is_closure_init =
+      initializer && initializer->type == AST_LAMBDA;
+  bool is_closure_value_init =
+      initializer && cg_expr_is_closure_like(cg, initializer);
 
   /* Determine type */
   LLVMTypeRef var_type = cg->i64_type; /* default */
@@ -3108,7 +4579,22 @@ static void emit_var_decl(Codegen *cg, AstNode *node) {
     var_type = cg_type_from_name(cg, node->as.var_decl.type_info->name);
   } else if (node->as.var_decl.initializer) {
     /* Auto: infer from initializer */
-    LLVMValueRef init_val = emit_expr(cg, node->as.var_decl.initializer);
+    LLVMValueRef init_val;
+    if (is_closure_init) {
+      AstNode *lambda = node->as.var_decl.initializer;
+      int param_count = lambda->as.lambda.params.count;
+      LLVMTypeRef lambda_return_type =
+          cg_lambda_general_return_type(cg, lambda);
+      LLVMTypeRef *param_types = calloc(param_count ? param_count : 1,
+                                        sizeof(LLVMTypeRef));
+      for (int i = 0; i < param_count; i++)
+        param_types[i] = cg->i64_type;
+      init_val = cg_emit_general_closure_value(cg, lambda, param_types,
+                                               param_count, lambda_return_type);
+      free(param_types);
+    } else {
+      init_val = emit_expr(cg, node->as.var_decl.initializer);
+    }
     if (cg->had_error)
       return;
     var_type = LLVMTypeOf(init_val);
@@ -3117,6 +4603,8 @@ static void emit_var_decl(Codegen *cg, AstNode *node) {
     LLVMValueRef alloca = LLVMBuildAlloca(cg->builder, var_type, name);
     LLVMBuildStore(cg->builder, init_val, alloca);
     cg_define(cg, name, alloca, var_type);
+    cg_attach_callable_metadata_from_initializer(cg, name,
+                                                 node->as.var_decl.initializer);
 
     /* Track array length for auto-inferred arrays */
     if (node->as.var_decl.initializer->type == AST_ARRAY_LITERAL) {
@@ -3154,8 +4642,7 @@ static void emit_var_decl(Codegen *cg, AstNode *node) {
     }
 
     {
-      CgStreamKind stream_kind =
-          cg_expr_stream_kind(cg, node->as.var_decl.initializer);
+      CgStreamKind stream_kind = cg_expr_stream_kind(cg, initializer);
       if (stream_kind != CG_STREAM_NONE) {
         char marker_name[300];
         snprintf(marker_name, sizeof(marker_name), "__%s__stream_%s", name,
@@ -3167,6 +4654,14 @@ static void emit_var_decl(Codegen *cg, AstNode *node) {
         cg_define(cg, marker_name, marker, cg->i1_type);
       }
     }
+    if (is_closure_value_init) {
+      char marker_name[300];
+      snprintf(marker_name, sizeof(marker_name), "__%s__closure", name);
+      LLVMValueRef marker =
+          LLVMBuildAlloca(cg->builder, cg->i1_type, marker_name);
+      LLVMBuildStore(cg->builder, LLVMConstInt(cg->i1_type, 1, false), marker);
+      cg_define(cg, marker_name, marker, cg->i1_type);
+    }
     return;
   }
 
@@ -3175,7 +4670,22 @@ static void emit_var_decl(Codegen *cg, AstNode *node) {
 
   /* Initialize */
   if (node->as.var_decl.initializer) {
-    LLVMValueRef init_val = emit_expr(cg, node->as.var_decl.initializer);
+    LLVMValueRef init_val;
+    if (is_closure_init) {
+      AstNode *lambda = initializer;
+      int param_count = lambda->as.lambda.params.count;
+      LLVMTypeRef lambda_return_type =
+          cg_lambda_general_return_type(cg, lambda);
+      LLVMTypeRef *param_types = calloc(param_count ? param_count : 1,
+                                        sizeof(LLVMTypeRef));
+      for (int i = 0; i < param_count; i++)
+        param_types[i] = cg->i64_type;
+      init_val = cg_emit_general_closure_value(cg, lambda, param_types,
+                                               param_count, lambda_return_type);
+      free(param_types);
+    } else {
+      init_val = emit_expr(cg, initializer);
+    }
     if (cg->had_error)
       return;
     /* Cast if needed (e.g., int to float) */
@@ -3195,6 +4705,9 @@ static void emit_var_decl(Codegen *cg, AstNode *node) {
   }
 
   cg_define(cg, name, alloca, var_type);
+  if (initializer) {
+    cg_attach_callable_metadata_from_initializer(cg, name, initializer);
+  }
 
   /* Track array length: store __name__len if initializer is an array literal */
   if (node->as.var_decl.initializer &&
@@ -3209,13 +4722,20 @@ static void emit_var_decl(Codegen *cg, AstNode *node) {
     cg_define(cg, len_name, len_alloca, cg->i64_type);
   }
 
-  if (node->as.var_decl.initializer) {
-    CgStreamKind stream_kind =
-        cg_expr_stream_kind(cg, node->as.var_decl.initializer);
+  if (initializer) {
+    CgStreamKind stream_kind = cg_expr_stream_kind(cg, initializer);
     if (stream_kind != CG_STREAM_NONE) {
       char marker_name[300];
       snprintf(marker_name, sizeof(marker_name), "__%s__stream_%s", name,
                stream_kind == CG_STREAM_STRING ? "string" : "int");
+      LLVMValueRef marker =
+          LLVMBuildAlloca(cg->builder, cg->i1_type, marker_name);
+      LLVMBuildStore(cg->builder, LLVMConstInt(cg->i1_type, 1, false), marker);
+      cg_define(cg, marker_name, marker, cg->i1_type);
+    }
+    if (is_closure_value_init) {
+      char marker_name[300];
+      snprintf(marker_name, sizeof(marker_name), "__%s__closure", name);
       LLVMValueRef marker =
           LLVMBuildAlloca(cg->builder, cg->i1_type, marker_name);
       LLVMBuildStore(cg->builder, LLVMConstInt(cg->i1_type, 1, false), marker);

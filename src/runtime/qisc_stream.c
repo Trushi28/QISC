@@ -1505,6 +1505,16 @@ typedef const char *(*QiscMapStringFn)(const char *);
 typedef bool (*QiscFilterStringFn)(const char *);
 typedef const char *(*QiscMapI64ToStringFn)(int64_t);
 typedef int64_t (*QiscMapStringToI64Fn)(const char *);
+typedef int64_t (*QiscMapI64CtxFn)(void *, int64_t);
+typedef bool (*QiscFilterI64CtxFn)(void *, int64_t);
+typedef const char *(*QiscMapStringCtxFn)(void *, const char *);
+typedef bool (*QiscFilterStringCtxFn)(void *, const char *);
+typedef const char *(*QiscMapI64ToStringCtxFn)(void *, int64_t);
+typedef int64_t (*QiscMapStringToI64CtxFn)(void *, const char *);
+typedef int64_t (*QiscReduceI64Fn)(int64_t, int64_t);
+typedef int64_t (*QiscReduceI64CtxFn)(void *, int64_t, int64_t);
+typedef int64_t (*QiscReduceStringToI64Fn)(int64_t, const char *);
+typedef int64_t (*QiscReduceStringToI64CtxFn)(void *, int64_t, const char *);
 
 typedef struct {
     QiscStream *source;
@@ -1568,6 +1578,77 @@ static QiscStream *qisc_stream_map_i64(QiscStream *source, QiscMapI64Fn mapper) 
     stream->next = int_map_next;
     stream->reset = int_map_reset;
     stream->free = int_map_free;
+    stream->state = source->state;
+    return stream;
+}
+
+typedef struct {
+    QiscStream *source;
+    QiscMapI64CtxFn mapper;
+    void *fn_context;
+    int64_t storage;
+} IntMapCtxContext;
+
+static StreamElement int_map_ctx_next(QiscStream *self) {
+    IntMapCtxContext *ctx = (IntMapCtxContext *)self->context;
+
+    if (ctx->source->state != STREAM_READY) {
+        self->state = ctx->source->state;
+        return (StreamElement){NULL, 0};
+    }
+
+    StreamElement elem = ctx->source->next(ctx->source);
+    if (elem.data == NULL) {
+        self->state = ctx->source->state;
+        return (StreamElement){NULL, 0};
+    }
+
+    ctx->storage = ctx->mapper(ctx->fn_context, *(int64_t *)elem.data);
+    self->state = ctx->source->state;
+    return (StreamElement){&ctx->storage, sizeof(int64_t)};
+}
+
+static void int_map_ctx_reset(QiscStream *self) {
+    IntMapCtxContext *ctx = (IntMapCtxContext *)self->context;
+    if (ctx->source->reset) {
+        ctx->source->reset(ctx->source);
+    }
+    self->state = ctx->source->state;
+}
+
+static void int_map_ctx_free(QiscStream *self) {
+    IntMapCtxContext *ctx = (IntMapCtxContext *)self->context;
+    stream_free(ctx->source);
+    free(ctx->fn_context);
+    free(ctx);
+}
+
+static QiscStream *qisc_stream_map_i64_ctx(QiscStream *source,
+                                           QiscMapI64CtxFn mapper,
+                                           void *fn_context) {
+    QiscStream *stream;
+    IntMapCtxContext *ctx;
+
+    if (!source || !mapper) return NULL;
+
+    stream = malloc(sizeof(QiscStream));
+    if (!stream) return NULL;
+
+    ctx = malloc(sizeof(IntMapCtxContext));
+    if (!ctx) {
+        free(stream);
+        return NULL;
+    }
+
+    ctx->source = source;
+    ctx->mapper = mapper;
+    ctx->fn_context = fn_context;
+    ctx->storage = 0;
+
+    stream->context = ctx;
+    stream->next = int_map_ctx_next;
+    stream->reset = int_map_ctx_reset;
+    stream->free = int_map_ctx_free;
     stream->state = source->state;
     return stream;
 }
@@ -1645,6 +1726,82 @@ static QiscStream *qisc_stream_map_i64_to_strings(QiscStream *source,
 
 typedef struct {
     QiscStream *source;
+    QiscMapI64ToStringCtxFn mapper;
+    void *fn_context;
+    const char *storage;
+} IntToStringMapCtxContext;
+
+static StreamElement int_to_string_map_ctx_next(QiscStream *self) {
+    IntToStringMapCtxContext *ctx = (IntToStringMapCtxContext *)self->context;
+
+    if (ctx->source->state != STREAM_READY) {
+        self->state = ctx->source->state;
+        return (StreamElement){NULL, 0};
+    }
+
+    StreamElement elem = ctx->source->next(ctx->source);
+    if (elem.data == NULL) {
+        self->state = ctx->source->state;
+        return (StreamElement){NULL, 0};
+    }
+
+    ctx->storage = ctx->mapper(ctx->fn_context, *(int64_t *)elem.data);
+    self->state = ctx->source->state;
+    if (!ctx->storage) {
+        return (StreamElement){NULL, 0};
+    }
+    return (StreamElement){(void *)ctx->storage, strlen(ctx->storage) + 1};
+}
+
+static void int_to_string_map_ctx_reset(QiscStream *self) {
+    IntToStringMapCtxContext *ctx =
+        (IntToStringMapCtxContext *)self->context;
+    if (ctx->source->reset) {
+        ctx->source->reset(ctx->source);
+    }
+    ctx->storage = NULL;
+    self->state = ctx->source->state;
+}
+
+static void int_to_string_map_ctx_free(QiscStream *self) {
+    IntToStringMapCtxContext *ctx =
+        (IntToStringMapCtxContext *)self->context;
+    stream_free(ctx->source);
+    free(ctx->fn_context);
+    free(ctx);
+}
+
+static QiscStream *qisc_stream_map_i64_to_strings_ctx(
+    QiscStream *source, QiscMapI64ToStringCtxFn mapper, void *fn_context) {
+    QiscStream *stream;
+    IntToStringMapCtxContext *ctx;
+
+    if (!source || !mapper) return NULL;
+
+    stream = malloc(sizeof(QiscStream));
+    if (!stream) return NULL;
+
+    ctx = malloc(sizeof(IntToStringMapCtxContext));
+    if (!ctx) {
+        free(stream);
+        return NULL;
+    }
+
+    ctx->source = source;
+    ctx->mapper = mapper;
+    ctx->fn_context = fn_context;
+    ctx->storage = NULL;
+
+    stream->context = ctx;
+    stream->next = int_to_string_map_ctx_next;
+    stream->reset = int_to_string_map_ctx_reset;
+    stream->free = int_to_string_map_ctx_free;
+    stream->state = source->state;
+    return stream;
+}
+
+typedef struct {
+    QiscStream *source;
     QiscFilterI64Fn predicate;
 } IntFilterContext;
 
@@ -1704,6 +1861,75 @@ static QiscStream *qisc_stream_filter_i64(QiscStream *source,
     stream->next = int_filter_next;
     stream->reset = int_filter_reset;
     stream->free = int_filter_free;
+    stream->state = source->state;
+    return stream;
+}
+
+typedef struct {
+    QiscStream *source;
+    QiscFilterI64CtxFn predicate;
+    void *fn_context;
+} IntFilterCtxContext;
+
+static StreamElement int_filter_ctx_next(QiscStream *self) {
+    IntFilterCtxContext *ctx = (IntFilterCtxContext *)self->context;
+
+    while (ctx->source->state == STREAM_READY) {
+        StreamElement elem = ctx->source->next(ctx->source);
+        if (elem.data == NULL) {
+            self->state = ctx->source->state;
+            return (StreamElement){NULL, 0};
+        }
+        if (ctx->predicate(ctx->fn_context, *(int64_t *)elem.data)) {
+            self->state = ctx->source->state;
+            return elem;
+        }
+    }
+
+    self->state = ctx->source->state;
+    return (StreamElement){NULL, 0};
+}
+
+static void int_filter_ctx_reset(QiscStream *self) {
+    IntFilterCtxContext *ctx = (IntFilterCtxContext *)self->context;
+    if (ctx->source->reset) {
+        ctx->source->reset(ctx->source);
+    }
+    self->state = ctx->source->state;
+}
+
+static void int_filter_ctx_free(QiscStream *self) {
+    IntFilterCtxContext *ctx = (IntFilterCtxContext *)self->context;
+    stream_free(ctx->source);
+    free(ctx->fn_context);
+    free(ctx);
+}
+
+static QiscStream *qisc_stream_filter_i64_ctx(QiscStream *source,
+                                              QiscFilterI64CtxFn predicate,
+                                              void *fn_context) {
+    QiscStream *stream;
+    IntFilterCtxContext *ctx;
+
+    if (!source || !predicate) return NULL;
+
+    stream = malloc(sizeof(QiscStream));
+    if (!stream) return NULL;
+
+    ctx = malloc(sizeof(IntFilterCtxContext));
+    if (!ctx) {
+        free(stream);
+        return NULL;
+    }
+
+    ctx->source = source;
+    ctx->predicate = predicate;
+    ctx->fn_context = fn_context;
+
+    stream->context = ctx;
+    stream->next = int_filter_ctx_next;
+    stream->reset = int_filter_ctx_reset;
+    stream->free = int_filter_ctx_free;
     stream->state = source->state;
     return stream;
 }
@@ -1781,6 +2007,81 @@ static QiscStream *qisc_stream_map_strings(QiscStream *source,
 
 typedef struct {
     QiscStream *source;
+    QiscMapStringCtxFn mapper;
+    void *fn_context;
+    const char *storage;
+} StringMapCtxContext;
+
+static StreamElement string_map_ctx_next(QiscStream *self) {
+    StringMapCtxContext *ctx = (StringMapCtxContext *)self->context;
+
+    if (ctx->source->state != STREAM_READY) {
+        self->state = ctx->source->state;
+        return (StreamElement){NULL, 0};
+    }
+
+    StreamElement elem = ctx->source->next(ctx->source);
+    if (elem.data == NULL) {
+        self->state = ctx->source->state;
+        return (StreamElement){NULL, 0};
+    }
+
+    ctx->storage = ctx->mapper(ctx->fn_context, (const char *)elem.data);
+    self->state = ctx->source->state;
+    if (!ctx->storage) {
+        return (StreamElement){NULL, 0};
+    }
+    return (StreamElement){(void *)ctx->storage, strlen(ctx->storage) + 1};
+}
+
+static void string_map_ctx_reset(QiscStream *self) {
+    StringMapCtxContext *ctx = (StringMapCtxContext *)self->context;
+    if (ctx->source->reset) {
+        ctx->source->reset(ctx->source);
+    }
+    ctx->storage = NULL;
+    self->state = ctx->source->state;
+}
+
+static void string_map_ctx_free(QiscStream *self) {
+    StringMapCtxContext *ctx = (StringMapCtxContext *)self->context;
+    stream_free(ctx->source);
+    free(ctx->fn_context);
+    free(ctx);
+}
+
+static QiscStream *qisc_stream_map_strings_ctx(QiscStream *source,
+                                               QiscMapStringCtxFn mapper,
+                                               void *fn_context) {
+    QiscStream *stream;
+    StringMapCtxContext *ctx;
+
+    if (!source || !mapper) return NULL;
+
+    stream = malloc(sizeof(QiscStream));
+    if (!stream) return NULL;
+
+    ctx = malloc(sizeof(StringMapCtxContext));
+    if (!ctx) {
+        free(stream);
+        return NULL;
+    }
+
+    ctx->source = source;
+    ctx->mapper = mapper;
+    ctx->fn_context = fn_context;
+    ctx->storage = NULL;
+
+    stream->context = ctx;
+    stream->next = string_map_ctx_next;
+    stream->reset = string_map_ctx_reset;
+    stream->free = string_map_ctx_free;
+    stream->state = source->state;
+    return stream;
+}
+
+typedef struct {
+    QiscStream *source;
     QiscFilterStringFn predicate;
 } StringFilterContext;
 
@@ -1840,6 +2141,74 @@ static QiscStream *qisc_stream_filter_strings(QiscStream *source,
     stream->next = string_filter_next;
     stream->reset = string_filter_reset;
     stream->free = string_filter_free;
+    stream->state = source->state;
+    return stream;
+}
+
+typedef struct {
+    QiscStream *source;
+    QiscFilterStringCtxFn predicate;
+    void *fn_context;
+} StringFilterCtxContext;
+
+static StreamElement string_filter_ctx_next(QiscStream *self) {
+    StringFilterCtxContext *ctx = (StringFilterCtxContext *)self->context;
+
+    while (ctx->source->state == STREAM_READY) {
+        StreamElement elem = ctx->source->next(ctx->source);
+        if (elem.data == NULL) {
+            self->state = ctx->source->state;
+            return (StreamElement){NULL, 0};
+        }
+        if (ctx->predicate(ctx->fn_context, (const char *)elem.data)) {
+            self->state = ctx->source->state;
+            return elem;
+        }
+    }
+
+    self->state = ctx->source->state;
+    return (StreamElement){NULL, 0};
+}
+
+static void string_filter_ctx_reset(QiscStream *self) {
+    StringFilterCtxContext *ctx = (StringFilterCtxContext *)self->context;
+    if (ctx->source->reset) {
+        ctx->source->reset(ctx->source);
+    }
+    self->state = ctx->source->state;
+}
+
+static void string_filter_ctx_free(QiscStream *self) {
+    StringFilterCtxContext *ctx = (StringFilterCtxContext *)self->context;
+    stream_free(ctx->source);
+    free(ctx->fn_context);
+    free(ctx);
+}
+
+static QiscStream *qisc_stream_filter_strings_ctx(
+    QiscStream *source, QiscFilterStringCtxFn predicate, void *fn_context) {
+    QiscStream *stream;
+    StringFilterCtxContext *ctx;
+
+    if (!source || !predicate) return NULL;
+
+    stream = malloc(sizeof(QiscStream));
+    if (!stream) return NULL;
+
+    ctx = malloc(sizeof(StringFilterCtxContext));
+    if (!ctx) {
+        free(stream);
+        return NULL;
+    }
+
+    ctx->source = source;
+    ctx->predicate = predicate;
+    ctx->fn_context = fn_context;
+
+    stream->context = ctx;
+    stream->next = string_filter_ctx_next;
+    stream->reset = string_filter_ctx_reset;
+    stream->free = string_filter_ctx_free;
     stream->state = source->state;
     return stream;
 }
@@ -1911,6 +2280,78 @@ static QiscStream *qisc_stream_map_strings_to_i64(QiscStream *source,
     return stream;
 }
 
+typedef struct {
+    QiscStream *source;
+    QiscMapStringToI64CtxFn mapper;
+    void *fn_context;
+    int64_t storage;
+} StringToIntMapCtxContext;
+
+static StreamElement string_to_int_map_ctx_next(QiscStream *self) {
+    StringToIntMapCtxContext *ctx = (StringToIntMapCtxContext *)self->context;
+
+    if (ctx->source->state != STREAM_READY) {
+        self->state = ctx->source->state;
+        return (StreamElement){NULL, 0};
+    }
+
+    StreamElement elem = ctx->source->next(ctx->source);
+    if (elem.data == NULL) {
+        self->state = ctx->source->state;
+        return (StreamElement){NULL, 0};
+    }
+
+    ctx->storage = ctx->mapper(ctx->fn_context, (const char *)elem.data);
+    self->state = ctx->source->state;
+    return (StreamElement){&ctx->storage, sizeof(int64_t)};
+}
+
+static void string_to_int_map_ctx_reset(QiscStream *self) {
+    StringToIntMapCtxContext *ctx =
+        (StringToIntMapCtxContext *)self->context;
+    if (ctx->source->reset) {
+        ctx->source->reset(ctx->source);
+    }
+    self->state = ctx->source->state;
+}
+
+static void string_to_int_map_ctx_free(QiscStream *self) {
+    StringToIntMapCtxContext *ctx =
+        (StringToIntMapCtxContext *)self->context;
+    stream_free(ctx->source);
+    free(ctx->fn_context);
+    free(ctx);
+}
+
+static QiscStream *qisc_stream_map_strings_to_i64_ctx(
+    QiscStream *source, QiscMapStringToI64CtxFn mapper, void *fn_context) {
+    QiscStream *stream;
+    StringToIntMapCtxContext *ctx;
+
+    if (!source || !mapper) return NULL;
+
+    stream = malloc(sizeof(QiscStream));
+    if (!stream) return NULL;
+
+    ctx = malloc(sizeof(StringToIntMapCtxContext));
+    if (!ctx) {
+        free(stream);
+        return NULL;
+    }
+
+    ctx->source = source;
+    ctx->mapper = mapper;
+    ctx->fn_context = fn_context;
+    ctx->storage = 0;
+
+    stream->context = ctx;
+    stream->next = string_to_int_map_ctx_next;
+    stream->reset = string_to_int_map_ctx_reset;
+    stream->free = string_to_int_map_ctx_free;
+    stream->state = source->state;
+    return stream;
+}
+
 /* ============================================================
  * QISC Wrapper Entry Points
  * ============================================================ */
@@ -1945,10 +2386,29 @@ void *__qisc_stream_filter_i64(void *stream, void *fn_ptr) {
     return qisc_stream_filter_i64((QiscStream *)stream, (QiscFilterI64Fn)fn_ptr);
 }
 
+void *__qisc_stream_map_i64_ctx(void *stream, void *fn_ptr, void *ctx) {
+    if (!stream || !fn_ptr) return NULL;
+    return qisc_stream_map_i64_ctx((QiscStream *)stream, (QiscMapI64CtxFn)fn_ptr,
+                                   ctx);
+}
+
+void *__qisc_stream_filter_i64_ctx(void *stream, void *fn_ptr, void *ctx) {
+    if (!stream || !fn_ptr) return NULL;
+    return qisc_stream_filter_i64_ctx(
+        (QiscStream *)stream, (QiscFilterI64CtxFn)fn_ptr, ctx);
+}
+
 void *__qisc_stream_map_i64_to_strings(void *stream, void *fn_ptr) {
     if (!stream || !fn_ptr) return NULL;
     return qisc_stream_map_i64_to_strings((QiscStream *)stream,
                                           (QiscMapI64ToStringFn)fn_ptr);
+}
+
+void *__qisc_stream_map_i64_to_strings_ctx(void *stream, void *fn_ptr,
+                                           void *ctx) {
+    if (!stream || !fn_ptr) return NULL;
+    return qisc_stream_map_i64_to_strings_ctx(
+        (QiscStream *)stream, (QiscMapI64ToStringCtxFn)fn_ptr, ctx);
 }
 
 void *__qisc_stream_map_strings(void *stream, void *fn_ptr) {
@@ -1961,10 +2421,112 @@ void *__qisc_stream_filter_strings(void *stream, void *fn_ptr) {
     return qisc_stream_filter_strings((QiscStream *)stream, (QiscFilterStringFn)fn_ptr);
 }
 
+void *__qisc_stream_map_strings_ctx(void *stream, void *fn_ptr, void *ctx) {
+    if (!stream || !fn_ptr) return NULL;
+    return qisc_stream_map_strings_ctx(
+        (QiscStream *)stream, (QiscMapStringCtxFn)fn_ptr, ctx);
+}
+
+void *__qisc_stream_filter_strings_ctx(void *stream, void *fn_ptr, void *ctx) {
+    if (!stream || !fn_ptr) return NULL;
+    return qisc_stream_filter_strings_ctx(
+        (QiscStream *)stream, (QiscFilterStringCtxFn)fn_ptr, ctx);
+}
+
 void *__qisc_stream_map_strings_to_i64(void *stream, void *fn_ptr) {
     if (!stream || !fn_ptr) return NULL;
     return qisc_stream_map_strings_to_i64((QiscStream *)stream,
                                           (QiscMapStringToI64Fn)fn_ptr);
+}
+
+void *__qisc_stream_map_strings_to_i64_ctx(void *stream, void *fn_ptr,
+                                           void *ctx) {
+    if (!stream || !fn_ptr) return NULL;
+    return qisc_stream_map_strings_to_i64_ctx(
+        (QiscStream *)stream, (QiscMapStringToI64CtxFn)fn_ptr, ctx);
+}
+
+int64_t __qisc_stream_reduce_i64(void *stream, void *fn_ptr, int64_t initial) {
+    QiscStream *source = (QiscStream *)stream;
+    QiscReduceI64Fn reducer = (QiscReduceI64Fn)fn_ptr;
+    int64_t acc = initial;
+
+    if (!source || !reducer) return acc;
+
+    while (source->state == STREAM_READY) {
+        StreamElement elem = source->next(source);
+        if (elem.data != NULL) {
+            acc = reducer(acc, *(int64_t *)elem.data);
+        }
+    }
+
+    stream_free(source);
+    return acc;
+}
+
+int64_t __qisc_stream_reduce_i64_ctx(void *stream, void *fn_ptr, void *ctx,
+                                     int64_t initial) {
+    QiscStream *source = (QiscStream *)stream;
+    QiscReduceI64CtxFn reducer = (QiscReduceI64CtxFn)fn_ptr;
+    int64_t acc = initial;
+
+    if (!source || !reducer) {
+        free(ctx);
+        return acc;
+    }
+
+    while (source->state == STREAM_READY) {
+        StreamElement elem = source->next(source);
+        if (elem.data != NULL) {
+            acc = reducer(ctx, acc, *(int64_t *)elem.data);
+        }
+    }
+
+    stream_free(source);
+    free(ctx);
+    return acc;
+}
+
+int64_t __qisc_stream_reduce_strings_to_i64(void *stream, void *fn_ptr,
+                                            int64_t initial) {
+    QiscStream *source = (QiscStream *)stream;
+    QiscReduceStringToI64Fn reducer = (QiscReduceStringToI64Fn)fn_ptr;
+    int64_t acc = initial;
+
+    if (!source || !reducer) return acc;
+
+    while (source->state == STREAM_READY) {
+        StreamElement elem = source->next(source);
+        if (elem.data != NULL) {
+            acc = reducer(acc, (const char *)elem.data);
+        }
+    }
+
+    stream_free(source);
+    return acc;
+}
+
+int64_t __qisc_stream_reduce_strings_to_i64_ctx(void *stream, void *fn_ptr,
+                                                void *ctx, int64_t initial) {
+    QiscStream *source = (QiscStream *)stream;
+    QiscReduceStringToI64CtxFn reducer = (QiscReduceStringToI64CtxFn)fn_ptr;
+    int64_t acc = initial;
+
+    if (!source || !reducer) {
+        free(ctx);
+        return acc;
+    }
+
+    while (source->state == STREAM_READY) {
+        StreamElement elem = source->next(source);
+        if (elem.data != NULL) {
+            acc = reducer(ctx, acc, (const char *)elem.data);
+        }
+    }
+
+    stream_free(source);
+    free(ctx);
+    return acc;
 }
 
 int64_t __qisc_stream_count_i64(void *stream) {

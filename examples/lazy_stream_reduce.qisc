@@ -1,0 +1,25 @@
+proc main() gives int {
+    auto offset = 3;
+
+    auto total = stream_range(1, 5, 1)
+        >> stream_map(x => x * 2)
+        >> stream_reduce((acc, x) => {
+            auto next = acc + x + offset;
+            give next;
+        }, 0);
+
+    stdout_write("total=");
+    print(total);
+
+    auto direct = stream_reduce(
+        stream_range(1, 4, 1),
+        (acc, x) => {
+            give acc + x + offset;
+        },
+        0
+    );
+
+    stdout_write("direct=");
+    print(direct);
+    give 0;
+}

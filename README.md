@@ -313,7 +313,7 @@ Continuing anyway because I'm either brave or stupid.
 │             │             │                         │
 │  ┌───────────────┐  ┌─────────────────────────────┐ │
 │  │  Personality  │  │     CLI Interface           │ │
-│  │    Engine     │  │     (qisc build/run/...)     │ │
+│  │    Engine     │  │     (qisc build/run/...)    │ │
 │  └───────────────┘  └─────────────────────────────┘ │
 └─────────────────────────────────────────────────────┘
 ```

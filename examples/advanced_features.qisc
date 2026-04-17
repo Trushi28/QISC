@@ -38,7 +38,7 @@ proc main() gives int {
     const LANG = "QISC";
     print("PI = " + str(PI));
     print("LANG = " + LANG);
-
+    PI=4;
     /* === auto variables === */
     auto x = 10;
     x = 20;

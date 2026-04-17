@@ -1,0 +1,23 @@
+proc join_score(string prefix, int score) gives string {
+    give prefix + str(score);
+}
+
+proc score_over(int score, int limit) gives bool {
+    give score > limit;
+}
+
+proc main() gives int {
+    auto formatter = join_score;
+    formatter(1, 2);
+
+    auto checker = score_over;
+    checker("bad", 7);
+
+    auto add_one = x => x + 1;
+    add_one(1, 2);
+
+    auto not_fn = 3;
+    not_fn();
+
+    give 0;
+}

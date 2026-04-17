@@ -1,0 +1,12 @@
+proc label(int x) gives string {
+    give "n=" + str(x);
+}
+
+proc main() gives int {
+    string[] bad_words = [1, 2];
+    stream(string) bad_stream = stream_range(1, 3);
+    int[] nums = [1, 2, 3];
+    push(nums, "oops");
+    int bad = stream_first(stream_file_lines(1));
+    give 0;
+}

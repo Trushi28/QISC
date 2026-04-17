@@ -19,6 +19,10 @@ typedef struct {
   char *name;
   char *type_name; /* "int", "float", "string", "bool", "auto", "any" */
   bool is_const;
+  bool is_callable;
+  int callable_param_count;
+  char *callable_return_type;
+  char *callable_param_types[TYPECHECKER_MAX_PARAMS];
 } TcSymbol;
 
 typedef struct {

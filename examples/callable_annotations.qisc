@@ -1,0 +1,22 @@
+proc increment(int x) gives int {
+    give x + 1;
+}
+
+proc join_score(string prefix, int score) gives string {
+    give prefix + str(score);
+}
+
+proc apply_twice(proc(int)->int fn, int value) gives int {
+    give fn(fn(value));
+}
+
+proc main() gives int {
+    proc(int)->int inc = increment;
+    print(apply_twice(inc, 5));
+
+    proc(string, int)->string formatter = join_score;
+    stdout_write(formatter("score=", 4));
+    print("");
+
+    give 0;
+}

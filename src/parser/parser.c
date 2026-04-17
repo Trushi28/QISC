@@ -48,6 +48,12 @@ static char *token_string(Token *token) {
   return str;
 }
 
+static bool token_is_word(Token *token, const char *word) {
+  size_t len = strlen(word);
+  return token && token->length == (int)len &&
+         strncmp(token->start, word, len) == 0;
+}
+
 /* ======== Error Handling ======== */
 
 void parser_error(Parser *parser, const char *message) {
@@ -1196,7 +1202,68 @@ static AstNode *statement(Parser *parser) {
 static TypeInfo *parse_type(Parser *parser) {
   char *name = NULL;
 
-  if (match(parser, TOK_INT))
+  if (match(parser, TOK_PROC)) {
+    char buffer[1024];
+    int offset = 0;
+    TypeInfo *param_types[32] = {0};
+    int param_count = 0;
+    TypeInfo *return_type = NULL;
+
+    consume(parser, TOK_LPAREN, "Expected '(' after 'proc' in type");
+    if (!check(parser, TOK_RPAREN)) {
+      do {
+        if (param_count >= 32) {
+          parser_error(parser, "Too many callable type parameters");
+          break;
+        }
+        param_types[param_count] = parse_type(parser);
+        if (!param_types[param_count]) {
+          parser_error_at_current(parser,
+                                  "Expected parameter type in callable type");
+          break;
+        }
+        param_count++;
+      } while (match(parser, TOK_COMMA));
+    }
+    consume(parser, TOK_RPAREN, "Expected ')' after callable type parameters");
+    consume(parser, TOK_ARROW, "Expected '->' after callable type parameters");
+    return_type = parse_type(parser);
+    if (!return_type) {
+      parser_error_at_current(parser, "Expected return type after '->'");
+    }
+
+    offset += snprintf(buffer + offset, sizeof(buffer) - (size_t)offset,
+                       "proc(");
+    for (int i = 0; i < param_count; i++) {
+      offset += snprintf(buffer + offset, sizeof(buffer) - (size_t)offset,
+                         "%s%s", i == 0 ? "" : ", ",
+                         param_types[i] ? param_types[i]->name : "any");
+    }
+    snprintf(buffer + offset, sizeof(buffer) - (size_t)offset, ")->%s",
+             return_type ? return_type->name : "any");
+    name = strdup(buffer);
+
+    for (int i = 0; i < param_count; i++) {
+      type_info_free(param_types[i]);
+    }
+    type_info_free(return_type);
+  } else if (check(parser, TOK_IDENT) &&
+             token_is_word(&parser->current, "stream")) {
+    TypeInfo *element_type = NULL;
+    char buffer[512];
+
+    advance(parser);
+    consume(parser, TOK_LPAREN, "Expected '(' after 'stream' in type");
+    element_type = parse_type(parser);
+    if (!element_type) {
+      parser_error_at_current(parser, "Expected element type in stream type");
+      return NULL;
+    }
+    consume(parser, TOK_RPAREN, "Expected ')' after stream element type");
+    snprintf(buffer, sizeof(buffer), "stream(%s)", element_type->name);
+    name = strdup(buffer);
+    type_info_free(element_type);
+  } else if (match(parser, TOK_INT))
     name = strdup("int");
   else if (match(parser, TOK_UINT))
     name = strdup("uint");
@@ -1245,12 +1312,16 @@ static TypeInfo *parse_type(Parser *parser) {
     info->is_pointer = true;
   }
   if (match(parser, TOK_LBRACKET)) {
+    size_t len;
     info->is_array = true;
     if (!check(parser, TOK_RBRACKET)) {
       /* Array size - skip for now */
       expression(parser);
     }
     consume(parser, TOK_RBRACKET, "Expected ']' after array type");
+    len = strlen(info->name);
+    info->name = realloc(info->name, len + 3);
+    memcpy(info->name + len, "[]", 3);
   }
 
   return info;
@@ -1389,12 +1460,13 @@ static bool is_type_start(Parser *parser) {
   case TOK_CHAR:
   case TOK_STRING:
   case TOK_VOID:
+  case TOK_PROC:
   case TOK_AUTO:
   case TOK_CONST:
   case TOK_MAYBE:
     return true;
   default:
-    return false;
+    return check(parser, TOK_IDENT) && token_is_word(&parser->current, "stream");
   }
 }
 
@@ -1403,8 +1475,14 @@ static bool is_type_start(Parser *parser) {
 static AstNode *declaration(Parser *parser) {
   AstNode *result = NULL;
 
-  if (match(parser, TOK_PROC)) {
-    result = proc_declaration(parser);
+  if (check(parser, TOK_PROC)) {
+    Token next = lexer_peek(parser->lexer);
+    if (next.type == TOK_IDENT) {
+      advance(parser);
+      result = proc_declaration(parser);
+    } else {
+      result = var_declaration(parser);
+    }
   } else if (match(parser, TOK_STRUCT)) {
     /* struct Name { type field; type field; ... } */
     int line = parser->previous.line;

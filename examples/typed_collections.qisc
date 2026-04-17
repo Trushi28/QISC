@@ -1,0 +1,36 @@
+proc is_even(int x) gives bool {
+    give x % 2 == 0;
+}
+
+proc label(int x) gives string {
+    give "n=" + str(x);
+}
+
+proc add(int acc, int x) gives int {
+    give acc + x;
+}
+
+proc main() gives int {
+    int[] nums = [1, 2, 3, 4];
+    int first = nums[0];
+    int[] evens = filter(nums, is_even);
+    int[] tail = skip(nums, 1);
+    int total = reduce(nums, add, 0);
+
+    stream(int) seq = stream_range(1, 5);
+    stream(string) labels_stream = stream_map(seq, label);
+    string[] labels = stream_collect(labels_stream);
+
+    string first_label =
+        stream_first(stream_take(stream_map(stream_range(1, 4), label), 1));
+
+    print(first);
+    print(len(evens));
+    print(len(tail));
+    print(total);
+    print(len(labels));
+    stdout_write(first_label);
+    print("");
+
+    give 0;
+}

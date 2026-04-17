@@ -574,6 +574,13 @@ static bool cg_ast_is_probably_callable(Codegen *cg, AstNode *node) {
 static CgStreamKind cg_stream_kind_from_type_name(const char *name) {
   if (!name)
     return CG_STREAM_NONE;
+  if (strncmp(name, "stream(", 7) == 0) {
+    size_t len = strlen(name);
+    if (len > 8 && strcmp(name + 7, "int)") == 0)
+      return CG_STREAM_INT;
+    if (len > 11 && strcmp(name + 7, "string)") == 0)
+      return CG_STREAM_STRING;
+  }
   if (strcmp(name, "int") == 0 || strcmp(name, "i64") == 0)
     return CG_STREAM_INT;
   if (strcmp(name, "string") == 0)
@@ -1902,8 +1909,16 @@ static LLVMValueRef cg_emit_strlen(Codegen *cg, LLVMValueRef val) {
 }
 
 static LLVMTypeRef cg_type_from_name(Codegen *cg, const char *name) {
+  size_t len;
   if (!name)
     return cg->i64_type;
+  len = strlen(name);
+  if (strncmp(name, "proc(", 5) == 0)
+    return cg->i8ptr_type;
+  if (strncmp(name, "stream(", 7) == 0)
+    return cg->i8ptr_type;
+  if (len >= 2 && strcmp(name + len - 2, "[]") == 0)
+    return cg->i8ptr_type;
   if (strcmp(name, "int") == 0 || strcmp(name, "i64") == 0)
     return cg->i64_type;
   if (strcmp(name, "float") == 0 || strcmp(name, "f64") == 0 ||
@@ -4331,12 +4346,30 @@ static LLVMValueRef emit_array_literal(Codegen *cg, AstNode *node) {
   return arr;
 }
 
-/* Emit array index: arr[idx] → GEP + load */
+/* Emit array index: array runtime values go through __qisc_array_get. */
 static LLVMValueRef emit_index(Codegen *cg, AstNode *node) {
   LLVMValueRef obj = emit_expr(cg, node->as.index.object);
   LLVMValueRef idx = emit_expr(cg, node->as.index.index);
   if (cg->had_error)
     return obj;
+
+  if (cg_expr_is_array_like(cg, node->as.index.object)) {
+    LLVMValueRef fn_array_get =
+        LLVMGetNamedFunction(cg->mod, "__qisc_array_get");
+    if (!fn_array_get) {
+      LLVMTypeRef fn_type = LLVMFunctionType(
+          cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type, cg->i64_type}, 2,
+          false);
+      fn_array_get = LLVMAddFunction(cg->mod, "__qisc_array_get", fn_type);
+    }
+    LLVMTypeRef fn_type = LLVMFunctionType(
+        cg->i8ptr_type, (LLVMTypeRef[]){cg->i8ptr_type, cg->i64_type}, 2,
+        false);
+    LLVMValueRef elem_ptr = LLVMBuildCall2(
+        cg->builder, fn_type, fn_array_get, (LLVMValueRef[]){obj, idx}, 2,
+        "elem_ptr");
+    return LLVMBuildLoad2(cg->builder, cg->i64_type, elem_ptr, "idx_val");
+  }
 
   LLVMValueRef ptr =
       LLVMBuildGEP2(cg->builder, cg->i64_type, obj, &idx, 1, "idx_ptr");
@@ -4719,6 +4752,28 @@ static void emit_var_decl(Codegen *cg, AstNode *node) {
         LLVMBuildAlloca(cg->builder, cg->i64_type, len_name);
     LLVMBuildStore(cg->builder, LLVMConstInt(cg->i64_type, alen, false),
                    len_alloca);
+    cg_define(cg, len_name, len_alloca, cg->i64_type);
+  }
+  else if (initializer && var_type == cg->i8ptr_type &&
+           cg_expr_is_array_like(cg, initializer)) {
+    char len_name[300];
+    LLVMValueRef len_alloca =
+        LLVMBuildAlloca(cg->builder, cg->i64_type, "__array_len");
+    LLVMValueRef fn_len = LLVMGetNamedFunction(cg->mod, "__qisc_array_len");
+    LLVMValueRef stored_array =
+        LLVMBuildLoad2(cg->builder, var_type, alloca, "arr_for_len");
+    snprintf(len_name, sizeof(len_name), "__%s__len", name);
+    if (fn_len) {
+      LLVMTypeRef len_fn_type = LLVMFunctionType(
+          cg->i64_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+      LLVMValueRef runtime_len = LLVMBuildCall2(
+          cg->builder, len_fn_type, fn_len, (LLVMValueRef[]){stored_array}, 1,
+          "arr_len");
+      LLVMBuildStore(cg->builder, runtime_len, len_alloca);
+    } else {
+      LLVMBuildStore(cg->builder, LLVMConstInt(cg->i64_type, 0, false),
+                     len_alloca);
+    }
     cg_define(cg, len_name, len_alloca, cg->i64_type);
   }
 

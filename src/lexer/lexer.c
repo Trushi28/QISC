@@ -20,6 +20,11 @@ void lexer_init(Lexer *lexer, const char *source) {
   lexer->error_message[0] = '\0';
 }
 
+Token lexer_peek(Lexer *lexer) {
+  Lexer copy = *lexer;
+  return lexer_scan_token(&copy);
+}
+
 /* Helper: check if at end */
 bool lexer_is_at_end(Lexer *lexer) { return *lexer->current == '\0'; }
 

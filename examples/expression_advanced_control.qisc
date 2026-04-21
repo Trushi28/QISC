@@ -1,0 +1,21 @@
+#pragma style:expression
+
+proc classify(int x) gives int {
+  when x
+  is 1 => give 3
+  is > 3 => give x * 2
+  else => give x + 10
+}
+
+proc accumulate() gives int {
+  auto total = 0
+  for int value in range(1, 5) => total = total + value
+  give total
+}
+
+proc recover() gives int {
+  try => fail "boom" catch err => give len(err)
+  give 0
+}
+
+proc main() gives int => classify(4) + accumulate() + recover();

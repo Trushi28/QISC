@@ -1,0 +1,12 @@
+#pragma style:expression
+
+struct Pair = int left, int right
+
+extend Pair =>
+proc total(self) gives int => self.left + self.right
+proc gap(self) gives int => self.right - self.left
+
+proc main() gives int {
+  auto pair = Pair { left: 3, right: 8 }
+  give pair.total() + pair.gap()
+}

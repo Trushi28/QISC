@@ -1,0 +1,9 @@
+#pragma style:expression
+
+proc times_two(int x) gives int => x * 2;
+
+proc add(int acc, int x) gives int => acc + x;
+
+proc total() gives int => reduce(map(range(1, 5), times_two), add, 0);
+
+proc main() gives int => total();

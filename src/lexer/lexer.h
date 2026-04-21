@@ -20,6 +20,16 @@ typedef struct {
   /* Error handling */
   bool had_error;
   char error_message[256];
+
+  /* Layout-sensitive lexing for python-style syntax */
+  bool emit_layout_tokens;
+  bool emit_newline_tokens;
+  bool line_start;
+  int indent_stack[64];
+  int indent_depth;
+  int pending_dedents;
+  int layout_indent;
+  bool layout_indent_ready;
 } Lexer;
 
 /* Initialize lexer with source code */

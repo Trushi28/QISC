@@ -1,0 +1,8 @@
+#pragma style:expression
+
+proc main() gives int {
+  auto total = 0
+  if 4 > 3 => total = 10 else => total = 1
+  while total < 14 => total = total + 2
+  give total
+}

@@ -595,7 +595,7 @@ cleanup:
   }
 }
 
-void tiny_llm_train_on_patterns(TinyLLM *llm, CodePattern *patterns,
+void tiny_llm_train_on_patterns(TinyLLM *llm, TinyLLMCodePattern *patterns,
                                 int count) {
   if (!llm || !patterns)
     return;

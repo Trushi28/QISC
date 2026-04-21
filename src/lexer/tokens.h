@@ -13,6 +13,8 @@ typedef enum {
   TOK_EOF,
   TOK_ERROR,
   TOK_NEWLINE,
+  TOK_INDENT,
+  TOK_DEDENT,
 
   /* Literals */
   TOK_IDENT,      /* identifier */

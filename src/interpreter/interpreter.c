@@ -2491,6 +2491,9 @@ static void execute(Interpreter *interp, AstNode *node) {
       AstNode *v = node->as.enum_decl.variants.items[i];
       enum_val.as.struct_val.field_names[i] = strdup(v->as.identifier.name);
       enum_val.as.struct_val.field_values[i] = value_int(i);
+      if (!env_get(interp->global, v->as.identifier.name)) {
+        env_define_const(interp->global, v->as.identifier.name, value_int(i));
+      }
     }
     env_define(interp->global, node->as.enum_decl.name, enum_val);
     break;

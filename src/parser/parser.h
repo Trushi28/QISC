@@ -8,11 +8,21 @@
 #include "../lexer/lexer.h"
 #include "ast.h"
 
+typedef enum {
+  PARSER_STYLE_DEFAULT = 0,
+  PARSER_STYLE_BRACE,
+  PARSER_STYLE_PIPELINE,
+  PARSER_STYLE_EXPRESSION,
+  PARSER_STYLE_PYTHON,
+} ParserStyle;
+
 /* Parser state */
 typedef struct {
   Lexer *lexer;
   Token current;
   Token previous;
+  ParserStyle current_style;
+  bool disallow_inline_lambda;
   bool had_error;
   bool panic_mode;
   char error_message[256];

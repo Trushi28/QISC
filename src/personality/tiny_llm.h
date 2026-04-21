@@ -26,7 +26,7 @@ typedef struct {
   const char *context;
   int severity; /* 1-10 */
   int line_number;
-} CodePattern;
+} TinyLLMCodePattern;
 
 /* N-gram entry for hash table */
 typedef struct NGramEntry {
@@ -90,7 +90,8 @@ void tiny_llm_train(TinyLLM *llm, const char *text);
  * Train on code patterns detected during compilation.
  * Builds context-specific responses.
  */
-void tiny_llm_train_on_patterns(TinyLLM *llm, CodePattern *patterns, int count);
+void tiny_llm_train_on_patterns(TinyLLM *llm, TinyLLMCodePattern *patterns,
+                                int count);
 
 /*
  * Generate text starting from a seed phrase.

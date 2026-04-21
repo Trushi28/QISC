@@ -1,0 +1,11 @@
+proc main() gives int {
+  auto total = 0;
+  for int i in range(1, 10002) {
+    if i < 10001 {
+      total = total + 1;
+    } else {
+      total = total + 5000;
+    }
+  }
+  give total;
+}

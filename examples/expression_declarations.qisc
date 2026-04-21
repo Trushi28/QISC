@@ -1,0 +1,20 @@
+#pragma style:expression
+
+module expression_declarations
+import expression_decl_math
+
+enum Mode = Add, Scale
+struct Pair = int left, int right
+
+extend Pair => proc total(self) gives int => self.left + self.right
+
+proc choose(Mode mode, Pair pair) gives int {
+  when mode
+  is Add => give pair.total()
+  else => give twice(pair.total())
+}
+
+proc main() gives int {
+  auto pair = Pair { left: 3, right: 4 }
+  give choose(Scale, pair)
+}

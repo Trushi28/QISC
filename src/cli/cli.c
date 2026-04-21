@@ -14,6 +14,7 @@
 #include "../optimization/tail_call.h"
 #include "../parser/parser.h"
 #include "../personality/personality.h"
+#include "../personality/tiny_llm.h"
 #include "../profile/profile.h"
 #include "../typechecker/typechecker.h"
 #include "../utils/utils.h"
@@ -47,6 +48,14 @@ static void qisc_profile_paths_from_source(const char *path, char *profile_path,
                                            size_t profile_path_size,
                                            char *runtime_path,
                                            size_t runtime_path_size);
+static void qisc_tiny_llm_path_from_source(const char *path, char *out,
+                                           size_t out_size);
+static int qisc_living_ir_total_mutations(const LivingIRMetrics *metrics);
+static void qisc_tiny_llm_report_living_ir(const char *path,
+                                           QiscOptions *options,
+                                           const LivingIRMetrics *metrics,
+                                           const QiscProfile *profile,
+                                           double compile_time_ms);
 static int qisc_execute_binary(const char *bin_path, const char *profile_out,
                                bool quiet);
 static int qisc_merge_runtime_profile(QiscProfile *profile,
@@ -119,6 +128,140 @@ static void qisc_profile_paths_from_source(const char *path, char *profile_path,
   if (runtime_path && runtime_path_size > 0) {
     snprintf(runtime_path, runtime_path_size, "%s.profile.runtime", path);
   }
+}
+
+static void qisc_tiny_llm_path_from_source(const char *path, char *out,
+                                           size_t out_size) {
+  if (!out || out_size == 0)
+    return;
+
+  if (!path) {
+    out[0] = '\0';
+    return;
+  }
+
+  snprintf(out, out_size, "%s.tinyllm.json", path);
+}
+
+static int qisc_living_ir_total_mutations(const LivingIRMetrics *metrics) {
+  if (!metrics)
+    return 0;
+
+  return metrics->functions_inlined + metrics->cold_blocks_outlined +
+         metrics->loops_unrolled + metrics->loops_prefetched +
+         metrics->branch_weights_applied;
+}
+
+static void qisc_tiny_llm_report_living_ir(const char *path,
+                                           QiscOptions *options,
+                                           const LivingIRMetrics *metrics,
+                                           const QiscProfile *profile,
+                                           double compile_time_ms) {
+  TinyLLM *llm;
+  char llm_path[PATH_MAX];
+  char context[1024];
+  char summary[256];
+  char *comment;
+  TinyLLMCodePattern patterns[3];
+  int pattern_count = 0;
+  int total_mutations;
+
+  if (!path || !options || !metrics)
+    return;
+  if (options->personality == QISC_PERSONALITY_OFF ||
+      options->personality == QISC_PERSONALITY_MINIMAL ||
+      options->converge) {
+    return;
+  }
+
+  qisc_tiny_llm_path_from_source(path, llm_path, sizeof(llm_path));
+  llm = tiny_llm_load(llm_path);
+  if (!llm) {
+    llm = tiny_llm_create(3);
+  }
+  if (!llm)
+    return;
+
+  total_mutations = qisc_living_ir_total_mutations(metrics);
+
+  snprintf(
+      context, sizeof(context),
+      "Living IR analyzed %d functions and %d loops. Inlined %d hot paths. "
+      "Outlined %d cold blocks. Unrolled %d loops. Added %d prefetch hints. "
+      "Applied %d branch weights. Estimated speedup %.2fx. Profile samples: "
+      "%d functions, %d branches, %d loops.",
+      metrics->functions_analyzed, metrics->loops_analyzed,
+      metrics->functions_inlined, metrics->cold_blocks_outlined,
+      metrics->loops_unrolled, metrics->loops_prefetched,
+      metrics->branch_weights_applied, metrics->estimated_speedup,
+      profile ? profile->function_count : 0, profile ? profile->branch_count : 0,
+      profile ? profile->loop_count : 0);
+
+  if (total_mutations > 0) {
+    patterns[pattern_count++] = (TinyLLMCodePattern){
+        .type = QISC_PATTERN_BRILLIANT,
+        .context = context,
+        .severity = total_mutations > 3 ? 8 : 5,
+        .line_number = 0,
+    };
+  } else {
+    patterns[pattern_count++] = (TinyLLMCodePattern){
+        .type = QISC_PATTERN_PREMATURE_OPT,
+        .context = context,
+        .severity = 4,
+        .line_number = 0,
+    };
+  }
+
+  if (metrics->branch_weights_applied > 0) {
+    patterns[pattern_count++] = (TinyLLMCodePattern){
+        .type = QISC_PATTERN_BRILLIANT,
+        .context = "Predictable branches were converted into profile-guided IR metadata.",
+        .severity = 6,
+        .line_number = 0,
+    };
+  }
+
+  if (metrics->loops_unrolled > 0 || metrics->loops_prefetched > 0) {
+    patterns[pattern_count++] = (TinyLLMCodePattern){
+        .type = QISC_PATTERN_NESTED_LOOPS,
+        .context = "Loop profile data drove unrolling and loop-shaping decisions.",
+        .severity = 3,
+        .line_number = 0,
+    };
+  }
+
+  tiny_llm_train_on_patterns(llm, patterns, pattern_count);
+
+  switch (options->personality) {
+  case QISC_PERSONALITY_FRIENDLY:
+    comment = tiny_llm_encourage(llm, total_mutations);
+    break;
+  case QISC_PERSONALITY_SNARKY:
+    comment = total_mutations > 0 ? tiny_llm_encourage(llm, total_mutations)
+                                  : tiny_llm_roast(llm, context);
+    break;
+  case QISC_PERSONALITY_SAGE:
+  case QISC_PERSONALITY_CRYPTIC:
+    comment = tiny_llm_existential(llm);
+    break;
+  case QISC_PERSONALITY_OFF:
+  case QISC_PERSONALITY_MINIMAL:
+    comment = NULL;
+    break;
+  }
+
+  snprintf(summary, sizeof(summary), "%d mutations, %.2fx estimate",
+           total_mutations, metrics->estimated_speedup);
+  if (comment && comment[0]) {
+    qisc_personality_print(options->personality, "Tiny LLM [%s]: %s\n",
+                           summary, comment);
+  }
+
+  tiny_llm_learn_outcome(llm, path, true, compile_time_ms, total_mutations);
+  tiny_llm_save(llm, llm_path);
+  free(comment);
+  tiny_llm_destroy(llm);
 }
 
 static int qisc_execute_binary(const char *bin_path, const char *profile_out,
@@ -1765,16 +1908,16 @@ QiscResult qisc_compile_file(const char *path, QiscOptions *options) {
     LivingIR *living = living_ir_create(cg.mod, &profile);
     if (living) {
       printf("\n🧬 Living IR Evolution:\n");
-      
-      /* Analyze the IR based on profile data */
-      living_ir_analyze(living);
-      
+
       /* Apply profile-driven mutations */
       living_ir_evolve(living);
-      
+
       /* Print summary of what was done */
       living_ir_print_summary(living);
-      
+      qisc_tiny_llm_report_living_ir(
+          path, options, &living->metrics, &profile,
+          ((double)(clock() - start_time) * 1000.0) / CLOCKS_PER_SEC);
+
       living_ir_destroy(living);
     }
   }
@@ -2026,7 +2169,6 @@ static QiscResult qisc_compile_file_with_hash(const char *path, QiscOptions *opt
   if (profile.function_count > 0) {
     LivingIR *living = living_ir_create(cg.mod, &profile);
     if (living) {
-      living_ir_analyze(living);
       living_ir_evolve(living);
       living_ir_destroy(living);
     }

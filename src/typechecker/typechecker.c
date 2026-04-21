@@ -612,9 +612,18 @@ static const char *infer_type(TypeChecker *tc, AstNode *node) {
     return infer_type(tc, node->as.assign.value);
   case AST_MEMBER: {
     const char *object_type = infer_type(tc, node->as.member.object);
+    if (node->as.member.object &&
+        node->as.member.object->type == AST_IDENTIFIER) {
+      char full_name[512];
+      const char *member_type;
+      snprintf(full_name, sizeof(full_name), "%s.%s",
+               node->as.member.object->as.identifier.name,
+               node->as.member.member);
+      member_type = tc_lookup(tc, full_name);
+      if (member_type)
+        return member_type;
+    }
     if (strcmp(node->as.member.member, "length") == 0)
-      return "int";
-    if (strcmp(object_type, "enum") == 0)
       return "int";
     return "any";
   }
@@ -771,7 +780,22 @@ static void collect_program_declarations(TypeChecker *tc, AstNode *program) {
       }
     } else if (decl->type == AST_ENUM) {
       if (!tc_lookup_symbol(tc, decl->as.enum_decl.name)) {
-        tc_define(tc, decl->as.enum_decl.name, "enum", true);
+        tc_define(tc, decl->as.enum_decl.name, decl->as.enum_decl.name, true);
+      }
+      for (int v = 0; v < decl->as.enum_decl.variants.count; v++) {
+        AstNode *variant = decl->as.enum_decl.variants.items[v];
+        if (variant && variant->type == AST_IDENTIFIER) {
+          char full_name[512];
+          snprintf(full_name, sizeof(full_name), "%s.%s",
+                   decl->as.enum_decl.name, variant->as.identifier.name);
+          if (!tc_lookup_symbol(tc, full_name)) {
+            tc_define(tc, full_name, decl->as.enum_decl.name, true);
+          }
+          if (!tc_lookup_symbol(tc, variant->as.identifier.name)) {
+            tc_define(tc, variant->as.identifier.name,
+                      decl->as.enum_decl.name, true);
+          }
+        }
       }
     }
   }

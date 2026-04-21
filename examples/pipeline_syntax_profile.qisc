@@ -1,0 +1,17 @@
+#pragma style:pipeline
+#pragma syntax_profile:
+    pipelines: 70%
+    functional: 20%
+    imperative: 10%
+
+proc main() gives int {
+    auto total = stream_range(1, 5, 1)
+        |> stream_map(x => x * 3)
+        |> stream_reduce((acc, x) => {
+            give acc + x;
+        }, 0);
+
+    stdout_write("total=");
+    print(total);
+    give 0;
+}

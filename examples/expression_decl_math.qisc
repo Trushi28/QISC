@@ -1,0 +1,5 @@
+#pragma style:expression
+
+module expression_decl_math
+
+proc twice(int x) gives int => x * 2;

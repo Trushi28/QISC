@@ -72,6 +72,10 @@ static int find_call_sites(LLVMModuleRef module, LLVMValueRef callee,
          func = LLVMGetNextFunction(func)) {
         
         if (is_declaration(func)) continue;
+        if (LLVMGetNamedFunction(module, "__qisc_user_main") &&
+            strcmp(get_function_name(func), "main") == 0) {
+            continue;
+        }
         if (func == callee) continue;
         
         for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(func);
@@ -102,6 +106,388 @@ static char *create_cold_function_name(const char *original, int block_id) {
     char *name = malloc(len);
     snprintf(name, len, "%s.__cold_%d", original, block_id);
     return name;
+}
+
+static const char *profile_function_name(const char *func_name) {
+    if (!func_name) return NULL;
+    if (strcmp(func_name, "__qisc_user_main") == 0) {
+        return "main";
+    }
+    return func_name;
+}
+
+static bool is_wrapper_main(LivingIR *ir, LLVMValueRef func) {
+    const char *func_name;
+
+    if (!ir || !func) return false;
+
+    func_name = get_function_name(func);
+    if (!func_name || strcmp(func_name, "main") != 0) return false;
+
+    return LLVMGetNamedFunction(ir->module, "__qisc_user_main") != NULL;
+}
+
+static bool should_skip_function(LivingIR *ir, LLVMValueRef func) {
+    if (!func) return true;
+    if (is_declaration(func)) return true;
+    if (is_wrapper_main(ir, func)) return true;
+    return false;
+}
+
+typedef struct {
+    LLVMValueRef from;
+    LLVMValueRef to;
+} ValueRemap;
+
+#define LIVING_IR_MAX_OUTLINE_VALUES 128
+#define LIVING_IR_MAX_OUTLINE_INSTS 256
+
+static int get_qisc_line_metadata(LivingIR *ir, LLVMValueRef inst);
+
+static void add_enum_attr_if_supported(LivingIR *ir, LLVMValueRef func,
+                                       const char *name) {
+    unsigned kind;
+
+    if (!ir || !func || !name) return;
+
+    kind = LLVMGetEnumAttributeKindForName(name, strlen(name));
+    if (kind == 0) return;
+
+    LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex,
+        LLVMCreateEnumAttribute(ir->context, kind, 0));
+}
+
+static void add_string_attr(LivingIR *ir, LLVMValueRef func,
+                            const char *key, const char *value) {
+    if (!ir || !func || !key || !value) return;
+
+    LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex,
+        LLVMCreateStringAttribute(ir->context,
+            key, strlen(key),
+            value, strlen(value)));
+}
+
+static LLVMValueRef remap_lookup(ValueRemap *items, int count, LLVMValueRef from) {
+    for (int i = 0; i < count; i++) {
+        if (items[i].from == from) return items[i].to;
+    }
+    return NULL;
+}
+
+static bool block_value_used_outside(LLVMValueRef value, LLVMBasicBlockRef block) {
+    LLVMUseRef use;
+
+    if (!value || !block) return false;
+
+    for (use = LLVMGetFirstUse(value); use != NULL; use = LLVMGetNextUse(use)) {
+        LLVMValueRef user = LLVMGetUser(use);
+        if (!user) continue;
+        if (!LLVMIsAInstruction(user)) continue;
+        if (LLVMGetInstructionParent(user) != block) return true;
+    }
+
+    return false;
+}
+
+static bool successor_has_phi_from_block(LLVMBasicBlockRef block,
+                                         LLVMBasicBlockRef successor) {
+    for (LLVMValueRef inst = LLVMGetFirstInstruction(successor);
+         inst != NULL && LLVMIsAPHINode(inst);
+         inst = LLVMGetNextInstruction(inst)) {
+        int incoming = LLVMCountIncoming(inst);
+        for (int i = 0; i < incoming; i++) {
+            if (LLVMGetIncomingBlock(inst, i) == block) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static double estimate_block_frequency(LivingIR *ir, const char *func_name,
+                                       LLVMBasicBlockRef bb,
+                                       ProfileFunction *pf,
+                                       int total_blocks) {
+    double freq = total_blocks > 0 ? 1.0 / total_blocks : 1.0;
+    bool used_profile = false;
+    LLVMValueRef func;
+
+    if (!ir || !func_name || !bb || !pf) return freq;
+
+    func = LLVMGetBasicBlockParent(bb);
+    for (LLVMBasicBlockRef pred = LLVMGetFirstBasicBlock(func);
+         pred != NULL;
+         pred = LLVMGetNextBasicBlock(pred)) {
+        LLVMValueRef term = LLVMGetBasicBlockTerminator(pred);
+        int line;
+        char location[256];
+        ProfileBranch *branch;
+        double edge_prob;
+
+        if (!term || LLVMGetInstructionOpcode(term) != LLVMBr ||
+            LLVMGetNumSuccessors(term) != 2) {
+            continue;
+        }
+
+        line = get_qisc_line_metadata(ir, term);
+        if (line <= 0) continue;
+
+        snprintf(location, sizeof(location), "%s:%d", func_name, line);
+        branch = profile_get_branch(ir->profile, location);
+        if (!branch) continue;
+
+        /*
+         * In this pipeline, the recorded "taken" branch maps to successor 1
+         * and the recorded "not taken" branch maps to successor 0.
+         */
+        if (LLVMGetSuccessor(term, 0) == bb) {
+            edge_prob = 1.0 - branch->taken_ratio;
+        } else if (LLVMGetSuccessor(term, 1) == bb) {
+            edge_prob = branch->taken_ratio;
+        } else {
+            continue;
+        }
+
+        freq = edge_prob;
+        used_profile = true;
+        if (branch->is_predictable) break;
+    }
+
+    if (!used_profile && bb == LLVMGetEntryBasicBlock(func)) {
+        return 1.0;
+    }
+
+    return freq;
+}
+
+static bool is_simple_outline_candidate(ColdBlock *cold, LLVMBasicBlockRef *successor) {
+    LLVMBasicBlockRef succ = NULL;
+    LLVMValueRef term;
+
+    if (!cold || !cold->can_outline || !cold->block) return false;
+
+    term = LLVMGetBasicBlockTerminator(cold->block);
+    if (!term || LLVMGetInstructionOpcode(term) != LLVMBr ||
+        LLVMGetNumSuccessors(term) != 1) {
+        return false;
+    }
+
+    succ = LLVMGetSuccessor(term, 0);
+    if (successor) *successor = succ;
+
+    if (successor_has_phi_from_block(cold->block, succ)) return false;
+
+    for (LLVMValueRef inst = LLVMGetFirstInstruction(cold->block);
+         inst != NULL;
+         inst = LLVMGetNextInstruction(inst)) {
+        if (inst == term) break;
+        if (LLVMIsAPHINode(inst)) return false;
+        if (LLVMGetTypeKind(LLVMTypeOf(inst)) != LLVMVoidTypeKind &&
+            block_value_used_outside(inst, cold->block)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static int collect_outline_inputs(ColdBlock *cold, LLVMValueRef *inputs,
+                                  int max_inputs) {
+    ValueRemap locals[LIVING_IR_MAX_OUTLINE_INSTS];
+    int local_count = 0;
+    int input_count = 0;
+    LLVMValueRef term;
+
+    if (!cold || !cold->block) return 0;
+
+    term = LLVMGetBasicBlockTerminator(cold->block);
+    for (LLVMValueRef inst = LLVMGetFirstInstruction(cold->block);
+         inst != NULL && inst != term;
+         inst = LLVMGetNextInstruction(inst)) {
+        if (local_count < LIVING_IR_MAX_OUTLINE_INSTS) {
+            locals[local_count].from = inst;
+            locals[local_count].to = NULL;
+            local_count++;
+        }
+    }
+
+    for (LLVMValueRef inst = LLVMGetFirstInstruction(cold->block);
+         inst != NULL && inst != term;
+         inst = LLVMGetNextInstruction(inst)) {
+        int operands = LLVMGetNumOperands(inst);
+        for (int i = 0; i < operands; i++) {
+            LLVMValueRef op = LLVMGetOperand(inst, i);
+            bool local = false;
+            bool seen = false;
+
+            if (!op || LLVMValueIsBasicBlock(op) || LLVMIsAConstant(op) ||
+                LLVMIsAFunction(op) || LLVMIsAGlobalValue(op)) {
+                continue;
+            }
+
+            for (int j = 0; j < local_count; j++) {
+                if (locals[j].from == op) {
+                    local = true;
+                    break;
+                }
+            }
+            if (local) continue;
+
+            for (int j = 0; j < input_count; j++) {
+                if (inputs[j] == op) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen || input_count >= max_inputs) continue;
+
+            inputs[input_count++] = op;
+        }
+    }
+
+    return input_count;
+}
+
+static char *create_unique_cold_function_name(LivingIR *ir,
+                                              const char *original,
+                                              int block_id) {
+    char *name;
+    int suffix = block_id;
+
+    if (!ir || !original) return NULL;
+
+    name = create_cold_function_name(original, suffix);
+    while (name && LLVMGetNamedFunction(ir->module, name) != NULL) {
+        free(name);
+        suffix++;
+        name = create_cold_function_name(original, suffix);
+    }
+
+    return name;
+}
+
+static double sample_confidence(uint64_t samples, uint64_t high_water) {
+    if (high_water == 0) high_water = 1;
+    if (samples >= high_water) return 1.0;
+    return (double)samples / (double)high_water;
+}
+
+static double profile_generation_confidence(LivingIR *ir) {
+    if (!ir || !ir->profile) return 0.0;
+    if (ir->profile->has_converged) return 1.0;
+    if (ir->profile->run_count >= 3) return 0.85;
+    if (ir->profile->run_count == 2) return 0.65;
+    if (ir->profile->run_count == 1) return 0.40;
+    return 0.0;
+}
+
+static double function_time_percentage(LivingIR *ir, ProfileFunction *pf) {
+    double total_time;
+    double self_time;
+
+    if (!ir || !pf) return 0.0;
+
+    total_time = (double)(ir->profile->total_execution_time_us > 0 ?
+                          ir->profile->total_execution_time_us : 1);
+    self_time = pf->avg_time_us * pf->call_count;
+    return (self_time / total_time) * 100.0;
+}
+
+static uint64_t total_profile_calls(LivingIR *ir) {
+    uint64_t total = 0;
+
+    if (!ir || !ir->profile) return 0;
+
+    for (int i = 0; i < ir->profile->function_count; i++) {
+        total += ir->profile->functions[i].call_count;
+    }
+
+    return total;
+}
+
+static double branch_predictability_for_function(LivingIR *ir,
+                                                 const char *func_name) {
+    double total = 0.0;
+    int count = 0;
+
+    if (!ir || !func_name || !ir->profile) return 0.5;
+
+    for (int i = 0; i < ir->profile->branch_count; i++) {
+        ProfileBranch *br = &ir->profile->branches[i];
+        size_t len;
+
+        if (!br->location) continue;
+        len = strlen(func_name);
+        if (strncmp(br->location, func_name, len) != 0 || br->location[len] != ':') {
+            continue;
+        }
+
+        total += br->is_predictable ? 0.98 :
+                 (br->taken_ratio > 0.5 ? br->taken_ratio : 1.0 - br->taken_ratio);
+        count++;
+    }
+
+    return count > 0 ? total / count : 0.5;
+}
+
+static void specialize_function_from_profile(LivingIR *ir, LLVMValueRef func,
+                                             ProfileFunction *pf) {
+    IRMetadata meta;
+    double time_pct;
+    int opt_level;
+    char unroll_hint[16];
+
+    if (!ir || !func || !pf) return;
+
+    ir_metadata_init(&meta);
+    time_pct = function_time_percentage(ir, pf);
+    ir_metadata_from_profile(&meta, pf->call_count, total_profile_calls(ir), time_pct);
+    meta.branch_predictability =
+        branch_predictability_for_function(ir, profile_function_name(pf->name));
+    if (profile_generation_confidence(ir) > meta.confidence) {
+        meta.confidence = profile_generation_confidence(ir);
+    }
+
+    if (ir->profile && ir->profile->cache_hit_ratio > 0.90) {
+        meta.memory_behavior = MEMORY_SEQUENTIAL;
+    } else if (ir->profile && ir->profile->cache_hit_ratio > 0.70) {
+        meta.memory_behavior = MEMORY_LOCALIZED;
+    }
+
+    ir_metadata_compute_hints(&meta);
+    if (meta.confidence < ir->config.min_confidence) {
+        ir->metrics.mutations_rejected++;
+        return;
+    }
+
+    opt_level = profile_get_opt_level(ir->profile, profile_function_name(pf->name));
+    if (pf->is_hot || meta.hints.is_hot_path || opt_level >= 3) {
+        add_enum_attr_if_supported(ir, func, "hot");
+        add_enum_attr_if_supported(ir, func, "inlinehint");
+        LLVMSetSection(func, ".text.hot");
+        ir->metrics.hot_functions_specialized++;
+    } else if (pf->is_cold || meta.hints.is_cold_path || opt_level <= 1) {
+        add_enum_attr_if_supported(ir, func, "cold");
+        add_enum_attr_if_supported(ir, func, "minsize");
+        add_enum_attr_if_supported(ir, func, "optsize");
+        LLVMSetSection(func, ".text.unlikely");
+        ir->metrics.cold_functions_specialized++;
+    }
+
+    if (meta.hints.should_vectorize) {
+        add_string_attr(ir, func, "qisc.vectorize", "true");
+    }
+    if (meta.hints.should_parallelize) {
+        add_string_attr(ir, func, "qisc.parallelize", "true");
+    }
+    if (meta.hints.should_unroll && meta.hints.unroll_factor > 1) {
+        snprintf(unroll_hint, sizeof(unroll_hint), "%d", meta.hints.unroll_factor);
+        add_string_attr(ir, func, "qisc.loop_unroll", unroll_hint);
+    }
+    if (pf->should_inline || meta.hints.should_inline) {
+        add_enum_attr_if_supported(ir, func, "inlinehint");
+    }
 }
 
 static void apply_loop_unroll_metadata(LivingIR *ir, LLVMBasicBlockRef header,
@@ -141,6 +527,114 @@ static void apply_loop_unroll_metadata(LivingIR *ir, LLVMBasicBlockRef header,
     LLVMSetMetadata(terminator, loop_kind, md_val);
 }
 
+static void apply_branch_weight_metadata(LivingIR *ir, LLVMValueRef branch_inst,
+                                         unsigned true_weight,
+                                         unsigned false_weight) {
+    unsigned prof_kind;
+    LLVMMetadataRef weights[3];
+    LLVMMetadataRef md;
+    LLVMValueRef md_val;
+
+    if (!ir || !branch_inst) return;
+
+    prof_kind = LLVMGetMDKindIDInContext(ir->context, "prof", 4);
+    weights[0] = LLVMMDStringInContext2(ir->context, "branch_weights", 14);
+    weights[1] = LLVMValueAsMetadata(
+        LLVMConstInt(LLVMInt32TypeInContext(ir->context),
+                     true_weight ? true_weight : 1, false));
+    weights[2] = LLVMValueAsMetadata(
+        LLVMConstInt(LLVMInt32TypeInContext(ir->context),
+                     false_weight ? false_weight : 1, false));
+    md = LLVMMDNodeInContext2(ir->context, weights, 3);
+    md_val = LLVMMetadataAsValue(ir->context, md);
+    LLVMSetMetadata(branch_inst, prof_kind, md_val);
+}
+
+static int get_qisc_line_metadata(LivingIR *ir, LLVMValueRef inst) {
+    unsigned line_kind;
+    LLVMValueRef md;
+    unsigned count;
+    LLVMValueRef operands[4];
+
+    if (!ir || !inst || !LLVMHasMetadata(inst)) return -1;
+
+    line_kind = LLVMGetMDKindIDInContext(ir->context, "qisc.line", 9);
+    md = LLVMGetMetadata(inst, line_kind);
+    if (!md) return -1;
+
+    count = LLVMGetMDNodeNumOperands(md);
+    if (count == 0 || count > 4) return -1;
+
+    memset(operands, 0, sizeof(operands));
+    LLVMGetMDNodeOperands(md, operands);
+    if (!operands[0] || !LLVMIsAConstantInt(operands[0])) return -1;
+
+    return (int)LLVMConstIntGetZExtValue(operands[0]);
+}
+
+static LLVMValueRef find_profile_function(LivingIR *ir, const char *profile_name) {
+    LLVMValueRef user_main;
+
+    if (!ir || !profile_name) return NULL;
+
+    if (strcmp(profile_name, "main") == 0) {
+        user_main = LLVMGetNamedFunction(ir->module, "__qisc_user_main");
+        if (user_main && !is_declaration(user_main)) {
+            return user_main;
+        }
+    }
+
+    for (LLVMValueRef func = LLVMGetFirstFunction(ir->module);
+         func != NULL;
+         func = LLVMGetNextFunction(func)) {
+        if (should_skip_function(ir, func)) continue;
+        const char *func_name = get_function_name(func);
+        if (func_name && strcmp(profile_function_name(func_name), profile_name) == 0) {
+            return func;
+        }
+    }
+
+    return NULL;
+}
+
+static LLVMBasicBlockRef find_loop_header_for_location(LivingIR *ir,
+                                                       const char *location) {
+    char func_name[256];
+    char *colon;
+    int line;
+    LLVMValueRef func;
+
+    if (!ir || !location) return NULL;
+
+    strncpy(func_name, location, sizeof(func_name) - 1);
+    func_name[sizeof(func_name) - 1] = '\0';
+    colon = strrchr(func_name, ':');
+    if (!colon) return NULL;
+
+    *colon = '\0';
+    line = atoi(colon + 1);
+    if (line <= 0) return NULL;
+
+    func = find_profile_function(ir, func_name);
+    if (!func) return NULL;
+
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(func);
+         bb != NULL;
+         bb = LLVMGetNextBasicBlock(bb)) {
+        LLVMValueRef term = LLVMGetBasicBlockTerminator(bb);
+        if (!term) continue;
+        if (LLVMGetInstructionOpcode(term) != LLVMBr ||
+            LLVMGetNumSuccessors(term) != 2) {
+            continue;
+        }
+        if (get_qisc_line_metadata(ir, term) == line) {
+            return bb;
+        }
+    }
+
+    return NULL;
+}
+
 /* ======== Creation and Destruction ======== */
 
 LivingIR *living_ir_create(LLVMModuleRef module, QiscProfile *profile) {
@@ -169,7 +663,7 @@ LivingIR *living_ir_create_with_metadata(LLVMModuleRef module,
     ir->config.enable_block_reorder = true;
     ir->config.aggressive_mode = false;
     ir->config.max_inline_depth = 3;
-    ir->config.min_confidence = 0.5;
+    ir->config.min_confidence = 0.25;
     
     /* Initialize metrics */
     memset(&ir->metrics, 0, sizeof(LivingIRMetrics));
@@ -219,7 +713,8 @@ void living_ir_set_min_confidence(LivingIR *ir, double confidence) {
 double living_ir_calc_hotness(LivingIR *ir, const char *func_name) {
     if (!ir || !func_name) return 0.0;
     
-    ProfileFunction *pf = profile_get_function(ir->profile, func_name);
+    ProfileFunction *pf = profile_get_function(ir->profile,
+                                               profile_function_name(func_name));
     if (!pf) return 0.0;
     
     /* Hotness = normalized call count * time percentage */
@@ -245,8 +740,10 @@ bool living_ir_should_inline(LivingIR *ir, const char *caller,
     }
     
     /* Check if callee is in profile */
-    ProfileFunction *pf_callee = profile_get_function(ir->profile, callee);
-    ProfileFunction *pf_caller = profile_get_function(ir->profile, caller);
+    ProfileFunction *pf_callee = profile_get_function(
+        ir->profile, profile_function_name(callee));
+    ProfileFunction *pf_caller = profile_get_function(
+        ir->profile, profile_function_name(caller));
     
     /* Both caller and callee should be hot */
     if (!pf_callee || !pf_caller) return false;
@@ -271,10 +768,11 @@ static void analyze_inlining(LivingIR *ir) {
          func != NULL;
          func = LLVMGetNextFunction(func)) {
         
-        if (is_declaration(func)) continue;
+        if (should_skip_function(ir, func)) continue;
         
         const char *func_name = get_function_name(func);
-        ProfileFunction *pf = profile_get_function(ir->profile, func_name);
+        ProfileFunction *pf = profile_get_function(
+            ir->profile, profile_function_name(func_name));
         
         if (!pf) continue;
         if (!pf->is_hot && !pf->should_inline) continue;
@@ -287,7 +785,8 @@ static void analyze_inlining(LivingIR *ir) {
         
         for (int i = 0; i < caller_count; i++) {
             const char *caller_name = get_function_name(callers[i]);
-            ProfileFunction *pf_caller = profile_get_function(ir->profile, caller_name);
+            ProfileFunction *pf_caller = profile_get_function(
+                ir->profile, profile_function_name(caller_name));
             
             if (!pf_caller) continue;
             
@@ -352,16 +851,16 @@ bool living_ir_is_cold_block(LivingIR *ir, LLVMBasicBlockRef block,
 /* Analyze for cold block outlining */
 static void analyze_cold_blocks(LivingIR *ir) {
     ir->cold_block_count = 0;
-    int block_id = 0;
     
     for (LLVMValueRef func = LLVMGetFirstFunction(ir->module);
          func != NULL;
          func = LLVMGetNextFunction(func)) {
         
-        if (is_declaration(func)) continue;
+        if (should_skip_function(ir, func)) continue;
         
         const char *func_name = get_function_name(func);
-        ProfileFunction *pf = profile_get_function(ir->profile, func_name);
+        ProfileFunction *pf = profile_get_function(
+            ir->profile, profile_function_name(func_name));
         
         /* Only analyze hot functions - cold functions don't need outlining */
         if (!pf || !pf->is_hot) continue;
@@ -372,24 +871,12 @@ static void analyze_cold_blocks(LivingIR *ir) {
              bb != NULL;
              bb = LLVMGetNextBasicBlock(bb)) {
             
-            /* Estimate block frequency from profile data */
-            double block_freq = 1.0 / total_blocks;  /* Default: uniform */
-            
-            /* Try to get actual frequency from branch profile */
-            const char *bb_name = LLVMGetBasicBlockName(bb);
-            if (bb_name && ir->profile) {
-                /* Create location string: function_name:block_name */
-                char location[256];
-                snprintf(location, sizeof(location), "%s:%s", func_name, bb_name);
-                
-                ProfileBranch *branch = profile_get_branch(ir->profile, location);
-                if (branch) {
-                    uint64_t total = branch->taken_count + branch->not_taken_count;
-                    if (total > 0) {
-                        /* Calculate frequency relative to function calls */
-                        block_freq = (double)total / (double)pf->call_count;
-                    }
-                }
+            double block_freq = estimate_block_frequency(
+                ir, profile_function_name(func_name), bb, pf, total_blocks);
+            double confidence = profile_generation_confidence(ir);
+            double call_confidence = sample_confidence(pf->call_count, 16);
+            if (call_confidence > confidence) {
+                confidence = call_confidence;
             }
             
             if (ir->cold_block_count >= LIVING_IR_MAX_COLD_BLOCKS) break;
@@ -409,12 +896,13 @@ static void analyze_cold_blocks(LivingIR *ir) {
             cold->instruction_count = inst_count;
             
             /* Determine if we can outline */
-            if (block_freq >= LIVING_IR_COLD_FREQ_THRESHOLD) {
+            if (confidence < ir->config.min_confidence) {
+                cold->can_outline = false;
+                cold->reason = "profile confidence too low";
+                ir->metrics.mutations_rejected++;
+            } else if (!living_ir_is_cold_block(ir, bb, block_freq)) {
                 cold->can_outline = false;
                 cold->reason = "block not cold enough";
-            } else if (bb == LLVMGetEntryBasicBlock(func)) {
-                cold->can_outline = false;
-                cold->reason = "cannot outline entry block";
             } else if (inst_count < 3) {
                 cold->can_outline = false;
                 cold->reason = "block too small to outline";
@@ -425,7 +913,6 @@ static void analyze_cold_blocks(LivingIR *ir) {
             }
             
             ir->cold_block_count++;
-            block_id++;
         }
     }
 }
@@ -461,32 +948,20 @@ static void analyze_loops(LivingIR *ir) {
     /* Iterate through profile loops */
     for (int i = 0; i < ir->profile->loop_count; i++) {
         ProfileLoop *pl = &ir->profile->loops[i];
+        double confidence;
         
         if (ir->loop_mutation_count >= LIVING_IR_MAX_LOOP_MUTATIONS) break;
+        confidence = sample_confidence(pl->invocation_count, 4);
+        if (confidence < ir->config.min_confidence) {
+            ir->metrics.mutations_rejected++;
+            continue;
+        }
         
         LoopMutation *mutation = &ir->loop_mutations[ir->loop_mutation_count];
         mutation->location = pl->location;
         
         /* Map location to LLVM block by searching module functions */
-        mutation->header = NULL;
-        if (pl->location && ir->module) {
-            /* Parse location format: "function:line" */
-            char func_name[256];
-            strncpy(func_name, pl->location, sizeof(func_name) - 1);
-            char *colon = strchr(func_name, ':');
-            if (colon) *colon = '\0';
-            
-            LLVMValueRef func = LLVMGetNamedFunction(ir->module, func_name);
-            if (func && !is_declaration(func)) {
-                /* Find block containing loop header (first block after entry is common) */
-                LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(func);
-                if (bb) {
-                    /* Skip entry block, loop headers are typically second+ block */
-                    LLVMBasicBlockRef next = LLVMGetNextBasicBlock(bb);
-                    mutation->header = next ? next : bb;
-                }
-            }
-        }
+        mutation->header = find_loop_header_for_location(ir, pl->location);
         
         mutation->avg_iterations = pl->avg_iterations;
         
@@ -601,15 +1076,136 @@ void living_ir_outline_cold_paths(LivingIR *ir) {
      * We use LLVM attributes to mark functions as cold.
      */
     
-    /* Mark cold blocks with cold attribute on their parent functions */
     for (int i = 0; i < ir->cold_block_count; i++) {
         ColdBlock *cold = &ir->cold_blocks[i];
+        LLVMBasicBlockRef successor = NULL;
+        LLVMValueRef parent;
+        LLVMTypeRef input_types[LIVING_IR_MAX_OUTLINE_VALUES];
+        LLVMValueRef inputs[LIVING_IR_MAX_OUTLINE_VALUES];
+        LLVMValueRef params[LIVING_IR_MAX_OUTLINE_VALUES];
+        ValueRemap remap[LIVING_IR_MAX_OUTLINE_VALUES + LIVING_IR_MAX_OUTLINE_INSTS];
+        LLVMValueRef to_erase[LIVING_IR_MAX_OUTLINE_INSTS];
+        int remap_count = 0;
+        int erase_count = 0;
+        int input_count;
+        char *helper_name;
+        LLVMTypeRef helper_type;
+        LLVMValueRef helper;
+        LLVMBasicBlockRef helper_entry;
+        LLVMBuilderRef builder;
         
         if (!cold->can_outline) continue;
-        
-        /* In a full implementation, we would extract to separate function.
-         * For now, mark parent function with cold hints via attributes. */
+
+        if (!is_simple_outline_candidate(cold, &successor)) {
+            cold->reason = "outline requires unsupported control/data flow";
+            ir->metrics.mutations_rejected++;
+            continue;
+        }
+
+        parent = LLVMGetBasicBlockParent(cold->block);
+        if (!parent || !successor) {
+            cold->reason = "outline missing parent or successor";
+            ir->metrics.mutations_rejected++;
+            continue;
+        }
+
+        input_count = collect_outline_inputs(cold, inputs, LIVING_IR_MAX_OUTLINE_VALUES);
+        helper_name = create_unique_cold_function_name(ir, cold->function_name, i);
+        if (!helper_name) {
+            cold->reason = "failed to allocate cold helper name";
+            ir->metrics.mutations_rejected++;
+            continue;
+        }
+
+        for (int j = 0; j < input_count; j++) {
+            input_types[j] = LLVMTypeOf(inputs[j]);
+        }
+
+        helper_type = LLVMFunctionType(LLVMVoidTypeInContext(ir->context),
+                                       input_types, input_count, false);
+        helper = LLVMAddFunction(ir->module, helper_name, helper_type);
+        free(helper_name);
+        if (!helper) {
+            cold->reason = "failed to create cold helper";
+            ir->metrics.mutations_rejected++;
+            continue;
+        }
+
+        helper_entry = LLVMAppendBasicBlockInContext(ir->context, helper, "entry");
+        builder = LLVMCreateBuilderInContext(ir->context);
+        LLVMPositionBuilderAtEnd(builder, helper_entry);
+
+        add_enum_attr_if_supported(ir, helper, "cold");
+        add_enum_attr_if_supported(ir, helper, "minsize");
+        add_enum_attr_if_supported(ir, helper, "optsize");
+        LLVMSetLinkage(helper, LLVMInternalLinkage);
+        LLVMSetSection(helper, ".text.unlikely");
+
+        for (int j = 0; j < input_count; j++) {
+            params[j] = LLVMGetParam(helper, j);
+            remap[remap_count].from = inputs[j];
+            remap[remap_count].to = params[j];
+            remap_count++;
+        }
+
+        for (LLVMValueRef inst = LLVMGetFirstInstruction(cold->block);
+             inst != NULL;
+             inst = LLVMGetNextInstruction(inst)) {
+            LLVMValueRef next = LLVMGetNextInstruction(inst);
+            LLVMValueRef clone;
+            int operands;
+
+            if (inst == LLVMGetBasicBlockTerminator(cold->block)) break;
+            if (erase_count >= LIVING_IR_MAX_OUTLINE_INSTS ||
+                remap_count >= LIVING_IR_MAX_OUTLINE_VALUES + LIVING_IR_MAX_OUTLINE_INSTS) {
+                break;
+            }
+
+            clone = LLVMInstructionClone(inst);
+            if (!clone) continue;
+
+            operands = LLVMGetNumOperands(clone);
+            for (int op = 0; op < operands; op++) {
+                LLVMValueRef value = LLVMGetOperand(clone, op);
+                LLVMValueRef mapped = remap_lookup(remap, remap_count, value);
+                if (mapped) {
+                    LLVMSetOperand(clone, op, mapped);
+                }
+            }
+
+            LLVMInsertIntoBuilder(builder, clone);
+            remap[remap_count].from = inst;
+            remap[remap_count].to = clone;
+            remap_count++;
+            to_erase[erase_count++] = inst;
+
+            if (!next) break;
+        }
+
+        LLVMBuildRetVoid(builder);
+        LLVMDisposeBuilder(builder);
+
+        LLVMValueRef old_term = LLVMGetBasicBlockTerminator(cold->block);
+        if (old_term && erase_count < LIVING_IR_MAX_OUTLINE_INSTS) {
+            to_erase[erase_count++] = old_term;
+        }
+
+        for (int j = 0; j < erase_count; j++) {
+            LLVMInstructionEraseFromParent(to_erase[j]);
+        }
+
+        builder = LLVMCreateBuilderInContext(ir->context);
+        LLVMPositionBuilderAtEnd(builder, cold->block);
+        if (input_count > 0) {
+            LLVMBuildCall2(builder, helper_type, helper, inputs, input_count, "");
+        } else {
+            LLVMBuildCall2(builder, helper_type, helper, NULL, 0, "");
+        }
+        LLVMBuildBr(builder, successor);
+        LLVMDisposeBuilder(builder);
+
         ir->metrics.cold_blocks_outlined++;
+        ir->metrics.code_size_delta += (uint64_t)cold->instruction_count;
     }
     
     /* Estimate speedup from outlining (better icache) */
@@ -624,6 +1220,7 @@ void living_ir_restructure_loops(LivingIR *ir) {
      * deprecated pass manager functions */
     for (int i = 0; i < ir->loop_mutation_count; i++) {
         LoopMutation *mutation = &ir->loop_mutations[i];
+        bool changed = false;
         
         /*
          * LLVM's loop unroll pass will use pragma hints we set.
@@ -633,17 +1230,21 @@ void living_ir_restructure_loops(LivingIR *ir) {
          * 3. Add prefetch intrinsics for large loops
          */
         
-        if (mutation->suggested_unroll > 1) {
+        if (mutation->header && mutation->suggested_unroll > 1) {
             apply_loop_unroll_metadata(ir, mutation->header,
                                        mutation->suggested_unroll);
             ir->metrics.loops_unrolled++;
+            changed = true;
         }
         
         if (mutation->should_prefetch) {
             ir->metrics.loops_prefetched++;
+            changed = true;
         }
-        
-        ir->metrics.loops_restructured++;
+
+        if (changed) {
+            ir->metrics.loops_restructured++;
+        }
     }
     
     /* Estimate speedup from loop optimization */
@@ -671,10 +1272,11 @@ void living_ir_reorder_blocks(LivingIR *ir) {
          func != NULL;
          func = LLVMGetNextFunction(func)) {
         
-        if (is_declaration(func)) continue;
+        if (should_skip_function(ir, func)) continue;
         
         const char *func_name = get_function_name(func);
-        ProfileFunction *pf = profile_get_function(ir->profile, func_name);
+        ProfileFunction *pf = profile_get_function(
+            ir->profile, profile_function_name(func_name));
         
         /* Only optimize hot functions */
         if (!pf || !pf->is_hot) continue;
@@ -695,7 +1297,8 @@ void living_ir_reorder_blocks(LivingIR *ir) {
             order->execution_freq = 1.0;  /* Default */
             if (bb_name && ir->profile) {
                 char location[256];
-                snprintf(location, sizeof(location), "%s:%s", func_name, bb_name);
+                snprintf(location, sizeof(location), "%s:%s",
+                         profile_function_name(func_name), bb_name);
                 ProfileBranch *branch = profile_get_branch(ir->profile, location);
                 if (branch) {
                     uint64_t total = branch->taken_count + branch->not_taken_count;
@@ -714,6 +1317,49 @@ void living_ir_reorder_blocks(LivingIR *ir) {
         }
         
         ir->metrics.blocks_reordered += block_idx;
+
+        for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(func);
+             bb != NULL;
+             bb = LLVMGetNextBasicBlock(bb)) {
+            LLVMValueRef term = LLVMGetBasicBlockTerminator(bb);
+            int line;
+            char location[256];
+            ProfileBranch *branch;
+            uint64_t total;
+            double taken_ratio;
+            unsigned true_weight;
+            unsigned false_weight;
+
+            if (!term) continue;
+            if (LLVMGetInstructionOpcode(term) != LLVMBr ||
+                LLVMGetNumSuccessors(term) != 2) {
+                continue;
+            }
+
+            line = get_qisc_line_metadata(ir, term);
+            if (line <= 0) continue;
+
+            snprintf(location, sizeof(location), "%s:%d",
+                     profile_function_name(func_name), line);
+            branch = profile_get_branch(ir->profile, location);
+            if (!branch || !branch->is_predictable) continue;
+
+            total = branch->taken_count + branch->not_taken_count;
+            if (total == 0) continue;
+            if (sample_confidence(total, 16) < ir->config.min_confidence) {
+                ir->metrics.mutations_rejected++;
+                continue;
+            }
+
+            taken_ratio = branch->taken_ratio;
+            true_weight = (unsigned)(taken_ratio * 10000.0);
+            false_weight = (unsigned)((1.0 - taken_ratio) * 10000.0);
+            if (true_weight == 0) true_weight = 1;
+            if (false_weight == 0) false_weight = 1;
+
+            apply_branch_weight_metadata(ir, term, false_weight, true_weight);
+            ir->metrics.branch_weights_applied++;
+        }
     }
     
     /* 
@@ -721,8 +1367,11 @@ void living_ir_reorder_blocks(LivingIR *ir) {
      * We can influence it through branch probability metadata.
      */
     
-    /* Estimate speedup from better block layout */
-    double reorder_speedup = 1.0 + (ir->metrics.blocks_reordered > 0 ? 0.02 : 0);
+    /* Estimate speedup from better branch guidance rather than claiming
+     * physical block movement we have not performed yet. */
+    double reorder_speedup = 1.0 +
+                             (ir->metrics.branch_weights_applied > 0 ? 0.02 : 0) +
+                             (ir->metrics.branch_weights_applied * 0.01);
     ir->metrics.estimated_speedup *= reorder_speedup;
 }
 
@@ -737,6 +1386,10 @@ void living_ir_evolve(LivingIR *ir) {
     living_ir_outline_cold_paths(ir);
     living_ir_restructure_loops(ir);
     living_ir_reorder_blocks(ir);
+    if (ir->profile && ir->profile->function_count > 0) {
+        living_ir_clone_hot_functions(ir);
+        living_ir_merge_cold_functions(ir);
+    }
     
     /* Verify IR is still valid */
     if (!living_ir_verify(ir)) {
@@ -759,20 +1412,15 @@ void living_ir_clone_hot_functions(LivingIR *ir) {
          func != NULL;
          func = LLVMGetNextFunction(func)) {
         
-        if (is_declaration(func)) continue;
+        if (should_skip_function(ir, func)) continue;
         
         const char *func_name = get_function_name(func);
-        ProfileFunction *pf = profile_get_function(ir->profile, func_name);
+        ProfileFunction *pf = profile_get_function(
+            ir->profile, profile_function_name(func_name));
         
         if (!pf || !pf->is_hot) continue;
-        
-        /* 
-         * In a full implementation, we would:
-         * 1. Clone the function
-         * 2. Add specialized suffix (e.g., __specialized_const_arg1)
-         * 3. Propagate known constant arguments into the clone
-         * 4. Redirect hot call sites to the specialized version
-         */
+
+        specialize_function_from_profile(ir, func, pf);
     }
 }
 
@@ -805,10 +1453,11 @@ void living_ir_merge_cold_functions(LivingIR *ir) {
          func != NULL;
          func = LLVMGetNextFunction(func)) {
         
-        if (is_declaration(func)) continue;
+        if (should_skip_function(ir, func)) continue;
         
         const char *func_name = get_function_name(func);
-        ProfileFunction *pf = profile_get_function(ir->profile, func_name);
+        ProfileFunction *pf = profile_get_function(
+            ir->profile, profile_function_name(func_name));
         
         if (!pf || !pf->is_cold) continue;
         
@@ -816,7 +1465,7 @@ void living_ir_merge_cold_functions(LivingIR *ir) {
         
         /* Very small cold functions could be merged into callers */
         if (size < 10 && pf->call_count < 100) {
-            /* Mark for potential merging */
+            specialize_function_from_profile(ir, func, pf);
         }
     }
 }
@@ -874,14 +1523,22 @@ void living_ir_print_summary(LivingIR *ir) {
            ir->metrics.functions_inlined);
     printf("║   Cold blocks outlined:   %4d                   ║\n", 
            ir->metrics.cold_blocks_outlined);
+    printf("║   Hot funcs specialized:  %4d                   ║\n",
+           ir->metrics.hot_functions_specialized);
+    printf("║   Cold funcs specialized: %4d                   ║\n",
+           ir->metrics.cold_functions_specialized);
     printf("║   Loops restructured:     %4d                   ║\n", 
            ir->metrics.loops_restructured);
     printf("║     - Unrolled:           %4d                   ║\n", 
            ir->metrics.loops_unrolled);
     printf("║     - Prefetched:         %4d                   ║\n", 
            ir->metrics.loops_prefetched);
-    printf("║   Blocks reordered:       %4d                   ║\n", 
+    printf("║   Hot blocks analyzed:    %4d                   ║\n", 
            ir->metrics.blocks_reordered);
+    printf("║   Branch weights applied: %4d                   ║\n",
+           ir->metrics.branch_weights_applied);
+    printf("║   Mutations rejected:     %4d                   ║\n",
+           ir->metrics.mutations_rejected);
     printf("╠══════════════════════════════════════════════════╣\n");
     printf("║ Estimated speedup:        %.2fx                  ║\n", 
            ir->metrics.estimated_speedup);

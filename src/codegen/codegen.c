@@ -403,6 +403,12 @@ static AstNode *cg_find_proc_decl(Codegen *cg, const char *name) {
   return NULL;
 }
 
+static const char *cg_proc_symbol_name(const char *name) {
+  if (name && strcmp(name, "main") == 0)
+    return "__qisc_user_main";
+  return name;
+}
+
 /* ======== Type Helpers ======== */
 
 typedef enum {
@@ -1948,6 +1954,23 @@ static CgStructType *cg_find_struct(Codegen *cg, const char *name) {
   return NULL;
 }
 
+static CgStructType *cg_find_struct_by_pointer_type(Codegen *cg,
+                                                    LLVMTypeRef ptr_type) {
+  if (!cg || !ptr_type ||
+      LLVMGetTypeKind(ptr_type) != LLVMPointerTypeKind) {
+    return NULL;
+  }
+
+  for (int i = 0; i < cg->struct_count; i++) {
+    LLVMTypeRef st_ptr = LLVMPointerType(cg->structs[i].llvm_type, 0);
+    if (ptr_type == st_ptr) {
+      return &cg->structs[i];
+    }
+  }
+
+  return NULL;
+}
+
 /* Register a struct type from an AST_STRUCT declaration */
 static void cg_register_struct(Codegen *cg, AstNode *decl) {
   if (cg->struct_count >= CG_MAX_STRUCTS)
@@ -1996,6 +2019,7 @@ static void emit_profile_call(Codegen *cg, LLVMValueRef fn_profile, const char *
 static void emit_profile_branch_call(Codegen *cg, const char *location, bool taken);
 static void emit_profile_loop_call(Codegen *cg, const char *location,
                                    LLVMValueRef iterations);
+static void emit_main_wrapper(Codegen *cg, AstNode *proc);
 
 /* ======== Context-Specific Compilation ======== */
 
@@ -2365,6 +2389,24 @@ static void cg_apply_branch_weights(Codegen *cg, LLVMValueRef branch_inst, bool 
   LLVMSetMetadata(branch_inst, prof_kind, md);
 }
 
+static void cg_attach_source_line_metadata(Codegen *cg, LLVMValueRef inst,
+                                           int line) {
+  unsigned line_kind;
+  LLVMMetadataRef ops[1];
+  LLVMMetadataRef md;
+  LLVMValueRef md_val;
+
+  if (!cg || !inst || line <= 0)
+    return;
+
+  line_kind = LLVMGetMDKindIDInContext(cg->ctx, "qisc.line", 9);
+  ops[0] = LLVMValueAsMetadata(
+      LLVMConstInt(LLVMInt32TypeInContext(cg->ctx), (unsigned)line, false));
+  md = LLVMMDNodeInContext2(cg->ctx, ops, 1);
+  md_val = LLVMMetadataAsValue(cg->ctx, md);
+  LLVMSetMetadata(inst, line_kind, md_val);
+}
+
 /* ======== Expression Emission ======== */
 
 static LLVMValueRef emit_int_literal(Codegen *cg, AstNode *node) {
@@ -2401,7 +2443,8 @@ static LLVMValueRef emit_identifier(Codegen *cg, AstNode *node) {
   CgSymbol *sym = cg_lookup(cg, name);
   if (!sym) {
     /* Could be a function reference */
-    LLVMValueRef fn = LLVMGetNamedFunction(cg->mod, name);
+    LLVMValueRef fn =
+        LLVMGetNamedFunction(cg->mod, cg_proc_symbol_name(name));
     if (fn)
       return fn;
     cg_error(cg, "Undefined variable: %s", name);
@@ -2945,7 +2988,9 @@ static LLVMValueRef emit_binary(Codegen *cg, AstNode *node) {
         args[i + 1] = emit_expr(cg, rhs->as.call.args.items[i]);
 
       /* Look up function */
-      LLVMValueRef fn = fname ? LLVMGetNamedFunction(cg->mod, fname) : NULL;
+      LLVMValueRef fn =
+          fname ? LLVMGetNamedFunction(cg->mod, cg_proc_symbol_name(fname))
+                : NULL;
       if (fn) {
         LLVMTypeRef fn_type = LLVMGlobalGetValueType(fn);
         LLVMTypeRef ret_type = LLVMGetReturnType(fn_type);
@@ -3295,6 +3340,53 @@ static LLVMValueRef emit_call(Codegen *cg, AstNode *node) {
 
   /* Get function name */
   const char *fname = NULL;
+  if (node->as.call.callee->type == AST_MEMBER) {
+    AstNode *member = node->as.call.callee;
+    LLVMValueRef self_val = emit_expr(cg, member->as.member.object);
+    CgStructType *st;
+    LLVMValueRef fn;
+    LLVMTypeRef fn_type;
+    LLVMTypeRef ret_type;
+    LLVMValueRef *args;
+    const char *call_name;
+    char mangled[256];
+    int argc;
+
+    if (cg->had_error)
+      return LLVMConstInt(cg->i64_type, 0, false);
+
+    st = cg_find_struct_by_pointer_type(cg, LLVMTypeOf(self_val));
+    if (!st) {
+      cg_error(cg, "Cannot call member '%s' on non-struct value",
+               member->as.member.member);
+      return LLVMConstInt(cg->i64_type, 0, false);
+    }
+
+    snprintf(mangled, sizeof(mangled), "%s__%s", st->name,
+             member->as.member.member);
+    fn = LLVMGetNamedFunction(cg->mod, mangled);
+    if (!fn) {
+      cg_error(cg, "No compiled method '%s' on type '%s'",
+               member->as.member.member, st->name);
+      return LLVMConstInt(cg->i64_type, 0, false);
+    }
+
+    argc = node->as.call.args.count + 1;
+    args = calloc((size_t)argc, sizeof(LLVMValueRef));
+    args[0] = self_val;
+    for (int i = 0; i < node->as.call.args.count; i++) {
+      args[i + 1] = emit_expr(cg, node->as.call.args.items[i]);
+    }
+
+    fn_type = LLVMGlobalGetValueType(fn);
+    ret_type = LLVMGetReturnType(fn_type);
+    call_name = (ret_type == cg->void_type) ? "" : "mcall";
+    LLVMValueRef result =
+        LLVMBuildCall2(cg->builder, fn_type, fn, args, argc, call_name);
+    free(args);
+    return result;
+  }
+
   if (node->as.call.callee->type == AST_IDENTIFIER)
     fname = node->as.call.callee->as.identifier.name;
 
@@ -4221,7 +4313,7 @@ static LLVMValueRef emit_call(Codegen *cg, AstNode *node) {
   }
 
   /* Regular function call */
-  LLVMValueRef fn = LLVMGetNamedFunction(cg->mod, fname);
+  LLVMValueRef fn = LLVMGetNamedFunction(cg->mod, cg_proc_symbol_name(fname));
   if (!fn) {
     /* Maybe it's a lambda variable (function pointer) */
     CgSymbol *sym = cg_lookup(cg, fname);
@@ -4883,7 +4975,8 @@ static void emit_if(Codegen *cg, AstNode *node) {
 
   snprintf(branch_location, sizeof(branch_location), "%s:%d", fn_name,
            node->line);
-  LLVMBuildCondBr(cg->builder, cond, then_bb, else_bb);
+  LLVMValueRef cond_br = LLVMBuildCondBr(cg->builder, cond, then_bb, else_bb);
+  cg_attach_source_line_metadata(cg, cond_br, node->line);
 
   /* Then */
   LLVMPositionBuilderAtEnd(cg->builder, then_bb);
@@ -4949,6 +5042,7 @@ static void emit_while(Codegen *cg, AstNode *node) {
                          LLVMConstNull(LLVMTypeOf(cond)), "tobool");
   }
   LLVMValueRef cond_br = LLVMBuildCondBr(cg->builder, cond, body_bb, end_bb);
+  cg_attach_source_line_metadata(cg, cond_br, node->line);
   
   /* Apply loop pragma metadata (vectorization, etc.) */
   cg_apply_loop_pragmas(cg, cond_br);
@@ -5021,9 +5115,11 @@ static void emit_for(Codegen *cg, AstNode *node) {
     }
 
     /* Determine array length */
-    int arr_len = 0;
+    LLVMValueRef len_val = NULL;
     if (node->as.for_stmt.iterable->type == AST_ARRAY_LITERAL) {
-      arr_len = node->as.for_stmt.iterable->as.array_literal.elements.count;
+      len_val = LLVMConstInt(
+          cg->i64_type, node->as.for_stmt.iterable->as.array_literal.elements.count,
+          false);
     } else if (node->as.for_stmt.iterable->type == AST_IDENTIFIER) {
       /* Look up hidden __name__len variable */
       const char *iname = node->as.for_stmt.iterable->as.identifier.name;
@@ -5031,81 +5127,24 @@ static void emit_for(Codegen *cg, AstNode *node) {
       snprintf(len_key, sizeof(len_key), "__%s__len", iname);
       CgSymbol *len_sym = cg_lookup(cg, len_key);
       if (len_sym) {
-        /* We'll use a runtime load instead of compile-time constant */
-        LLVMValueRef runtime_len = LLVMBuildLoad2(cg->builder, cg->i64_type,
-                                                  len_sym->alloca, "arr_len");
-        /* Store it locally for the condition to use */
-        LLVMValueRef len_alloca =
-            LLVMBuildAlloca(cg->builder, cg->i64_type, "__forin_len");
-        LLVMBuildStore(cg->builder, runtime_len, len_alloca);
-
-        /* Store array pointer */
-        LLVMValueRef arr_alloca =
-            LLVMBuildAlloca(cg->builder, cg->i8ptr_type, "__arr");
-        LLVMBuildStore(cg->builder, arr, arr_alloca);
-
-        /* Create hidden index counter */
-        LLVMValueRef idx_alloca =
-            LLVMBuildAlloca(cg->builder, cg->i64_type, "__idx");
-        LLVMBuildStore(cg->builder, LLVMConstInt(cg->i64_type, 0, false),
-                       idx_alloca);
-
-        /* Create the loop variable */
-        LLVMValueRef var_alloca = LLVMBuildAlloca(cg->builder, cg->i64_type,
-                                                  node->as.for_stmt.var_name);
-        LLVMBuildStore(cg->builder, LLVMConstInt(cg->i64_type, 0, false),
-                       var_alloca);
-        cg_define(cg, node->as.for_stmt.var_name, var_alloca, cg->i64_type);
-
-        LLVMBuildBr(cg->builder, cond_bb);
-
-        /* Condition: __idx < len */
-        LLVMPositionBuilderAtEnd(cg->builder, cond_bb);
-        LLVMValueRef idx_val =
-            LLVMBuildLoad2(cg->builder, cg->i64_type, idx_alloca, "idx");
-        LLVMValueRef len_val =
-            LLVMBuildLoad2(cg->builder, cg->i64_type, len_alloca, "len");
-        LLVMValueRef cond = LLVMBuildICmp(cg->builder, LLVMIntSLT, idx_val,
-                                          len_val, "forin_cond");
-        LLVMBuildCondBr(cg->builder, cond, body_bb, end_bb);
-
-        /* Body */
-        LLVMPositionBuilderAtEnd(cg->builder, body_bb);
-        if (loop_counter) {
-          LLVMValueRef old_count = LLVMBuildLoad2(cg->builder, cg->i64_type,
-                                                  loop_counter, "loop_count");
-          LLVMValueRef new_count = LLVMBuildAdd(
-              cg->builder, old_count, LLVMConstInt(cg->i64_type, 1, false),
-              "loop_count_next");
-          LLVMBuildStore(cg->builder, new_count, loop_counter);
-        }
-        LLVMValueRef cur_arr =
-            LLVMBuildLoad2(cg->builder, cg->i8ptr_type, arr_alloca, "arr_ptr");
-        LLVMValueRef cur_idx =
-            LLVMBuildLoad2(cg->builder, cg->i64_type, idx_alloca, "cur_idx");
-        LLVMValueRef elem_ptr = LLVMBuildGEP2(cg->builder, cg->i64_type,
-                                              cur_arr, &cur_idx, 1, "elem");
-        LLVMValueRef elem_val =
-            LLVMBuildLoad2(cg->builder, cg->i64_type, elem_ptr, "elem_val");
-        LLVMBuildStore(cg->builder, elem_val, var_alloca);
-
-        emit_stmt(cg, node->as.for_stmt.body);
-        if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(cg->builder)))
-          LLVMBuildBr(cg->builder, step_bb);
-
-        /* Step: __idx++ */
-        LLVMPositionBuilderAtEnd(cg->builder, step_bb);
-        LLVMValueRef old_idx =
-            LLVMBuildLoad2(cg->builder, cg->i64_type, idx_alloca, "old_idx");
-        LLVMValueRef new_idx =
-            LLVMBuildAdd(cg->builder, old_idx,
-                         LLVMConstInt(cg->i64_type, 1, false), "next_idx");
-        LLVMBuildStore(cg->builder, new_idx, idx_alloca);
-        LLVMBuildBr(cg->builder, cond_bb);
-
-        goto for_end;
+        len_val = LLVMBuildLoad2(cg->builder, cg->i64_type, len_sym->alloca,
+                                 "arr_len");
       }
     }
+
+    if (!len_val) {
+      LLVMTypeRef arr_len_type =
+          LLVMFunctionType(cg->i64_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, false);
+      LLVMValueRef fn_array_len =
+          LLVMGetNamedFunction(cg->mod, "__qisc_array_len");
+      len_val = LLVMBuildCall2(cg->builder, arr_len_type, fn_array_len, &arr, 1,
+                               "forin_len");
+    }
+
+    /* Store it locally for the condition to use */
+    LLVMValueRef len_alloca =
+        LLVMBuildAlloca(cg->builder, cg->i64_type, "__forin_len");
+    LLVMBuildStore(cg->builder, len_val, len_alloca);
 
     /* Store array pointer for later GEP */
     LLVMValueRef arr_alloca =
@@ -5131,10 +5170,11 @@ static void emit_for(Codegen *cg, AstNode *node) {
     LLVMPositionBuilderAtEnd(cg->builder, cond_bb);
     LLVMValueRef idx_val =
         LLVMBuildLoad2(cg->builder, cg->i64_type, idx_alloca, "idx");
-    LLVMValueRef len_val = LLVMConstInt(cg->i64_type, arr_len, false);
+    len_val = LLVMBuildLoad2(cg->builder, cg->i64_type, len_alloca, "len");
     LLVMValueRef cond =
         LLVMBuildICmp(cg->builder, LLVMIntSLT, idx_val, len_val, "forin_cond");
-    LLVMBuildCondBr(cg->builder, cond, body_bb, end_bb);
+    LLVMValueRef cond_br = LLVMBuildCondBr(cg->builder, cond, body_bb, end_bb);
+    cg_attach_source_line_metadata(cg, cond_br, node->line);
 
     /* Body: load var = arr[__idx] */
     LLVMPositionBuilderAtEnd(cg->builder, body_bb);
@@ -5186,6 +5226,7 @@ static void emit_for(Codegen *cg, AstNode *node) {
                              LLVMConstNull(LLVMTypeOf(cond)), "tobool");
       }
       LLVMValueRef cond_br = LLVMBuildCondBr(cg->builder, cond, body_bb, end_bb);
+      cg_attach_source_line_metadata(cg, cond_br, node->line);
       /* Apply loop pragma metadata (vectorization, etc.) */
       cg_apply_loop_pragmas(cg, cond_br);
     } else {
@@ -5329,6 +5370,13 @@ static void emit_stmt(Codegen *cg, AstNode *node) {
         LLVMBuildStore(cg->builder, LLVMConstInt(cg->i64_type, i, false),
                        alloca);
         cg_define(cg, full, alloca, cg->i64_type);
+        if (!cg_lookup(cg, v->as.identifier.name)) {
+          LLVMValueRef short_alloca =
+              LLVMBuildAlloca(cg->builder, cg->i64_type, v->as.identifier.name);
+          LLVMBuildStore(cg->builder, LLVMConstInt(cg->i64_type, i, false),
+                         short_alloca);
+          cg_define(cg, v->as.identifier.name, short_alloca, cg->i64_type);
+        }
       }
     }
     break;
@@ -5743,6 +5791,7 @@ static void emit_profile_loop_call(Codegen *cg, const char *location,
 
 static void emit_proc(Codegen *cg, AstNode *node) {
   const char *name = node->as.proc.name;
+  const char *symbol_name = cg_proc_symbol_name(name);
   int param_count = node->as.proc.params.count;
 
   /* Return type */
@@ -5768,9 +5817,9 @@ static void emit_proc(Codegen *cg, AstNode *node) {
   free(param_types);
 
   /* Reuse the forward-declared function from the first pass */
-  LLVMValueRef fn = LLVMGetNamedFunction(cg->mod, name);
+  LLVMValueRef fn = LLVMGetNamedFunction(cg->mod, symbol_name);
   if (!fn) {
-    fn = LLVMAddFunction(cg->mod, name, fn_type);
+    fn = LLVMAddFunction(cg->mod, symbol_name, fn_type);
   }
   LLVMSetLinkage(fn, LLVMExternalLinkage);
 
@@ -5831,6 +5880,71 @@ static void emit_proc(Codegen *cg, AstNode *node) {
   if (LLVMVerifyFunction(fn, LLVMPrintMessageAction)) {
     fprintf(stderr, "[codegen] Warning: Function '%s' failed verification\n",
             name);
+  }
+}
+
+static void emit_main_wrapper(Codegen *cg, AstNode *proc) {
+  LLVMValueRef user_main;
+  LLVMTypeRef user_main_type;
+  LLVMTypeRef wrapper_type;
+  LLVMValueRef wrapper;
+  LLVMBasicBlockRef entry;
+  LLVMValueRef result = NULL;
+  LLVMTypeRef i32_type;
+  const char *return_name;
+  bool printable_result;
+
+  if (!cg || !proc || proc->type != AST_PROC || proc->as.proc.params.count != 0)
+    return;
+
+  user_main = LLVMGetNamedFunction(cg->mod, cg_proc_symbol_name(proc->as.proc.name));
+  if (!user_main)
+    return;
+
+  i32_type = LLVMInt32TypeInContext(cg->ctx);
+  wrapper_type = LLVMFunctionType(i32_type, NULL, 0, false);
+  wrapper = LLVMAddFunction(cg->mod, "main", wrapper_type);
+  LLVMSetLinkage(wrapper, LLVMExternalLinkage);
+
+  entry = LLVMAppendBasicBlockInContext(cg->ctx, wrapper, "entry");
+  LLVMPositionBuilderAtEnd(cg->builder, entry);
+
+  user_main_type = LLVMGlobalGetValueType(user_main);
+  return_name = proc->as.proc.return_type ? proc->as.proc.return_type->name : "void";
+  printable_result =
+      strcmp(return_name, "int") == 0 || strcmp(return_name, "i64") == 0 ||
+      strcmp(return_name, "bool") == 0 || strcmp(return_name, "float") == 0 ||
+      strcmp(return_name, "f64") == 0 || strcmp(return_name, "double") == 0 ||
+      strcmp(return_name, "string") == 0;
+
+  if (strcmp(return_name, "void") != 0) {
+    result = LLVMBuildCall2(cg->builder, user_main_type, user_main, NULL, 0,
+                            "main_result");
+    if (printable_result) {
+      LLVMTypeRef printf_type =
+          LLVMFunctionType(i32_type, (LLVMTypeRef[]){cg->i8ptr_type}, 1, true);
+      LLVMValueRef prefix =
+          LLVMBuildGlobalStringPtr(cg->builder, "=> ", "qisc_main_prefix");
+      LLVMBuildCall2(cg->builder, printf_type, cg->fn_printf, &prefix, 1, "");
+      emit_print_call(cg, result);
+    }
+  } else {
+    LLVMBuildCall2(cg->builder, user_main_type, user_main, NULL, 0, "");
+  }
+
+  if (result &&
+      (strcmp(return_name, "int") == 0 || strcmp(return_name, "i64") == 0)) {
+    LLVMBuildRet(cg->builder,
+                 LLVMBuildTrunc(cg->builder, result, i32_type, "main_exit"));
+  } else if (result && strcmp(return_name, "bool") == 0) {
+    LLVMBuildRet(cg->builder,
+                 LLVMBuildZExt(cg->builder, result, i32_type, "main_exit"));
+  } else {
+    LLVMBuildRet(cg->builder, LLVMConstInt(i32_type, 0, false));
+  }
+
+  if (LLVMVerifyFunction(wrapper, LLVMPrintMessageAction)) {
+    fprintf(stderr, "[codegen] Warning: Wrapper 'main' failed verification\n");
   }
 }
 
@@ -5959,7 +6073,7 @@ static void emit_program(Codegen *cg, AstNode *program) {
   for (int i = 0; i < program->as.program.declarations.count; i++) {
     AstNode *decl = program->as.program.declarations.items[i];
     if (decl->type == AST_PROC) {
-      const char *name = decl->as.proc.name;
+      const char *name = cg_proc_symbol_name(decl->as.proc.name);
       int pc = decl->as.proc.params.count;
       LLVMTypeRef ret = cg_return_type(cg, decl);
       LLVMTypeRef *pts = NULL;
@@ -6032,6 +6146,14 @@ static void emit_program(Codegen *cg, AstNode *program) {
           LLVMSetLinkage(gv, LLVMPrivateLinkage);
           /* Register in global (scope 0) for lookup */
           cg_define(cg, full, gv, cg->i64_type);
+          if (!cg_lookup(cg, v->as.identifier.name)) {
+            LLVMValueRef short_gv =
+                LLVMAddGlobal(cg->mod, cg->i64_type, v->as.identifier.name);
+            LLVMSetInitializer(short_gv, LLVMConstInt(cg->i64_type, j, false));
+            LLVMSetGlobalConstant(short_gv, true);
+            LLVMSetLinkage(short_gv, LLVMPrivateLinkage);
+            cg_define(cg, v->as.identifier.name, short_gv, cg->i64_type);
+          }
         }
       }
     }
@@ -6060,6 +6182,15 @@ static void emit_program(Codegen *cg, AstNode *program) {
     }
     if (cg->had_error)
       return;
+  }
+
+  {
+    AstNode *main_proc = cg_find_proc_decl(cg, "main");
+    if (main_proc) {
+      emit_main_wrapper(cg, main_proc);
+      if (cg->had_error)
+        return;
+    }
   }
 
   /* Add personality-aware compilation metadata */

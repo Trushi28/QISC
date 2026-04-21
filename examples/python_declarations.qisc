@@ -1,0 +1,27 @@
+#pragma style:python
+
+module examples.python_declarations
+import std.math
+
+struct Pair:
+    int left
+    int right
+
+enum Mode:
+    Add
+    Mul
+
+extend Pair:
+    proc total(self) gives int:
+        give self.left + self.right
+
+proc choose(Mode mode, Pair pair) gives int:
+    when mode:
+        is Add:
+            give pair.total()
+        else:
+            give pair.left * pair.right
+
+proc main() gives int:
+    auto pair = Pair { left: 3, right: 4 }
+    give choose(Add, pair) + twice(2)

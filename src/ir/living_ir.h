@@ -86,11 +86,15 @@ typedef struct {
     int inline_candidates_found;
     int cold_blocks_found;
     int cold_blocks_outlined;
+    int hot_functions_specialized;
+    int cold_functions_specialized;
+    int mutations_rejected;
     int loops_analyzed;
     int loops_restructured;
     int loops_unrolled;
     int loops_prefetched;
     int blocks_reordered;
+    int branch_weights_applied;
     double estimated_speedup;
     uint64_t code_size_delta;
 } LivingIRMetrics;

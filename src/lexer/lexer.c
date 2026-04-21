@@ -18,6 +18,14 @@ void lexer_init(Lexer *lexer, const char *source) {
   lexer->start_column = 1;
   lexer->had_error = false;
   lexer->error_message[0] = '\0';
+  lexer->emit_layout_tokens = false;
+  lexer->emit_newline_tokens = false;
+  lexer->line_start = true;
+  lexer->indent_stack[0] = 0;
+  lexer->indent_depth = 0;
+  lexer->pending_dedents = 0;
+  lexer->layout_indent = 0;
+  lexer->layout_indent_ready = false;
 }
 
 Token lexer_peek(Lexer *lexer) {
@@ -34,8 +42,10 @@ static char advance(Lexer *lexer) {
   if (c == '\n') {
     lexer->line++;
     lexer->column = 1;
+    lexer->line_start = true;
   } else {
     lexer->column++;
+    lexer->line_start = false;
   }
   return c;
 }
@@ -87,6 +97,34 @@ static Token error_token(Lexer *lexer, const char *message) {
   return token;
 }
 
+static Token make_layout_token(Lexer *lexer, TokenType type) {
+  lexer->start = lexer->current;
+  lexer->start_column = lexer->column;
+  return make_token(lexer, type);
+}
+
+static void skip_comment(Lexer *lexer) {
+  if (peek_next(lexer) == '/') {
+    while (peek(lexer) != '\n' && !lexer_is_at_end(lexer)) {
+      advance(lexer);
+    }
+    return;
+  }
+
+  if (peek_next(lexer) == '*') {
+    advance(lexer); /* / */
+    advance(lexer); /* * */
+    while (!lexer_is_at_end(lexer)) {
+      if (peek(lexer) == '*' && peek_next(lexer) == '/') {
+        advance(lexer);
+        advance(lexer);
+        break;
+      }
+      advance(lexer);
+    }
+  }
+}
+
 /* Skip whitespace and comments */
 static void skip_whitespace(Lexer *lexer) {
   for (;;) {
@@ -95,29 +133,25 @@ static void skip_whitespace(Lexer *lexer) {
     case ' ':
     case '\t':
     case '\r':
+      if (lexer->emit_layout_tokens && lexer->line_start) {
+        return;
+      }
       advance(lexer);
       break;
     case '\n':
+      if (lexer->emit_newline_tokens) {
+        return;
+      }
       advance(lexer);
       break;
     case '/':
       if (peek_next(lexer) == '/') {
-        /* Single-line comment */
-        while (peek(lexer) != '\n' && !lexer_is_at_end(lexer)) {
-          advance(lexer);
+        if (lexer->emit_layout_tokens && lexer->line_start) {
+          return;
         }
+        skip_comment(lexer);
       } else if (peek_next(lexer) == '*') {
-        /* Multi-line comment */
-        advance(lexer); /* / */
-        advance(lexer); /* * */
-        while (!lexer_is_at_end(lexer)) {
-          if (peek(lexer) == '*' && peek_next(lexer) == '/') {
-            advance(lexer);
-            advance(lexer);
-            break;
-          }
-          advance(lexer);
-        }
+        skip_comment(lexer);
       } else {
         return;
       }
@@ -125,6 +159,111 @@ static void skip_whitespace(Lexer *lexer) {
     default:
       return;
     }
+  }
+}
+
+static bool lex_layout_prefix(Lexer *lexer, Token *out) {
+  for (;;) {
+    int indent = 0;
+
+    if (lexer->pending_dedents > 0) {
+      lexer->pending_dedents--;
+      lexer->line_start = true;
+      *out = make_layout_token(lexer, TOK_DEDENT);
+      return true;
+    }
+
+    if (lexer_is_at_end(lexer)) {
+      if (lexer->indent_depth > 0) {
+        lexer->indent_depth--;
+        lexer->line_start = true;
+        *out = make_layout_token(lexer, TOK_DEDENT);
+        return true;
+      }
+      *out = make_layout_token(lexer, TOK_EOF);
+      return true;
+    }
+
+    if (lexer->layout_indent_ready) {
+      indent = lexer->layout_indent;
+    } else {
+      while (peek(lexer) == ' ' || peek(lexer) == '\t') {
+        indent += (peek(lexer) == '\t') ? 4 : 1;
+        lexer->current++;
+        lexer->column++;
+      }
+      lexer->layout_indent = indent;
+      lexer->layout_indent_ready = true;
+    }
+
+    if (peek(lexer) == '/' &&
+        (peek_next(lexer) == '/' || peek_next(lexer) == '*')) {
+      skip_comment(lexer);
+      if (peek(lexer) == '\n') {
+        lexer->layout_indent_ready = false;
+        lexer->start = lexer->current;
+        lexer->start_column = lexer->column;
+        advance(lexer);
+        *out = make_token(lexer, TOK_NEWLINE);
+        return true;
+      }
+      continue;
+    }
+
+    if (peek(lexer) == '\n') {
+      lexer->layout_indent_ready = false;
+      lexer->start = lexer->current;
+      lexer->start_column = lexer->column;
+      advance(lexer);
+      *out = make_token(lexer, TOK_NEWLINE);
+      return true;
+    }
+
+    if (peek(lexer) == '\0') {
+      if (lexer->indent_depth > 0) {
+        lexer->indent_depth--;
+        lexer->line_start = true;
+        *out = make_layout_token(lexer, TOK_DEDENT);
+        return true;
+      }
+      lexer->layout_indent_ready = false;
+      *out = make_layout_token(lexer, TOK_EOF);
+      return true;
+    }
+
+    if (indent > lexer->indent_stack[lexer->indent_depth]) {
+      if (lexer->indent_depth >= 63) {
+        *out = error_token(lexer, "Indentation nesting too deep");
+        return true;
+      }
+      lexer->indent_depth++;
+      lexer->indent_stack[lexer->indent_depth] = indent;
+      lexer->layout_indent_ready = false;
+      lexer->line_start = false;
+      *out = make_layout_token(lexer, TOK_INDENT);
+      return true;
+    }
+
+    if (indent < lexer->indent_stack[lexer->indent_depth]) {
+      int dedents = 0;
+      while (lexer->indent_depth > 0 &&
+             indent < lexer->indent_stack[lexer->indent_depth]) {
+        lexer->indent_depth--;
+        dedents++;
+      }
+      if (indent != lexer->indent_stack[lexer->indent_depth]) {
+        *out = error_token(lexer, "Inconsistent indentation");
+        return true;
+      }
+      lexer->pending_dedents = dedents - 1;
+      lexer->line_start = true;
+      *out = make_layout_token(lexer, TOK_DEDENT);
+      return true;
+    }
+
+    lexer->layout_indent_ready = false;
+    lexer->line_start = false;
+    return false;
   }
 }
 
@@ -448,16 +587,32 @@ static Token char_literal(Lexer *lexer) {
 
 /* Main scan function */
 Token lexer_scan_token(Lexer *lexer) {
+  if (lexer->emit_layout_tokens && lexer->line_start) {
+    Token layout;
+    if (lex_layout_prefix(lexer, &layout)) {
+      return layout;
+    }
+  }
+
   skip_whitespace(lexer);
 
   lexer->start = lexer->current;
   lexer->start_column = lexer->column;
 
   if (lexer_is_at_end(lexer)) {
+    if (lexer->emit_layout_tokens && lexer->indent_depth > 0) {
+      lexer->indent_depth--;
+      lexer->line_start = false;
+      return make_layout_token(lexer, TOK_DEDENT);
+    }
     return make_token(lexer, TOK_EOF);
   }
 
   char c = advance(lexer);
+
+  if (c == '\n' && lexer->emit_newline_tokens) {
+    return make_token(lexer, TOK_NEWLINE);
+  }
 
   /* Identifiers and keywords */
   if (isalpha(c) || c == '_') {
@@ -547,6 +702,8 @@ Token lexer_scan_token(Lexer *lexer) {
       return make_token(lexer, TOK_AMPAMP);
     return make_token(lexer, TOK_AMP);
   case '|':
+    if (match(lexer, '>'))
+      return make_token(lexer, TOK_PIPELINE); /* |> for pipeline */
     if (match(lexer, '|'))
       return make_token(lexer, TOK_PIPEPIPE);
     return make_token(lexer, TOK_PIPE);
@@ -599,6 +756,12 @@ const char *token_type_name(TokenType type) {
     return "EOF";
   case TOK_ERROR:
     return "ERROR";
+  case TOK_NEWLINE:
+    return "NEWLINE";
+  case TOK_INDENT:
+    return "INDENT";
+  case TOK_DEDENT:
+    return "DEDENT";
   case TOK_IDENT:
     return "IDENT";
   case TOK_INT_LIT:

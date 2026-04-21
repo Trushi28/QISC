@@ -128,12 +128,14 @@ PragmaValidation pragma_validate_syntax(const char *pragma_text) {
                 result.suggestion = "Known values: speed, size, latency, throughput, power, none";
                 return result;
             }
+        } else if (strcmp(directive, "syntax_profile") == 0) {
+            /* syntax_profile carries structured key:value density hints */
         } else if (strcmp(directive, "profile") == 0) {
             /* profile:X format - accept any value */
         } else {
             result.valid = true;
             result.warning = "Unknown pragma category";
-            result.suggestion = "Known categories: style, context, optimize, profile";
+            result.suggestion = "Known categories: style, context, optimize, profile, syntax_profile";
             return result;
         }
     } else {

@@ -1,23 +1,55 @@
 # QISC Build System
 CC ?= cc
-CFLAGS = -Wall -Wextra -std=c11 -I./include $(shell llvm-config --cflags)
+LLVM_TOOLCHAIN_DIR = toolchains/llvm
+LLVM_TOOLCHAIN_BIN_DIR = $(LLVM_TOOLCHAIN_DIR)/bin
+LLVM_TOOLCHAIN_LIB_DIR = $(LLVM_TOOLCHAIN_DIR)/lib
+LLVM_TOOLCHAIN_INCLUDE_DIR = $(LLVM_TOOLCHAIN_DIR)/include
+LLVM_TOOLCHAIN_CONFIG = $(LLVM_TOOLCHAIN_BIN_DIR)/llvm-config
+LLVM_TOOLCHAIN_READY = $(LLVM_TOOLCHAIN_DIR)/.ready
+LLVM_CONFIG_WRAPPER = scripts/qisc-llvm-config.sh
+LLVM_TOOLCHAIN_ARCHIVE ?= llvm-toolchain.tar.xz
+GIT_REMOTE_ORIGIN := $(strip $(shell git config --get remote.origin.url 2>/dev/null))
+GITHUB_REPO := $(patsubst %.git,%,$(patsubst https://github.com/%,%,$(patsubst git@github.com:%,%,$(GIT_REMOTE_ORIGIN))))
+ifeq ($(strip $(GITHUB_REPO)),)
+LLVM_TOOLCHAIN_URL ?=
+else
+LLVM_TOOLCHAIN_URL ?= https://github.com/$(GITHUB_REPO)/releases/latest/download/$(notdir $(LLVM_TOOLCHAIN_ARCHIVE))
+endif
+HOST_LLVM_CONFIG ?= llvm-config
+LLVM_CONFIG ?= $(LLVM_CONFIG_WRAPPER)
+export LLVM_TOOLCHAIN_DIR
+export LLVM_TOOLCHAIN_ARCHIVE
+export LLVM_TOOLCHAIN_URL
+export HOST_LLVM_CONFIG
+LLVM_CFLAGS := $(shell $(LLVM_CONFIG) --cflags)
+LLVM_LDFLAGS := $(shell $(LLVM_CONFIG) --ldflags)
+LLVM_LIBS := $(shell $(LLVM_CONFIG) --libs core)
+LLVM_SHARED_MODE := $(shell $(LLVM_CONFIG) --shared-mode 2>/dev/null || echo shared)
+LLVM_LIBFILES := $(shell $(LLVM_CONFIG) --libfiles core 2>/dev/null)
+
+CFLAGS = -Wall -Wextra -std=c11 -I./include $(LLVM_CFLAGS)
 
 ifeq ($(OS),Windows_NT)
 	EXE_EXT = .exe
 	THREAD_FLAGS =
+	QISC_RPATH =
 else
 	EXE_EXT =
 	THREAD_FLAGS = -pthread
+	QISC_RPATH = -Wl,-rpath,'$$ORIGIN/../lib/llvm' -Wl,--enable-new-dtags
 endif
 
 CFLAGS += $(THREAD_FLAGS)
-LDFLAGS = $(shell llvm-config --ldflags --libs core) -lm $(THREAD_FLAGS)
+LDFLAGS = $(LLVM_LDFLAGS) $(LLVM_LIBS) -lm $(THREAD_FLAGS) $(QISC_RPATH)
 
 # Directories
 SRC_DIR = src
 BUILD_DIR = build
 BIN_DIR = bin
 LIB_DIR = lib
+LLVM_BUNDLE_DIR = $(LIB_DIR)/llvm
+DIST_DIR = dist
+DIST_ROOT = $(DIST_DIR)/qisc-portable
 
 # Source files
 SRCS = $(wildcard $(SRC_DIR)/*.c) \
@@ -70,9 +102,9 @@ else
     CFLAGS += -O3 -DNDEBUG
 endif
 
-.PHONY: all clean test runtime stream error
+.PHONY: all clean test runtime stream error bundle-llvm portable bootstrap-llvm-toolchain fetch-llvm-toolchain dist
 
-all: dirs $(TARGET) runtime io stream error
+all: dirs $(TARGET) runtime io stream error bundle-llvm
 
 runtime: dirs $(RUNTIME_OBJ) $(ARRAY_RUNTIME_OBJ) $(IO_RUNTIME_OBJ)
 
@@ -101,6 +133,7 @@ dirs:
 ifeq ($(OS),Windows_NT)
 	@if not exist $(BIN_DIR) mkdir $(BIN_DIR)
 	@if not exist $(LIB_DIR) mkdir $(LIB_DIR)
+	@if not exist $(LLVM_BUNDLE_DIR) mkdir $(LLVM_BUNDLE_DIR)
 	@if not exist $(BUILD_DIR) mkdir $(BUILD_DIR)
 	@if not exist $(BUILD_DIR)\lexer mkdir $(BUILD_DIR)\lexer
 	@if not exist $(BUILD_DIR)\parser mkdir $(BUILD_DIR)\parser
@@ -120,6 +153,7 @@ ifeq ($(OS),Windows_NT)
 else
 	@mkdir -p $(BIN_DIR)
 	@mkdir -p $(LIB_DIR)
+	@mkdir -p $(LLVM_BUNDLE_DIR)
 	@mkdir -p $(BUILD_DIR)/lexer
 	@mkdir -p $(BUILD_DIR)/parser
 	@mkdir -p $(BUILD_DIR)/interpreter
@@ -140,6 +174,81 @@ endif
 $(TARGET): $(OBJS) $(STREAM_OBJ) $(ARRAY_RUNTIME_OBJ)
 	$(CC) $(OBJS) $(STREAM_OBJ) $(ARRAY_RUNTIME_OBJ) -o $@ $(LDFLAGS)
 
+bundle-llvm: $(TARGET)
+ifeq ($(OS),Windows_NT)
+	@echo "LLVM bundling is not configured on Windows in this Makefile."
+else
+ifeq ($(LLVM_SHARED_MODE),shared)
+	@if [ -n "$(LLVM_LIBFILES)" ]; then \
+		echo "Bundling LLVM runtime into $(LLVM_BUNDLE_DIR)"; \
+		for lib in $(LLVM_LIBFILES); do \
+			resolved="$$(readlink -f "$$lib" 2>/dev/null || printf '%s' "$$lib")"; \
+			cp -Lf "$$resolved" $(LLVM_BUNDLE_DIR)/; \
+			if [ "$$(basename "$$resolved")" != "$$(basename "$$lib")" ]; then \
+				ln -sf "$$(basename "$$resolved")" "$(LLVM_BUNDLE_DIR)/$$(basename "$$lib")"; \
+			fi; \
+		done; \
+	fi
+else
+	@echo "LLVM is not in shared mode; no runtime bundling needed."
+endif
+endif
+
+portable: all
+	@echo "Portable QISC build is ready at $(TARGET)"
+
+bootstrap-llvm-toolchain:
+	@mkdir -p $(LLVM_TOOLCHAIN_BIN_DIR)
+	@mkdir -p $(LLVM_TOOLCHAIN_LIB_DIR)
+	@mkdir -p $(LLVM_TOOLCHAIN_INCLUDE_DIR)
+	@mkdir -p $(LLVM_TOOLCHAIN_INCLUDE_DIR)/llvm
+	@echo "Bootstrapping vendored LLVM toolchain into $(LLVM_TOOLCHAIN_DIR)"
+	@host_inc="$$($(HOST_LLVM_CONFIG) --includedir)"; \
+	host_ver="$$($(HOST_LLVM_CONFIG) --version)"; \
+	host_cflags="$$($(HOST_LLVM_CONFIG) --cflags)"; \
+	host_cflags="$$(printf '%s\n' "$$host_cflags" | sed -E 's/(^| )-I[^ ]+//g; s/^ +//; s/ +/ /g')"; \
+	cp -R "$$host_inc/llvm-c" "$(LLVM_TOOLCHAIN_INCLUDE_DIR)/"; \
+	cp -R "$$host_inc/llvm/Config" "$(LLVM_TOOLCHAIN_INCLUDE_DIR)/llvm/"; \
+	printf '%s\n' "$$host_ver" > "$(LLVM_TOOLCHAIN_DIR)/VERSION"; \
+	printf '%s\n' "$$host_cflags" > "$(LLVM_TOOLCHAIN_DIR)/CFLAGS"
+	@for lib in $$($(HOST_LLVM_CONFIG) --libfiles core); do \
+		resolved="$$(readlink -f "$$lib" 2>/dev/null || printf '%s' "$$lib")"; \
+		cp -Lf "$$resolved" "$(LLVM_TOOLCHAIN_LIB_DIR)/"; \
+		if [ "$$(basename "$$resolved")" != "$$(basename "$$lib")" ]; then \
+			ln -sf "$$(basename "$$resolved")" "$(LLVM_TOOLCHAIN_LIB_DIR)/$$(basename "$$lib")"; \
+		fi; \
+	done
+	@chmod +x $(LLVM_TOOLCHAIN_CONFIG)
+	@touch $(LLVM_TOOLCHAIN_READY)
+	@echo "Vendored LLVM toolchain ready. Future builds will prefer $(LLVM_TOOLCHAIN_CONFIG)."
+
+fetch-llvm-toolchain:
+	@chmod +x $(LLVM_CONFIG_WRAPPER)
+	@chmod +x scripts/ensure_llvm_toolchain.sh
+	@LLVM_TOOLCHAIN_DIR="$(LLVM_TOOLCHAIN_DIR)" \
+	LLVM_TOOLCHAIN_ARCHIVE="$(LLVM_TOOLCHAIN_ARCHIVE)" \
+	LLVM_TOOLCHAIN_URL="$(LLVM_TOOLCHAIN_URL)" \
+	HOST_LLVM_CONFIG="$(HOST_LLVM_CONFIG)" \
+	scripts/ensure_llvm_toolchain.sh
+
+dist: all
+	@rm -rf $(DIST_ROOT)
+	@mkdir -p $(DIST_ROOT)
+	@mkdir -p $(DIST_ROOT)/bin
+	@mkdir -p $(DIST_ROOT)/lib
+	@mkdir -p $(DIST_ROOT)/toolchains
+	@cp -R $(TARGET) $(DIST_ROOT)/bin/
+	@cp -R $(LIB_DIR) $(DIST_ROOT)/
+	@cp -R $(LLVM_TOOLCHAIN_DIR) $(DIST_ROOT)/toolchains/
+	@cp -R include $(DIST_ROOT)/
+	@cp -R scripts $(DIST_ROOT)/
+	@cp -R src $(DIST_ROOT)/
+	@cp -R stdlib $(DIST_ROOT)/
+	@cp -R examples $(DIST_ROOT)/
+	@cp Makefile $(DIST_ROOT)/
+	@tar -czf $(DIST_DIR)/qisc-portable.tar.gz -C $(DIST_DIR) qisc-portable
+	@echo "Portable distribution written to $(DIST_DIR)/qisc-portable.tar.gz"
+
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -150,7 +259,7 @@ ifeq ($(OS),Windows_NT)
 	@if exist $(BIN_DIR) rmdir /s /q $(BIN_DIR)
 	@if exist $(LIB_DIR) rmdir /s /q $(LIB_DIR)
 else
-	rm -rf $(BUILD_DIR) $(BIN_DIR) $(LIB_DIR)
+	rm -rf $(BUILD_DIR) $(BIN_DIR) $(LIB_DIR) $(DIST_DIR)
 endif
 
 test:

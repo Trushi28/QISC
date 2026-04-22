@@ -152,6 +152,76 @@ static int qisc_living_ir_total_mutations(const LivingIRMetrics *metrics) {
          metrics->branch_weights_applied;
 }
 
+static void qisc_living_ir_guidance(const LivingIRMetrics *metrics,
+                                    const QiscProfile *profile, char *out,
+                                    size_t out_size) {
+  const char *phase;
+
+  if (!out || out_size == 0) {
+    return;
+  }
+  out[0] = '\0';
+
+  if (!metrics) {
+    return;
+  }
+
+  if (!profile) {
+    phase = "no-profile";
+  } else if (profile->has_converged) {
+    phase = "stable";
+  } else if (profile->run_count >= 2) {
+    phase = "warming";
+  } else {
+    phase = "first-run";
+  }
+
+  if (metrics->cold_blocks_outlined >= 2 &&
+             metrics->cold_blocks_found > metrics->cold_blocks_outlined) {
+    snprintf(out, out_size,
+             "Living IR guidance [%s]: multi-block cold regions are being "
+             "decomposed into safe cold descendants; the next step is strict "
+             "region cloning for single-entry/single-exit chains.",
+             phase);
+  } else if (metrics->cold_blocks_outlined >= 2) {
+    snprintf(out, out_size,
+             "Living IR guidance [%s]: multiple cold descendants were extracted; "
+             "the next step is merging them into stricter region-level clones.",
+             phase);
+  } else if (metrics->mutations_rejected > 0 && profile && !profile->has_converged) {
+    snprintf(out, out_size,
+             "Living IR guidance [%s]: more profile runs should unlock stronger "
+             "mutations; %d candidates were rejected on confidence.",
+             phase, metrics->mutations_rejected);
+  } else if (metrics->cold_blocks_outlined > 0 &&
+             metrics->blocks_reordered > 0) {
+    snprintf(out, out_size,
+             "Living IR guidance [%s]: cold extraction and block layout are both "
+             "active; the next meaningful step is multi-block cold regions and "
+             "hot-path cloning.",
+             phase);
+  } else if (metrics->cold_blocks_outlined > 0) {
+    snprintf(out, out_size,
+             "Living IR guidance [%s]: cold outlining is active; block layout and "
+             "region-level extraction are the next leverage points.",
+             phase);
+  } else if (metrics->branch_weights_applied > 0) {
+    snprintf(out, out_size,
+             "Living IR guidance [%s]: profile steering is active; cold outlining "
+             "or region splitting is the next useful mutation.",
+             phase);
+  } else if (metrics->loops_unrolled > 0 || metrics->loops_prefetched > 0) {
+    snprintf(out, out_size,
+             "Living IR guidance [%s]: loop shaping is active; more branch and "
+             "cold-path evidence would expand specialization.",
+             phase);
+  } else {
+    snprintf(out, out_size,
+             "Living IR guidance [%s]: gather more runtime evidence before "
+             "aggressive specialization.", phase);
+  }
+}
+
 static void qisc_tiny_llm_report_living_ir(const char *path,
                                            QiscOptions *options,
                                            const LivingIRMetrics *metrics,
@@ -161,6 +231,7 @@ static void qisc_tiny_llm_report_living_ir(const char *path,
   char llm_path[PATH_MAX];
   char context[1024];
   char summary[256];
+  char guidance[256];
   char *comment;
   TinyLLMCodePattern patterns[3];
   int pattern_count = 0;
@@ -253,6 +324,10 @@ static void qisc_tiny_llm_report_living_ir(const char *path,
 
   snprintf(summary, sizeof(summary), "%d mutations, %.2fx estimate",
            total_mutations, metrics->estimated_speedup);
+  qisc_living_ir_guidance(metrics, profile, guidance, sizeof(guidance));
+  if (guidance[0]) {
+    qisc_personality_print(options->personality, "%s\n", guidance);
+  }
   if (comment && comment[0]) {
     qisc_personality_print(options->personality, "Tiny LLM [%s]: %s\n",
                            summary, comment);

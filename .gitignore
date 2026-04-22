@@ -1,0 +1,7 @@
+dist/
+build/
+bin/
+toolchains/
+lib/*.o
+lib/llvm/
+# Keep other files in lib/ if they aren't .o or in llvm/

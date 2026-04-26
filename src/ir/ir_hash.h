@@ -23,17 +23,21 @@ uint64_t ir_hash_block(LLVMBasicBlockRef block);
 typedef struct {
     uint64_t current_hash;
     uint64_t previous_hash;
+    uint64_t current_profile_hash;
+    uint64_t previous_profile_hash;
     int iterations;
     bool converged;
     double stability;       /* 0.0-1.0, how stable is the IR */
     double edit_distance;   /* Normalized difference from previous */
+    int stable_iterations;
 } ConvergenceMetrics;
 
 /* Initialize convergence tracking */
 void convergence_init(ConvergenceMetrics *metrics);
 
-/* Update with new IR hash, returns true if converged */
-bool convergence_update(ConvergenceMetrics *metrics, uint64_t new_hash);
+/* Update with new IR/profile hashes, returns true if converged */
+bool convergence_update(ConvergenceMetrics *metrics, uint64_t new_hash,
+                        uint64_t new_profile_hash);
 
 /* Check if should continue iterating */
 bool convergence_should_continue(ConvergenceMetrics *metrics, int max_iterations);

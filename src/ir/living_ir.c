@@ -272,6 +272,152 @@ static bool successor_has_phi_from_block(LLVMBasicBlockRef block,
     return false;
 }
 
+static bool value_belongs_to_function(LLVMValueRef value, LLVMValueRef func) {
+    if (!value || !func) return false;
+    if (LLVMIsAConstant(value) || LLVMIsAGlobalValue(value) || LLVMIsAFunction(value)) {
+        return true;
+    }
+    if (LLVMIsAArgument(value)) {
+        return LLVMGetParamParent(value) == func;
+    }
+    if (LLVMIsAInstruction(value)) {
+        return LLVMGetBasicBlockParent(LLVMGetInstructionParent(value)) == func;
+    }
+    return false;
+}
+
+static bool block_has_only_uncond_branch(LLVMBasicBlockRef block) {
+    LLVMValueRef first;
+    LLVMValueRef term;
+
+    if (!block) return false;
+    first = LLVMGetFirstInstruction(block);
+    term = LLVMGetBasicBlockTerminator(block);
+    if (!first || !term) return false;
+    if (first != term) return false;
+    if (LLVMGetInstructionOpcode(term) != LLVMBr) return false;
+    if (LLVMGetNumSuccessors(term) != 1) return false;
+    return true;
+}
+
+static bool collapse_trivial_bridge_block(LLVMValueRef func, LLVMBasicBlockRef block) {
+    LLVMBasicBlockRef succ;
+    LLVMValueRef pred_term;
+
+    if (!func || !block) return false;
+    if (count_block_predecessors(block) != 1) return false;
+    if (!block_has_only_uncond_branch(block)) return false;
+
+    succ = LLVMGetSuccessor(LLVMGetBasicBlockTerminator(block), 0);
+    if (!succ || succ == block) return false;
+    if (successor_has_phi_from_block(block, succ)) return false;
+
+    for (LLVMBasicBlockRef candidate = LLVMGetFirstBasicBlock(func);
+         candidate != NULL;
+         candidate = LLVMGetNextBasicBlock(candidate)) {
+        LLVMValueRef term = LLVMGetBasicBlockTerminator(candidate);
+        if (!term) continue;
+        for (unsigned i = 0; i < LLVMGetNumSuccessors(term); i++) {
+            if (LLVMGetSuccessor(term, i) == block) {
+                pred_term = term;
+                LLVMSetSuccessor(pred_term, i, succ);
+                LLVMDeleteBasicBlock(block);
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static bool merge_linear_bridge_block(LivingIR *ir, LLVMValueRef func,
+                                      LLVMBasicBlockRef block) {
+    LLVMBasicBlockRef pred = NULL;
+    LLVMBasicBlockRef succ;
+    LLVMValueRef pred_term = NULL;
+    LLVMValueRef block_term;
+    LLVMBuilderRef builder;
+    ValueRemap remap[128];
+    int remap_count = 0;
+
+    if (!ir || !func || !block) return false;
+    if (count_block_predecessors(block) != 1) return false;
+
+    block_term = LLVMGetBasicBlockTerminator(block);
+    if (!block_term || LLVMGetInstructionOpcode(block_term) != LLVMBr ||
+        LLVMGetNumSuccessors(block_term) != 1) {
+        return false;
+    }
+
+    succ = LLVMGetSuccessor(block_term, 0);
+    if (!succ || succ == block) return false;
+    if (successor_has_phi_from_block(block, succ)) return false;
+
+    for (LLVMValueRef inst = LLVMGetFirstInstruction(block);
+         inst != NULL && inst != block_term;
+         inst = LLVMGetNextInstruction(inst)) {
+        if (LLVMIsAPHINode(inst)) return false;
+    }
+
+    for (LLVMBasicBlockRef candidate = LLVMGetFirstBasicBlock(func);
+         candidate != NULL;
+         candidate = LLVMGetNextBasicBlock(candidate)) {
+        LLVMValueRef term = LLVMGetBasicBlockTerminator(candidate);
+        if (!term) continue;
+        for (unsigned i = 0; i < LLVMGetNumSuccessors(term); i++) {
+            if (LLVMGetSuccessor(term, i) == block) {
+                pred = candidate;
+                pred_term = term;
+                break;
+            }
+        }
+        if (pred) break;
+    }
+
+    if (!pred || !pred_term) return false;
+
+    builder = LLVMCreateBuilderInContext(ir->context);
+    LLVMPositionBuilderBefore(builder, pred_term);
+
+    for (LLVMValueRef inst = LLVMGetFirstInstruction(block);
+         inst != NULL && inst != block_term;
+         inst = LLVMGetNextInstruction(inst)) {
+        LLVMValueRef clone = LLVMInstructionClone(inst);
+        int operands;
+
+        if (!clone) {
+            LLVMDisposeBuilder(builder);
+            return false;
+        }
+
+        operands = LLVMGetNumOperands(clone);
+        for (int op = 0; op < operands; op++) {
+            LLVMValueRef operand = LLVMGetOperand(clone, op);
+            LLVMValueRef mapped = remap_lookup(remap, remap_count, operand);
+            if (mapped) {
+                LLVMSetOperand(clone, op, mapped);
+            }
+        }
+
+        LLVMInsertIntoBuilder(builder, clone);
+        remap[remap_count].from = inst;
+        remap[remap_count].to = clone;
+        remap_count++;
+    }
+
+    LLVMDisposeBuilder(builder);
+
+    for (unsigned i = 0; i < LLVMGetNumSuccessors(pred_term); i++) {
+        if (LLVMGetSuccessor(pred_term, i) == block) {
+            LLVMSetSuccessor(pred_term, i, succ);
+            LLVMDeleteBasicBlock(block);
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static ColdBlock *find_cold_block_for_bb(LivingIR *ir, LLVMBasicBlockRef bb) {
     if (!ir || !bb) return NULL;
 
@@ -292,14 +438,29 @@ static double estimate_block_frequency_depth(LivingIR *ir, const char *func_name
                                              LLVMBasicBlockRef *trail,
                                              int trail_count) {
     double freq = total_blocks > 0 ? 1.0 / total_blocks : 1.0;
-    bool used_profile = false;
     LLVMValueRef func;
+    LLVMBasicBlockRef next_trail[16];
+    int next_trail_count = 0;
+    bool saw_incoming = false;
 
     if (!ir || !func_name || !bb || !pf) return freq;
-    if (depth > 6) return freq;
+    if (depth > 8) return freq;
     if (trail && block_in_region(bb, trail, trail_count)) return freq;
 
     func = LLVMGetBasicBlockParent(bb);
+    if (bb == LLVMGetEntryBasicBlock(func)) {
+        return 1.0;
+    }
+
+    if (trail && trail_count > 0) {
+        next_trail_count = trail_count < 15 ? trail_count : 15;
+        for (int i = 0; i < next_trail_count; i++) {
+            next_trail[i] = trail[i];
+        }
+    }
+    next_trail[next_trail_count++] = bb;
+
+    freq = 0.0;
     for (LLVMBasicBlockRef pred = LLVMGetFirstBasicBlock(func);
          pred != NULL;
          pred = LLVMGetNextBasicBlock(pred)) {
@@ -308,35 +469,60 @@ static double estimate_block_frequency_depth(LivingIR *ir, const char *func_name
         char location[256];
         ProfileBranch *branch;
         double edge_prob;
+        double pred_freq;
+        unsigned succ_count;
 
-        if (!term || LLVMGetInstructionOpcode(term) != LLVMBr ||
-            LLVMGetNumSuccessors(term) != 2) {
+        if (!term) {
             continue;
         }
 
-        line = get_qisc_line_metadata(ir, term);
-        if (line <= 0) continue;
+        succ_count = LLVMGetNumSuccessors(term);
+        if (succ_count == 0) {
+            continue;
+        }
 
-        snprintf(location, sizeof(location), "%s:%d", func_name, line);
-        branch = profile_get_branch(ir->profile, location);
-        if (!branch) continue;
+        if (succ_count == 1) {
+            if (LLVMGetSuccessor(term, 0) != bb) {
+                continue;
+            }
+            edge_prob = 1.0;
+        } else if (succ_count == 2) {
+            line = get_qisc_line_metadata(ir, term);
+            if (line > 0) {
+                snprintf(location, sizeof(location), "%s:%d", func_name, line);
+                branch = profile_get_branch(ir->profile, location);
+            } else {
+                branch = NULL;
+            }
 
-        if (LLVMGetSuccessor(term, 0) == bb) {
-            edge_prob = branch->taken_ratio;
-        } else if (LLVMGetSuccessor(term, 1) == bb) {
-            edge_prob = 1.0 - branch->taken_ratio;
+            if (LLVMGetSuccessor(term, 0) == bb) {
+                edge_prob = branch ? branch->taken_ratio : 0.5;
+            } else if (LLVMGetSuccessor(term, 1) == bb) {
+                edge_prob = branch ? (1.0 - branch->taken_ratio) : 0.5;
+            } else {
+                continue;
+            }
         } else {
             continue;
         }
 
-        freq = used_profile ? (freq + edge_prob) : edge_prob;
-        used_profile = true;
+        saw_incoming = true;
+        pred_freq = estimate_block_frequency_depth(ir, func_name, pred, pf,
+                                                   total_blocks, depth + 1,
+                                                   next_trail,
+                                                   next_trail_count);
+        freq += pred_freq * edge_prob;
     }
 
-    if (!used_profile && bb == LLVMGetEntryBasicBlock(func)) {
+    if (freq <= 0.0) {
+        if (saw_incoming) {
+            return 0.0;
+        }
+        return total_blocks > 0 ? 1.0 / total_blocks : 1.0;
+    }
+    if (freq > 1.0) {
         return 1.0;
     }
-
     return freq;
 }
 
@@ -440,6 +626,141 @@ static int collect_linear_cold_region(LivingIR *ir, ColdBlock *cold,
 
     if (total_inst_count) *total_inst_count = inst_total;
     return region_count;
+}
+
+static bool region_has_single_exit(LLVMBasicBlockRef *region, int region_count,
+                                   LLVMBasicBlockRef exit_successor) {
+    if (!region || region_count <= 0 || !exit_successor) return false;
+
+    for (int i = 0; i < region_count; i++) {
+        LLVMValueRef term = LLVMGetBasicBlockTerminator(region[i]);
+        unsigned succ_count;
+
+        if (!term) return false;
+        succ_count = LLVMGetNumSuccessors(term);
+        for (unsigned s = 0; s < succ_count; s++) {
+            LLVMBasicBlockRef succ = LLVMGetSuccessor(term, s);
+            if (!block_in_region(succ, region, region_count) &&
+                succ != exit_successor) {
+                return false;
+            }
+        }
+    }
+
+    for (int i = 0; i < region_count; i++) {
+        if (successor_has_phi_from_block(region[i], exit_successor)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static int collect_diamond_cold_region(LivingIR *ir, ColdBlock *cold,
+                                       LLVMBasicBlockRef *region, int max_region,
+                                       LLVMBasicBlockRef *exit_successor,
+                                       int *total_inst_count) {
+    LLVMValueRef entry_term;
+    LLVMBasicBlockRef left;
+    LLVMBasicBlockRef right;
+    LLVMValueRef left_term;
+    LLVMValueRef right_term;
+    LLVMBasicBlockRef exit_block;
+    int inst_total = 0;
+
+    if (!ir || !cold || !region || max_region < 3 || !cold->block) return 0;
+
+    entry_term = LLVMGetBasicBlockTerminator(cold->block);
+    if (!entry_term || LLVMGetInstructionOpcode(entry_term) != LLVMBr ||
+        LLVMGetNumSuccessors(entry_term) != 2) {
+        return 0;
+    }
+
+    left = LLVMGetSuccessor(entry_term, 0);
+    right = LLVMGetSuccessor(entry_term, 1);
+    if (!left || !right || left == right) return 0;
+    if (left == cold->block || right == cold->block) return 0;
+    if (LLVMGetBasicBlockParent(left) != LLVMGetBasicBlockParent(cold->block) ||
+        LLVMGetBasicBlockParent(right) != LLVMGetBasicBlockParent(cold->block)) {
+        return 0;
+    }
+    if (left == LLVMGetEntryBasicBlock(LLVMGetBasicBlockParent(left)) ||
+        right == LLVMGetEntryBasicBlock(LLVMGetBasicBlockParent(right))) {
+        return 0;
+    }
+    if (count_block_predecessors(left) != 1 || count_block_predecessors(right) != 1) {
+        return 0;
+    }
+    if (!find_cold_block_for_bb(ir, left) || !find_cold_block_for_bb(ir, right)) {
+        return 0;
+    }
+    if (!find_cold_block_for_bb(ir, left)->can_outline ||
+        !find_cold_block_for_bb(ir, right)->can_outline) {
+        return 0;
+    }
+    if (successor_has_phi_from_block(cold->block, left) ||
+        successor_has_phi_from_block(cold->block, right)) {
+        return 0;
+    }
+
+    left_term = LLVMGetBasicBlockTerminator(left);
+    right_term = LLVMGetBasicBlockTerminator(right);
+    if (!left_term || !right_term) return 0;
+    if (LLVMGetInstructionOpcode(left_term) != LLVMBr ||
+        LLVMGetInstructionOpcode(right_term) != LLVMBr) {
+        return 0;
+    }
+    if (LLVMGetNumSuccessors(left_term) != 1 || LLVMGetNumSuccessors(right_term) != 1) {
+        return 0;
+    }
+
+    exit_block = LLVMGetSuccessor(left_term, 0);
+    if (!exit_block || LLVMGetSuccessor(right_term, 0) != exit_block) {
+        return 0;
+    }
+
+    region[0] = cold->block;
+    region[1] = left;
+    region[2] = right;
+
+    if (!region_has_single_exit(region, 3, exit_block)) {
+        return 0;
+    }
+
+    for (int i = 0; i < 3; i++) {
+        LLVMValueRef term = LLVMGetBasicBlockTerminator(region[i]);
+        for (LLVMValueRef inst = LLVMGetFirstInstruction(region[i]);
+             inst != NULL;
+             inst = LLVMGetNextInstruction(inst)) {
+            inst_total++;
+            if (inst == term) break;
+            if (LLVMIsAPHINode(inst)) return 0;
+            if (LLVMGetTypeKind(LLVMTypeOf(inst)) != LLVMVoidTypeKind &&
+                value_used_outside_region(inst, region, 3)) {
+                return 0;
+            }
+        }
+    }
+
+    if (exit_successor) *exit_successor = exit_block;
+    if (total_inst_count) *total_inst_count = inst_total;
+    return 3;
+}
+
+static int collect_cold_region(LivingIR *ir, ColdBlock *cold,
+                               LLVMBasicBlockRef *region, int max_region,
+                               LLVMBasicBlockRef *exit_successor,
+                               int *total_inst_count) {
+    int region_count;
+
+    region_count = collect_linear_cold_region(
+        ir, cold, region, max_region, exit_successor, total_inst_count);
+    if (region_count > 0) {
+        return region_count;
+    }
+
+    return collect_diamond_cold_region(
+        ir, cold, region, max_region, exit_successor, total_inst_count);
 }
 
 static int collect_outline_inputs(ColdBlock *cold, LLVMValueRef *inputs,
@@ -576,6 +897,161 @@ static char *create_unique_cold_function_name(LivingIR *ir,
     }
 
     return name;
+}
+
+static char *create_unique_hot_clone_name(LivingIR *ir, const char *original) {
+    char *name;
+    int suffix = 0;
+    size_t len;
+
+    if (!ir || !original) return NULL;
+
+    len = strlen(original) + 32;
+    name = malloc(len);
+    if (!name) return NULL;
+
+    snprintf(name, len, "%s.__hotclone_%d", original, suffix);
+    while (LLVMGetNamedFunction(ir->module, name) != NULL) {
+        suffix++;
+        snprintf(name, len, "%s.__hotclone_%d", original, suffix);
+    }
+
+    return name;
+}
+
+static bool is_cold_helper_function(LLVMValueRef func) {
+    const char *name;
+
+    if (!func) return false;
+    name = get_function_name(func);
+    if (!name) return false;
+    return strstr(name, ".__cold_") != NULL;
+}
+
+static bool is_simple_void_tail_helper(LLVMValueRef func) {
+    LLVMBasicBlockRef entry;
+    LLVMValueRef term;
+    LLVMTypeRef fn_ty;
+
+    if (!func || LLVMIsDeclaration(func)) return false;
+    if (!is_cold_helper_function(func)) return false;
+    if (count_function_blocks(func) != 1) return false;
+
+    fn_ty = LLVMGlobalGetValueType(func);
+    if (!fn_ty || LLVMGetTypeKind(LLVMGetReturnType(fn_ty)) != LLVMVoidTypeKind) {
+        return false;
+    }
+
+    entry = LLVMGetFirstBasicBlock(func);
+    term = LLVMGetBasicBlockTerminator(entry);
+    if (!term || LLVMGetInstructionOpcode(term) != LLVMRet) return false;
+
+    for (LLVMValueRef inst = LLVMGetFirstInstruction(entry);
+         inst != NULL && inst != term;
+         inst = LLVMGetNextInstruction(inst)) {
+        if (LLVMIsAPHINode(inst)) return false;
+    }
+
+    return true;
+}
+
+static LLVMValueRef clone_function_body(LivingIR *ir, LLVMValueRef func,
+                                        const char *clone_name) {
+    LLVMTypeRef fn_type;
+    LLVMValueRef clone_func;
+    ValueRemap remap[4096];
+    int remap_count = 0;
+
+    if (!ir || !func || !clone_name) return NULL;
+
+    fn_type = LLVMGlobalGetValueType(func);
+    clone_func = LLVMAddFunction(ir->module, clone_name, fn_type);
+    if (!clone_func) return NULL;
+
+    LLVMSetLinkage(clone_func, LLVMInternalLinkage);
+    remap[remap_count].from = func;
+    remap[remap_count].to = clone_func;
+    remap_count++;
+
+    for (unsigned i = 0; i < LLVMCountParams(func); i++) {
+        LLVMValueRef old_param = LLVMGetParam(func, i);
+        LLVMValueRef new_param = LLVMGetParam(clone_func, i);
+        remap[remap_count].from = old_param;
+        remap[remap_count].to = new_param;
+        remap_count++;
+    }
+
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(func);
+         bb != NULL;
+         bb = LLVMGetNextBasicBlock(bb)) {
+        const char *bb_name = LLVMGetBasicBlockName(bb);
+        LLVMBasicBlockRef clone_bb =
+            LLVMAppendBasicBlockInContext(ir->context, clone_func,
+                                          bb_name && *bb_name ? bb_name : "bb");
+        remap[remap_count].from = LLVMBasicBlockAsValue(bb);
+        remap[remap_count].to = LLVMBasicBlockAsValue(clone_bb);
+        remap_count++;
+    }
+
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(func);
+         bb != NULL;
+         bb = LLVMGetNextBasicBlock(bb)) {
+        LLVMBasicBlockRef clone_bb =
+            LLVMValueAsBasicBlock(remap_lookup(remap, remap_count,
+                                               LLVMBasicBlockAsValue(bb)));
+        LLVMBuilderRef builder = LLVMCreateBuilderInContext(ir->context);
+        LLVMPositionBuilderAtEnd(builder, clone_bb);
+
+        for (LLVMValueRef inst = LLVMGetFirstInstruction(bb);
+             inst != NULL;
+             inst = LLVMGetNextInstruction(inst)) {
+            LLVMValueRef clone_inst = LLVMInstructionClone(inst);
+            int operands;
+
+            if (!clone_inst) continue;
+
+            operands = LLVMGetNumOperands(clone_inst);
+            for (int op = 0; op < operands; op++) {
+                LLVMValueRef operand = LLVMGetOperand(clone_inst, op);
+                LLVMValueRef mapped = remap_lookup(remap, remap_count, operand);
+                if (mapped) {
+                    LLVMSetOperand(clone_inst, op, mapped);
+                }
+            }
+
+            LLVMInsertIntoBuilder(builder, clone_inst);
+            remap[remap_count].from = inst;
+            remap[remap_count].to = clone_inst;
+            remap_count++;
+        }
+
+        LLVMDisposeBuilder(builder);
+    }
+
+    return clone_func;
+}
+
+static bool redirect_calls_in_caller(LLVMValueRef caller, LLVMValueRef from_func,
+                                     LLVMValueRef to_func) {
+    bool changed = false;
+
+    if (!caller || !from_func || !to_func) return false;
+
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(caller);
+         bb != NULL;
+         bb = LLVMGetNextBasicBlock(bb)) {
+        for (LLVMValueRef inst = LLVMGetFirstInstruction(bb);
+             inst != NULL;
+             inst = LLVMGetNextInstruction(inst)) {
+            if (LLVMGetInstructionOpcode(inst) != LLVMCall) continue;
+            if (LLVMGetCalledValue(inst) != from_func) continue;
+
+            LLVMSetOperand(inst, LLVMGetNumArgOperands(inst), to_func);
+            changed = true;
+        }
+    }
+
+    return changed;
 }
 
 static double sample_confidence(uint64_t samples, uint64_t high_water) {
@@ -1261,10 +1737,7 @@ void living_ir_inline_hot_paths(LivingIR *ir) {
         /* Find the callee function and add inline hint */
         LLVMValueRef callee_func = LLVMGetNamedFunction(ir->module, candidate->callee);
         if (callee_func) {
-            /* Add alwaysinline attribute for hot functions */
-            LLVMAddAttributeAtIndex(callee_func, LLVMAttributeFunctionIndex,
-                LLVMCreateEnumAttribute(ir->context, 
-                    LLVMGetEnumAttributeKindForName("alwaysinline", 12), 0));
+            add_enum_attr_if_supported(ir, callee_func, "inlinehint");
             ir->metrics.functions_inlined++;
         }
     }
@@ -1314,7 +1787,7 @@ void living_ir_outline_cold_paths(LivingIR *ir) {
         if (!cold->can_outline) continue;
         if (block_in_region(cold->block, processed, processed_count)) continue;
 
-        region_count = collect_linear_cold_region(
+        region_count = collect_cold_region(
             ir, cold, region, 16, &successor, &region_inst_count);
         if (region_count <= 0) {
             cold->reason = "outline requires unsupported control/data flow";
@@ -1407,8 +1880,45 @@ void living_ir_outline_cold_paths(LivingIR *ir) {
                 remap_count++;
             }
 
-            if (b + 1 < region_count) {
-                LLVMBuildBr(builder, helper_blocks[b + 1]);
+            if (term && LLVMGetInstructionOpcode(term) == LLVMBr) {
+                unsigned succ_count = LLVMGetNumSuccessors(term);
+                if (succ_count == 1) {
+                    LLVMBasicBlockRef succ = LLVMGetSuccessor(term, 0);
+                    if (block_in_region(succ, region, region_count)) {
+                        for (int t = 0; t < region_count; t++) {
+                            if (region[t] == succ) {
+                                LLVMBuildBr(builder, helper_blocks[t]);
+                                break;
+                            }
+                        }
+                    } else {
+                        LLVMBuildRetVoid(builder);
+                    }
+                } else if (succ_count == 2) {
+                    LLVMBasicBlockRef succ0 = LLVMGetSuccessor(term, 0);
+                    LLVMBasicBlockRef succ1 = LLVMGetSuccessor(term, 1);
+                    LLVMValueRef cond = LLVMGetOperand(term, 0);
+                    LLVMValueRef mapped_cond = remap_lookup(remap, remap_count, cond);
+                    LLVMBasicBlockRef helper_succ0 = NULL;
+                    LLVMBasicBlockRef helper_succ1 = NULL;
+
+                    if (!mapped_cond) {
+                        mapped_cond = cond;
+                    }
+
+                    for (int t = 0; t < region_count; t++) {
+                        if (region[t] == succ0) helper_succ0 = helper_blocks[t];
+                        if (region[t] == succ1) helper_succ1 = helper_blocks[t];
+                    }
+
+                    if (!helper_succ0 || !helper_succ1) {
+                        LLVMBuildRetVoid(builder);
+                    } else {
+                        LLVMBuildCondBr(builder, mapped_cond, helper_succ0, helper_succ1);
+                    }
+                } else {
+                    LLVMBuildRetVoid(builder);
+                }
             } else {
                 LLVMBuildRetVoid(builder);
             }
@@ -1685,8 +2195,16 @@ void living_ir_clone_hot_functions(LivingIR *ir) {
     for (LLVMValueRef func = LLVMGetFirstFunction(ir->module);
          func != NULL;
          func = LLVMGetNextFunction(func)) {
+        LLVMValueRef callers[64];
+        int caller_count;
+        LLVMValueRef hot_caller = NULL;
+        int hot_caller_count = 0;
+        char *clone_name;
+        LLVMValueRef clone_func;
+        bool redirected;
         
         if (should_skip_function(ir, func)) continue;
+        if (is_cold_helper_function(func)) continue;
         
         const char *func_name = get_function_name(func);
         ProfileFunction *pf = profile_get_function(
@@ -1695,6 +2213,61 @@ void living_ir_clone_hot_functions(LivingIR *ir) {
         if (!pf || !pf->is_hot) continue;
 
         specialize_function_from_profile(ir, func, pf);
+
+        caller_count = find_call_sites(ir->module, func, callers, 64);
+        if (caller_count < 2) continue;
+
+        for (int i = 0; i < caller_count; i++) {
+            LLVMValueRef caller = callers[i];
+            ProfileFunction *caller_pf;
+            bool seen = false;
+
+            for (int j = 0; j < i; j++) {
+                if (callers[j] == caller) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+
+            caller_pf = profile_get_function(
+                ir->profile, profile_function_name(get_function_name(caller)));
+            if (!caller_pf || !caller_pf->is_hot) continue;
+
+            hot_caller = caller;
+            hot_caller_count++;
+            if (hot_caller_count > 1) break;
+        }
+
+        if (hot_caller_count != 1) continue;
+        if (count_function_instructions(func) > 96) continue;
+
+        clone_name = create_unique_hot_clone_name(ir, func_name);
+        if (!clone_name) {
+            ir->metrics.mutations_rejected++;
+            continue;
+        }
+
+        clone_func = clone_function_body(ir, func, clone_name);
+        free(clone_name);
+        if (!clone_func) {
+            ir->metrics.mutations_rejected++;
+            continue;
+        }
+
+        add_enum_attr_if_supported(ir, clone_func, "hot");
+        add_enum_attr_if_supported(ir, clone_func, "inlinehint");
+        LLVMSetSection(clone_func, ".text.hot");
+
+        redirected = redirect_calls_in_caller(hot_caller, func, clone_func);
+        if (!redirected) {
+            LLVMDeleteFunction(clone_func);
+            ir->metrics.mutations_rejected++;
+            continue;
+        }
+
+        ir->metrics.hot_functions_specialized++;
+        ir->metrics.code_size_delta += (uint64_t)count_function_instructions(clone_func);
     }
 }
 
@@ -1726,20 +2299,200 @@ void living_ir_merge_cold_functions(LivingIR *ir) {
     for (LLVMValueRef func = LLVMGetFirstFunction(ir->module);
          func != NULL;
          func = LLVMGetNextFunction(func)) {
-        
-        if (should_skip_function(ir, func)) continue;
-        
-        const char *func_name = get_function_name(func);
-        ProfileFunction *pf = profile_get_function(
-            ir->profile, profile_function_name(func_name));
-        
-        if (!pf || !pf->is_cold) continue;
-        
-        int size = count_function_instructions(func);
-        
-        /* Very small cold functions could be merged into callers */
-        if (size < 10 && pf->call_count < 100) {
-            specialize_function_from_profile(ir, func, pf);
+        for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(func);
+             bb != NULL;) {
+            LLVMValueRef tail_call = NULL;
+            LLVMValueRef tail_helper = NULL;
+            LLVMBasicBlockRef pred_block = NULL;
+            LLVMValueRef pred_call = NULL;
+            LLVMValueRef pred_helper = NULL;
+            LLVMBasicBlockRef next_bb = LLVMGetNextBasicBlock(bb);
+            bool mergeable = true;
+            LLVMBasicBlockRef helper_entry;
+            LLVMValueRef helper_term;
+
+            if (!bb) {
+                bb = next_bb;
+                continue;
+            }
+
+            for (LLVMValueRef inst = LLVMGetFirstInstruction(bb);
+                 inst != NULL;
+                 inst = LLVMGetNextInstruction(inst)) {
+                if (LLVMGetInstructionOpcode(inst) == LLVMCall) {
+                    tail_call = inst;
+                    break;
+                }
+            }
+
+            if (!tail_call && count_block_predecessors(bb) == 1) {
+                for (LLVMBasicBlockRef candidate = LLVMGetFirstBasicBlock(func);
+                     candidate != NULL;
+                     candidate = LLVMGetNextBasicBlock(candidate)) {
+                    LLVMValueRef term = LLVMGetBasicBlockTerminator(candidate);
+                    if (!term) continue;
+                    for (unsigned s = 0; s < LLVMGetNumSuccessors(term); s++) {
+                        if (LLVMGetSuccessor(term, s) == bb) {
+                            pred_block = candidate;
+                            break;
+                        }
+                    }
+                    if (pred_block) break;
+                }
+
+                if (pred_block) {
+                    for (LLVMValueRef inst = LLVMGetFirstInstruction(pred_block);
+                         inst != NULL;
+                         inst = LLVMGetNextInstruction(inst)) {
+                        if (LLVMGetInstructionOpcode(inst) == LLVMCall) {
+                            pred_call = inst;
+                            break;
+                        }
+                    }
+                    if (pred_call) {
+                        pred_helper = LLVMGetCalledValue(pred_call);
+                        if (pred_helper && is_cold_helper_function(pred_helper) &&
+                            !LLVMIsDeclaration(pred_helper) &&
+                            merge_linear_bridge_block(ir, func, bb)) {
+                            ir->metrics.cold_functions_specialized++;
+                            bb = next_bb;
+                            continue;
+                        }
+                    }
+                }
+
+                bb = next_bb;
+                continue;
+            }
+            if (!tail_call) {
+                bb = next_bb;
+                continue;
+            }
+
+            tail_helper = LLVMGetCalledValue(tail_call);
+            if (!tail_helper || !is_simple_void_tail_helper(tail_helper)) {
+                bb = next_bb;
+                continue;
+            }
+
+            if (count_block_predecessors(bb) != 1) {
+                bb = next_bb;
+                continue;
+            }
+            for (LLVMBasicBlockRef candidate = LLVMGetFirstBasicBlock(func);
+                 candidate != NULL;
+                 candidate = LLVMGetNextBasicBlock(candidate)) {
+                LLVMValueRef term = LLVMGetBasicBlockTerminator(candidate);
+                if (!term) continue;
+                for (unsigned s = 0; s < LLVMGetNumSuccessors(term); s++) {
+                    if (LLVMGetSuccessor(term, s) == bb) {
+                        pred_block = candidate;
+                        break;
+                    }
+                }
+                if (pred_block) break;
+            }
+            if (!pred_block) {
+                bb = next_bb;
+                continue;
+            }
+
+            for (LLVMValueRef inst = LLVMGetFirstInstruction(pred_block);
+                 inst != NULL;
+                 inst = LLVMGetNextInstruction(inst)) {
+                if (LLVMGetInstructionOpcode(inst) == LLVMCall) {
+                    pred_call = inst;
+                    break;
+                }
+            }
+            if (!pred_call) {
+                bb = next_bb;
+                continue;
+            }
+
+            pred_helper = LLVMGetCalledValue(pred_call);
+            if (!pred_helper || !is_cold_helper_function(pred_helper) ||
+                LLVMIsDeclaration(pred_helper) || pred_helper == tail_helper) {
+                bb = next_bb;
+                continue;
+            }
+
+            for (unsigned i = 0; i < LLVMCountParams(tail_helper); i++) {
+                LLVMValueRef tail_arg = LLVMGetArgOperand(tail_call, i);
+                if (!value_belongs_to_function(tail_arg, func)) {
+                    mergeable = false;
+                    break;
+                }
+            }
+
+            if (!mergeable) {
+                bb = next_bb;
+                continue;
+            }
+
+            helper_entry = LLVMGetFirstBasicBlock(tail_helper);
+            helper_term = LLVMGetBasicBlockTerminator(helper_entry);
+            if (!helper_entry || !helper_term) {
+                bb = next_bb;
+                continue;
+            }
+
+            {
+                LLVMBuilderRef builder;
+                ValueRemap remap[128];
+                int remap_count = 0;
+                LLVMValueRef bb_term = LLVMGetBasicBlockTerminator(bb);
+
+                if (!bb_term) {
+                    bb = next_bb;
+                    continue;
+                }
+                builder = LLVMCreateBuilderInContext(ir->context);
+                LLVMPositionBuilderBefore(builder, bb_term);
+
+                for (unsigned i = 0; i < LLVMCountParams(tail_helper); i++) {
+                    remap[remap_count].from = LLVMGetParam(tail_helper, i);
+                    remap[remap_count].to = LLVMGetArgOperand(tail_call, i);
+                    remap_count++;
+                }
+
+                for (LLVMValueRef inst = LLVMGetFirstInstruction(helper_entry);
+                     inst != NULL && inst != helper_term;
+                     inst = LLVMGetNextInstruction(inst)) {
+                    LLVMValueRef clone = LLVMInstructionClone(inst);
+                    int operands;
+                    if (!clone) continue;
+
+                    operands = LLVMGetNumOperands(clone);
+                    for (int op = 0; op < operands; op++) {
+                        LLVMValueRef operand = LLVMGetOperand(clone, op);
+                        LLVMValueRef mapped = remap_lookup(remap, remap_count, operand);
+                        if (mapped) {
+                            LLVMSetOperand(clone, op, mapped);
+                        }
+                    }
+
+                    LLVMInsertIntoBuilder(builder, clone);
+                    remap[remap_count].from = inst;
+                    remap[remap_count].to = clone;
+                    remap_count++;
+                }
+
+                LLVMDisposeBuilder(builder);
+            }
+
+            LLVMInstructionEraseFromParent(tail_call);
+            if (LLVMGetFirstUse(tail_helper) == NULL) {
+                LLVMDeleteFunction(tail_helper);
+            }
+            if (block_has_only_uncond_branch(bb)) {
+                collapse_trivial_bridge_block(func, bb);
+            } else {
+                merge_linear_bridge_block(ir, func, bb);
+            }
+            ir->metrics.cold_functions_specialized++;
+
+            bb = next_bb;
         }
     }
 }

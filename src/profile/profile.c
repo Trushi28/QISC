@@ -13,6 +13,26 @@
 #include <time.h>
 
 #define PROFILE_VERSION 1
+#define PROFILE_FNV_OFFSET 14695981039346656037ULL
+#define PROFILE_FNV_PRIME 1099511628211ULL
+
+static uint64_t profile_hash_bytes(uint64_t hash, const void *data, size_t len) {
+  const unsigned char *bytes = (const unsigned char *)data;
+  for (size_t i = 0; i < len; i++) {
+    hash ^= bytes[i];
+    hash *= PROFILE_FNV_PRIME;
+  }
+  return hash;
+}
+
+static uint64_t profile_hash_u64(uint64_t hash, uint64_t value) {
+  return profile_hash_bytes(hash, &value, sizeof(value));
+}
+
+static uint64_t profile_hash_bool(uint64_t hash, bool value) {
+  uint8_t v = value ? 1 : 0;
+  return profile_hash_bytes(hash, &v, sizeof(v));
+}
 
 /* ======== Initialization ======== */
 
@@ -651,6 +671,51 @@ void profile_set_ir_hash(QiscProfile *profile, uint64_t hash) {
 
 bool profile_check_convergence(QiscProfile *profile, uint64_t current_hash) {
   return profile->ir_hash != 0 && profile->ir_hash == current_hash;
+}
+
+uint64_t profile_fingerprint(const QiscProfile *profile) {
+  uint64_t hash = PROFILE_FNV_OFFSET;
+
+  if (!profile) return 0;
+
+  hash = profile_hash_u64(hash, (uint64_t)profile->function_count);
+  hash = profile_hash_u64(hash, (uint64_t)profile->branch_count);
+  hash = profile_hash_u64(hash, (uint64_t)profile->loop_count);
+
+  for (int i = 0; i < profile->function_count; i++) {
+    const ProfileFunction *fn = &profile->functions[i];
+    uint64_t avg_bucket = (uint64_t)(fn->avg_time_us * 1000.0);
+    if (fn->name) {
+      hash = profile_hash_bytes(hash, fn->name, strlen(fn->name));
+    }
+    hash = profile_hash_bool(hash, fn->is_hot);
+    hash = profile_hash_bool(hash, fn->is_cold);
+    hash = profile_hash_bool(hash, fn->should_inline);
+    hash = profile_hash_u64(hash, avg_bucket);
+  }
+
+  for (int i = 0; i < profile->branch_count; i++) {
+    const ProfileBranch *br = &profile->branches[i];
+    uint64_t ratio_bucket = (uint64_t)(br->taken_ratio * 10000.0 + 0.5);
+    if (br->location) {
+      hash = profile_hash_bytes(hash, br->location, strlen(br->location));
+    }
+    hash = profile_hash_u64(hash, ratio_bucket);
+    hash = profile_hash_bool(hash, br->is_predictable);
+  }
+
+  for (int i = 0; i < profile->loop_count; i++) {
+    const ProfileLoop *lp = &profile->loops[i];
+    uint64_t avg_bucket = (uint64_t)(lp->avg_iterations * 100.0 + 0.5);
+    if (lp->location) {
+      hash = profile_hash_bytes(hash, lp->location, strlen(lp->location));
+    }
+    hash = profile_hash_u64(hash, avg_bucket);
+    hash = profile_hash_bool(hash, lp->should_unroll);
+    hash = profile_hash_u64(hash, (uint64_t)lp->suggested_unroll_factor);
+  }
+
+  return hash;
 }
 
 /* ======== Printing ======== */

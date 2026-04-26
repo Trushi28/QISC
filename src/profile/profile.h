@@ -135,6 +135,7 @@ int profile_get_opt_level(QiscProfile *profile, const char *func_name);
 /* Convergence detection */
 void profile_set_ir_hash(QiscProfile *profile, uint64_t hash);
 bool profile_check_convergence(QiscProfile *profile, uint64_t current_hash);
+uint64_t profile_fingerprint(const QiscProfile *profile);
 
 /* Print profile summary */
 void profile_print_summary(QiscProfile *profile);

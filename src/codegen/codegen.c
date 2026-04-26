@@ -2247,8 +2247,8 @@ static void cg_apply_pragma_attrs(Codegen *cg, LLVMValueRef func) {
   
   /* Inline control */
   if (opts->enable_inline && opts->mark_hot_path) {
-    /* #pragma inline:always or hot_path → alwaysinline */
-    kind = LLVMGetEnumAttributeKindForName("alwaysinline", 12);
+    /* Hot-path inlining should remain a strong hint, not fight noinline. */
+    kind = LLVMGetEnumAttributeKindForName("inlinehint", 10);
     LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex,
         LLVMCreateEnumAttribute(cg->ctx, kind, 0));
   } else if (!opts->enable_inline) {

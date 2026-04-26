@@ -177,6 +177,13 @@ static void qisc_living_ir_guidance(const LivingIRMetrics *metrics,
   }
 
   if (metrics->cold_blocks_outlined >= 2 &&
+      metrics->cold_functions_specialized > 0) {
+    snprintf(out, out_size,
+             "Living IR guidance [%s]: cold descendants are being outlined and "
+             "their linear tails are now folded back into hot predecessors; the "
+             "next step is stricter region cloning and multi-caller hot dispatch.",
+             phase);
+  } else if (metrics->cold_blocks_outlined >= 2 &&
              metrics->cold_blocks_found > metrics->cold_blocks_outlined) {
     snprintf(out, out_size,
              "Living IR guidance [%s]: multi-block cold regions are being "
@@ -1763,6 +1770,11 @@ int qisc_cli_run(int argc, char **argv) {
       ConvergenceMetrics metrics;
       convergence_init(&metrics);
       uint64_t ir_hash;
+      char profile_path[512];
+      char runtime_profile_path[576];
+      qisc_profile_paths_from_source(args.input_file, profile_path,
+                                     sizeof(profile_path), runtime_profile_path,
+                                     sizeof(runtime_profile_path));
       
       /* First pass: enable profiling */
       args.options.collect_profile = true;
@@ -1784,26 +1796,38 @@ int qisc_cli_run(int argc, char **argv) {
           return 1;
         }
         
-        /* Update convergence metrics with new IR hash */
-        bool converged = convergence_update(&metrics, ir_hash);
-        
-        qisc_personality_print(args.options.personality,
-                               "  Hash: 0x%016llx | Stability: %.1f%%\n",
-                               (unsigned long long)ir_hash, metrics.stability * 100.0);
-        
-        if (converged) {
+        /* Update convergence metrics with both IR and normalized profile state */
+        {
+          QiscProfile profile;
+          uint64_t profile_hash = 0;
+          profile_init(&profile);
+          if (profile_load(&profile, profile_path) == 0 &&
+              qisc_profile_has_samples(&profile)) {
+            profile_finalize(&profile);
+            profile_hash = profile_fingerprint(&profile);
+          }
+          bool converged = convergence_update(&metrics, ir_hash, profile_hash);
           qisc_personality_print(args.options.personality,
-                                 "\n┌─────────────────────────────────────────────────┐\n"
-                                 "│     🎯 CONVERGENCE ACHIEVED! 🎯                 │\n"
-                                 "│                                                 │\n"
-                                 "│ IR hash stabilized - optimal form reached       │\n"
-                                 "│ Iterations: %-36d│\n"
-                                 "│ Final Hash: 0x%016llx             │\n"
-                                 "│ Status: OPTIMAL                                 │\n"
-                                 "└─────────────────────────────────────────────────┘\n",
-                                 metrics.iterations,
-                                 (unsigned long long)metrics.current_hash);
-          break;
+                                 "  IR: 0x%016llx | Profile: 0x%016llx | Stability: %.1f%%\n",
+                                 (unsigned long long)ir_hash,
+                                 (unsigned long long)profile_hash,
+                                 metrics.stability * 100.0);
+          profile_free(&profile);
+        
+          if (converged) {
+            qisc_personality_print(args.options.personality,
+                                   "\n┌─────────────────────────────────────────────────┐\n"
+                                   "│     🎯 CONVERGENCE ACHIEVED! 🎯                 │\n"
+                                   "│                                                 │\n"
+                                   "│ IR and profile behavior both stabilized         │\n"
+                                   "│ Iterations: %-36d│\n"
+                                   "│ Final IR: 0x%016llx                 │\n"
+                                   "│ Status: OPTIMAL                                 │\n"
+                                   "└─────────────────────────────────────────────────┘\n",
+                                   metrics.iterations,
+                                   (unsigned long long)metrics.current_hash);
+            break;
+          }
         }
       }
       
@@ -1999,6 +2023,7 @@ QiscResult qisc_compile_file(const char *path, QiscOptions *options) {
   /* ========== END LIVING IR ========== */
 
   uint64_t current_ir_hash = ir_hash_module(cg.mod);
+  bool link_succeeded = false;
 
   /* Dump IR to stdout (only if not converging) */
   if (!options->converge) {
@@ -2114,6 +2139,7 @@ QiscResult qisc_compile_file(const char *path, QiscOptions *options) {
     
     int ret = system(link_cmd);
     if (ret == 0) {
+      link_succeeded = true;
       clock_t end_time = clock();
       double elapsed = (double)(end_time - start_time) / CLOCKS_PER_SEC;
       double elapsed_ms = elapsed * 1000.0;
@@ -2141,6 +2167,12 @@ QiscResult qisc_compile_file(const char *path, QiscOptions *options) {
 
   /* Save profile if --profile */
   if (options->collect_profile) {
+    if (!link_succeeded) {
+      codegen_free(&cg);
+      ast_free(program);
+      profile_free(&profile);
+      return QISC_ERROR_INTERNAL;
+    }
     if (!profile.source_file) {
       profile.source_file = strdup(path);
     }
@@ -2256,6 +2288,7 @@ static QiscResult qisc_compile_file_with_hash(const char *path, QiscOptions *opt
 
   /* Write object file */
   char obj_path[512];
+  bool link_succeeded = false;
   snprintf(obj_path, sizeof(obj_path), "%s.o", path);
   if (codegen_write_object(&cg, obj_path) == 0) {
     /* Link to binary */
@@ -2358,6 +2391,7 @@ static QiscResult qisc_compile_file_with_hash(const char *path, QiscOptions *opt
     
     int ret = system(link_cmd);
     if (ret == 0) {
+      link_succeeded = true;
       clock_t end_time = clock();
       double elapsed = (double)(end_time - start_time) / CLOCKS_PER_SEC;
       
@@ -2377,6 +2411,12 @@ static QiscResult qisc_compile_file_with_hash(const char *path, QiscOptions *opt
 
   /* Save profile if --profile */
   if (options->collect_profile) {
+    if (!link_succeeded) {
+      codegen_free(&cg);
+      ast_free(program);
+      profile_free(&profile);
+      return QISC_ERROR_INTERNAL;
+    }
     if (!profile.source_file) {
       profile.source_file = strdup(path);
     }

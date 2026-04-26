@@ -105,27 +105,39 @@ uint64_t ir_hash_module(LLVMModuleRef module) {
 void convergence_init(ConvergenceMetrics *m) {
     m->current_hash = 0;
     m->previous_hash = 0;
+    m->current_profile_hash = 0;
+    m->previous_profile_hash = 0;
     m->iterations = 0;
     m->converged = false;
     m->stability = 0.0;
     m->edit_distance = 1.0;
+    m->stable_iterations = 0;
 }
 
-bool convergence_update(ConvergenceMetrics *m, uint64_t new_hash) {
+bool convergence_update(ConvergenceMetrics *m, uint64_t new_hash,
+                        uint64_t new_profile_hash) {
     m->previous_hash = m->current_hash;
     m->current_hash = new_hash;
+    m->previous_profile_hash = m->current_profile_hash;
+    m->current_profile_hash = new_profile_hash;
     m->iterations++;
     
     if (m->iterations > 1) {
-        if (m->current_hash == m->previous_hash) {
+        bool same_ir = (m->current_hash == m->previous_hash);
+        bool same_profile = (m->current_profile_hash == m->previous_profile_hash);
+        if (same_ir && same_profile) {
+            m->stable_iterations++;
             m->converged = true;
             m->stability = 1.0;
             m->edit_distance = 0.0;
         } else {
+            m->stable_iterations = 0;
             /* Calculate a rough stability metric based on hash bit differences */
-            uint64_t diff = m->current_hash ^ m->previous_hash;
-            int bits_different = __builtin_popcountll(diff);
-            m->edit_distance = (double)bits_different / 64.0;
+            uint64_t ir_diff = m->current_hash ^ m->previous_hash;
+            uint64_t profile_diff = m->current_profile_hash ^ m->previous_profile_hash;
+            int bits_different = __builtin_popcountll(ir_diff);
+            int profile_bits_different = __builtin_popcountll(profile_diff);
+            m->edit_distance = (double)(bits_different + profile_bits_different) / 128.0;
             m->stability = 1.0 - m->edit_distance;
         }
     }
@@ -140,10 +152,11 @@ bool convergence_should_continue(ConvergenceMetrics *m, int max_iterations) {
 const char* convergence_summary(ConvergenceMetrics *m) {
     static char buf[256];
     snprintf(buf, sizeof(buf), 
-             "Iterations: %d, Converged: %s, Stability: %.1f%%, Hash: 0x%016llx",
+             "Iterations: %d, Converged: %s, Stability: %.1f%%, IR: 0x%016llx, Profile: 0x%016llx",
              m->iterations, 
              m->converged ? "yes" : "no",
              m->stability * 100.0,
-             (unsigned long long)m->current_hash);
+             (unsigned long long)m->current_hash,
+             (unsigned long long)m->current_profile_hash);
     return buf;
 }

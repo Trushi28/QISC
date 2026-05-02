@@ -1054,6 +1054,159 @@ static bool redirect_calls_in_caller(LLVMValueRef caller, LLVMValueRef from_func
     return changed;
 }
 
+static bool is_specializable_constant_arg(LLVMValueRef value) {
+    if (!value) return false;
+    return LLVMIsAConstantInt(value) != NULL ||
+           LLVMIsAConstantFP(value) != NULL ||
+           LLVMIsAConstantPointerNull(value) != NULL;
+}
+
+static int collect_constant_actual_args_for_caller(LLVMValueRef caller,
+                                                   LLVMValueRef callee,
+                                                   LLVMValueRef *constants,
+                                                   int max_params) {
+    bool viable[16];
+    bool saw_call = false;
+    int specialized = 0;
+    int param_count;
+
+    if (!caller || !callee || !constants || max_params <= 0) return 0;
+    if (max_params > 16) max_params = 16;
+
+    memset(constants, 0, (size_t)max_params * sizeof(LLVMValueRef));
+    for (int i = 0; i < max_params; i++) {
+        viable[i] = true;
+    }
+
+    param_count = (int)LLVMCountParams(callee);
+    if (param_count < max_params) max_params = param_count;
+
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(caller);
+         bb != NULL;
+         bb = LLVMGetNextBasicBlock(bb)) {
+        for (LLVMValueRef inst = LLVMGetFirstInstruction(bb);
+             inst != NULL;
+             inst = LLVMGetNextInstruction(inst)) {
+            unsigned arg_count;
+
+            if (LLVMGetInstructionOpcode(inst) != LLVMCall) continue;
+            if (LLVMGetCalledValue(inst) != callee) continue;
+
+            saw_call = true;
+            arg_count = LLVMGetNumArgOperands(inst);
+            for (int i = 0; i < max_params; i++) {
+                LLVMValueRef arg;
+
+                if (!viable[i]) continue;
+                if ((unsigned)i >= arg_count) {
+                    viable[i] = false;
+                    constants[i] = NULL;
+                    continue;
+                }
+
+                arg = LLVMGetOperand(inst, i);
+                if (!is_specializable_constant_arg(arg)) {
+                    viable[i] = false;
+                    constants[i] = NULL;
+                    continue;
+                }
+
+                if (!constants[i]) {
+                    constants[i] = arg;
+                } else if (constants[i] != arg) {
+                    viable[i] = false;
+                    constants[i] = NULL;
+                }
+            }
+        }
+    }
+
+    if (!saw_call) return 0;
+
+    for (int i = 0; i < max_params; i++) {
+        if (viable[i] && constants[i] != NULL) {
+            specialized++;
+        }
+    }
+
+    return specialized;
+}
+
+static int specialize_clone_constant_params(LLVMValueRef clone_func,
+                                            LLVMValueRef *constants,
+                                            int max_params) {
+    int specialized = 0;
+    int param_count;
+
+    if (!clone_func || !constants || max_params <= 0) return 0;
+
+    param_count = (int)LLVMCountParams(clone_func);
+    if (param_count < max_params) max_params = param_count;
+
+    for (int i = 0; i < max_params; i++) {
+        LLVMValueRef param;
+
+        if (!constants[i]) continue;
+        param = LLVMGetParam(clone_func, (unsigned)i);
+        if (!param || LLVMTypeOf(param) != LLVMTypeOf(constants[i])) continue;
+
+        LLVMReplaceAllUsesWith(param, constants[i]);
+        specialized++;
+    }
+
+    return specialized;
+}
+
+static bool caller_already_listed(LLVMValueRef *callers, int count,
+                                  LLVMValueRef candidate) {
+    if (!callers || !candidate) return false;
+    for (int i = 0; i < count; i++) {
+        if (callers[i] == candidate) return true;
+    }
+    return false;
+}
+
+static void tune_hot_clone_attributes(LivingIR *ir, LLVMValueRef clone_func) {
+    unsigned noinline_kind;
+    unsigned minsize_kind;
+    unsigned optsize_kind;
+    unsigned alwaysinline_kind;
+    int inst_count;
+
+    if (!ir || !clone_func) return;
+
+    add_enum_attr_if_supported(ir, clone_func, "hot");
+    add_enum_attr_if_supported(ir, clone_func, "inlinehint");
+    LLVMSetSection(clone_func, ".text.hot");
+
+    noinline_kind = LLVMGetEnumAttributeKindForName("noinline", 8);
+    if (noinline_kind != 0) {
+        LLVMRemoveEnumAttributeAtIndex(clone_func, LLVMAttributeFunctionIndex,
+                                       noinline_kind);
+    }
+
+    minsize_kind = LLVMGetEnumAttributeKindForName("minsize", 7);
+    if (minsize_kind != 0) {
+        LLVMRemoveEnumAttributeAtIndex(clone_func, LLVMAttributeFunctionIndex,
+                                       minsize_kind);
+    }
+
+    optsize_kind = LLVMGetEnumAttributeKindForName("optsize", 7);
+    if (optsize_kind != 0) {
+        LLVMRemoveEnumAttributeAtIndex(clone_func, LLVMAttributeFunctionIndex,
+                                       optsize_kind);
+    }
+
+    inst_count = count_function_instructions(clone_func);
+    if (inst_count > 0 && inst_count <= 24) {
+        alwaysinline_kind = LLVMGetEnumAttributeKindForName("alwaysinline", 12);
+        if (alwaysinline_kind != 0) {
+            LLVMAddAttributeAtIndex(clone_func, LLVMAttributeFunctionIndex,
+                LLVMCreateEnumAttribute(ir->context, alwaysinline_kind, 0));
+        }
+    }
+}
+
 static double sample_confidence(uint64_t samples, uint64_t high_water) {
     if (high_water == 0) high_water = 1;
     if (samples >= high_water) return 1.0;
@@ -2196,12 +2349,10 @@ void living_ir_clone_hot_functions(LivingIR *ir) {
          func != NULL;
          func = LLVMGetNextFunction(func)) {
         LLVMValueRef callers[64];
+        LLVMValueRef hot_callers[4];
         int caller_count;
-        LLVMValueRef hot_caller = NULL;
         int hot_caller_count = 0;
-        char *clone_name;
-        LLVMValueRef clone_func;
-        bool redirected;
+        int distinct_caller_count = 0;
         
         if (should_skip_function(ir, func)) continue;
         if (is_cold_helper_function(func)) continue;
@@ -2220,54 +2371,71 @@ void living_ir_clone_hot_functions(LivingIR *ir) {
         for (int i = 0; i < caller_count; i++) {
             LLVMValueRef caller = callers[i];
             ProfileFunction *caller_pf;
-            bool seen = false;
+            if (caller_already_listed(callers, i, caller)) continue;
 
-            for (int j = 0; j < i; j++) {
-                if (callers[j] == caller) {
-                    seen = true;
-                    break;
-                }
-            }
-            if (seen) continue;
+            distinct_caller_count++;
 
             caller_pf = profile_get_function(
                 ir->profile, profile_function_name(get_function_name(caller)));
             if (!caller_pf || !caller_pf->is_hot) continue;
 
-            hot_caller = caller;
-            hot_caller_count++;
-            if (hot_caller_count > 1) break;
+            if (hot_caller_count < 4) {
+                hot_callers[hot_caller_count++] = caller;
+            } else {
+                ir->metrics.mutations_rejected++;
+                hot_caller_count = 0;
+                break;
+            }
         }
 
-        if (hot_caller_count != 1) continue;
+        if (hot_caller_count == 0) continue;
+        if (distinct_caller_count < 2) continue;
         if (count_function_instructions(func) > 96) continue;
 
-        clone_name = create_unique_hot_clone_name(ir, func_name);
-        if (!clone_name) {
-            ir->metrics.mutations_rejected++;
-            continue;
+        for (int i = 0; i < hot_caller_count; i++) {
+            char *clone_name;
+            LLVMValueRef clone_func;
+            LLVMValueRef constant_args[16];
+            int specialized_args = 0;
+            bool redirected;
+
+            clone_name = create_unique_hot_clone_name(ir, func_name);
+            if (!clone_name) {
+                ir->metrics.mutations_rejected++;
+                continue;
+            }
+
+            clone_func = clone_function_body(ir, func, clone_name);
+            free(clone_name);
+            if (!clone_func) {
+                ir->metrics.mutations_rejected++;
+                continue;
+            }
+
+            specialized_args = collect_constant_actual_args_for_caller(
+                hot_callers[i], func, constant_args, 16);
+            if (specialized_args > 0) {
+                specialized_args =
+                    specialize_clone_constant_params(clone_func, constant_args, 16);
+                if (specialized_args > 0) {
+                    add_string_attr(ir, clone_func, "qisc.arg_specialized", "true");
+                    ir->metrics.argument_specializations += specialized_args;
+                }
+            }
+
+            tune_hot_clone_attributes(ir, clone_func);
+
+            redirected = redirect_calls_in_caller(hot_callers[i], func, clone_func);
+            if (!redirected) {
+                LLVMDeleteFunction(clone_func);
+                ir->metrics.mutations_rejected++;
+                continue;
+            }
+
+            ir->metrics.hot_functions_specialized++;
+            ir->metrics.code_size_delta +=
+                (uint64_t)count_function_instructions(clone_func);
         }
-
-        clone_func = clone_function_body(ir, func, clone_name);
-        free(clone_name);
-        if (!clone_func) {
-            ir->metrics.mutations_rejected++;
-            continue;
-        }
-
-        add_enum_attr_if_supported(ir, clone_func, "hot");
-        add_enum_attr_if_supported(ir, clone_func, "inlinehint");
-        LLVMSetSection(clone_func, ".text.hot");
-
-        redirected = redirect_calls_in_caller(hot_caller, func, clone_func);
-        if (!redirected) {
-            LLVMDeleteFunction(clone_func);
-            ir->metrics.mutations_rejected++;
-            continue;
-        }
-
-        ir->metrics.hot_functions_specialized++;
-        ir->metrics.code_size_delta += (uint64_t)count_function_instructions(clone_func);
     }
 }
 
@@ -2554,6 +2722,8 @@ void living_ir_print_summary(LivingIR *ir) {
            ir->metrics.hot_functions_specialized);
     printf("║   Cold funcs specialized: %4d                   ║\n",
            ir->metrics.cold_functions_specialized);
+    printf("║   Arg specializations:    %4d                   ║\n",
+           ir->metrics.argument_specializations);
     printf("║   Loops restructured:     %4d                   ║\n", 
            ir->metrics.loops_restructured);
     printf("║     - Unrolled:           %4d                   ║\n", 

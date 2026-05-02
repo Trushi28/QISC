@@ -1542,6 +1542,70 @@ char *tiny_llm_analyze_and_comment(TinyLLM *llm, const char *code,
   return tiny_llm_generate_sentiment(llm, sentiment, code, 150);
 }
 
+char *tiny_llm_summarize_optimization(TinyLLM *llm, const char *phase,
+                                      int total_mutations,
+                                      int hot_specializations,
+                                      int cold_specializations,
+                                      int cold_blocks_outlined,
+                                      int loops_restructured,
+                                      int blocks_reordered,
+                                      int branch_weights_applied,
+                                      double estimated_speedup) {
+  char summary[512];
+  char primary[128];
+  char secondary[160];
+  const char *phase_name = phase ? phase : "unknown";
+
+  if (!llm) return NULL;
+
+  primary[0] = '\0';
+  secondary[0] = '\0';
+
+  if (hot_specializations > 0 && cold_specializations > 0) {
+    snprintf(primary, sizeof(primary),
+             "Hot and cold path specialization are both active.");
+  } else if (hot_specializations > 0) {
+    snprintf(primary, sizeof(primary),
+             "Hot-path specialization is active.");
+  } else if (cold_specializations > 0 || cold_blocks_outlined > 0) {
+    snprintf(primary, sizeof(primary),
+             "Cold-path extraction is active.");
+  } else if (loops_restructured > 0) {
+    snprintf(primary, sizeof(primary),
+             "Loop restructuring is the dominant mutation.");
+  } else if (branch_weights_applied > 0) {
+    snprintf(primary, sizeof(primary),
+             "Profile-guided branch steering is active.");
+  } else {
+    snprintf(primary, sizeof(primary),
+             "Optimization stayed conservative.");
+  }
+
+  if (hot_specializations >= 2) {
+    snprintf(secondary, sizeof(secondary),
+             "Distinct hot callers now receive specialized paths.");
+  } else if (cold_blocks_outlined >= 2) {
+    snprintf(secondary, sizeof(secondary),
+             "Cold regions were outlined to reduce hot-path pressure.");
+  } else if (blocks_reordered > 0) {
+    snprintf(secondary, sizeof(secondary),
+             "Block layout was reordered for hotter fall-through.");
+  } else if (loops_restructured > 0) {
+    snprintf(secondary, sizeof(secondary),
+             "Loop metadata now drives stronger LLVM cleanup.");
+  } else {
+    snprintf(secondary, sizeof(secondary),
+             "Further gains would need richer profile evidence or new infrastructure.");
+  }
+
+  snprintf(summary, sizeof(summary),
+           "phase=%s, mutations=%d, est=%.2fx. %s %s",
+           phase_name, total_mutations, estimated_speedup, primary, secondary);
+
+  tiny_llm_train(llm, summary);
+  return llm_strdup(summary);
+}
+
 void tiny_llm_learn_outcome(TinyLLM *llm, const char *code_hash,
                              bool success, double compile_time_ms,
                              int opt_count) {

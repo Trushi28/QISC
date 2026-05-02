@@ -57,6 +57,12 @@ typedef enum {
   QISC_PERSONALITY_CRYPTIC,
 } QiscPersonality;
 
+typedef enum {
+  QISC_LTO_NONE = 0,
+  QISC_LTO_FULL,
+  QISC_LTO_THIN,
+} QiscLtoMode;
+
 /* Compilation options */
 typedef struct {
   QiscContext context;
@@ -64,9 +70,13 @@ typedef struct {
   bool collect_profile;
   bool use_profile;
   bool converge;
+  bool llvm_pgo_generate;
+  bool llvm_pgo_use;
   bool competitive;     /* Enable competitive mode */
   const char *profile_path;
+  const char *llvm_profile_path;
   int optimization_level; /* 0-3 */
+  QiscLtoMode lto_mode;
 } QiscOptions;
 
 /* Create default options */

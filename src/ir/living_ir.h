@@ -88,6 +88,7 @@ typedef struct {
     int cold_blocks_outlined;
     int hot_functions_specialized;
     int cold_functions_specialized;
+    int argument_specializations;
     int mutations_rejected;
     int loops_analyzed;
     int loops_restructured;

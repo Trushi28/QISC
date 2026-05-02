@@ -34,6 +34,35 @@ static uint64_t profile_hash_bool(uint64_t hash, bool value) {
   return profile_hash_bytes(hash, &v, sizeof(v));
 }
 
+static uint64_t profile_quantize_time_class(double avg_time_us) {
+  if (avg_time_us < 0.01) return 0;
+  if (avg_time_us < 0.05) return 1;
+  if (avg_time_us < 0.25) return 2;
+  if (avg_time_us < 1.0) return 3;
+  if (avg_time_us < 5.0) return 4;
+  return 5;
+}
+
+static uint64_t profile_quantize_branch_class(double taken_ratio, bool predictable) {
+  double dominant = taken_ratio >= 0.5 ? taken_ratio : (1.0 - taken_ratio);
+
+  if (predictable || dominant >= 0.99) return 0;
+  if (dominant >= 0.95) return 1;
+  if (dominant >= 0.85) return 2;
+  if (dominant >= 0.70) return 3;
+  if (dominant >= 0.55) return 4;
+  return 5;
+}
+
+static uint64_t profile_quantize_loop_class(double avg_iterations) {
+  if (avg_iterations <= 4.0) return 0;
+  if (avg_iterations <= 16.0) return 1;
+  if (avg_iterations <= 64.0) return 2;
+  if (avg_iterations <= 256.0) return 3;
+  if (avg_iterations <= 1024.0) return 4;
+  return 5;
+}
+
 /* ======== Initialization ======== */
 
 void profile_init(QiscProfile *profile) {
@@ -684,33 +713,34 @@ uint64_t profile_fingerprint(const QiscProfile *profile) {
 
   for (int i = 0; i < profile->function_count; i++) {
     const ProfileFunction *fn = &profile->functions[i];
-    uint64_t avg_bucket = (uint64_t)(fn->avg_time_us * 1000.0);
+    uint64_t time_class = profile_quantize_time_class(fn->avg_time_us);
     if (fn->name) {
       hash = profile_hash_bytes(hash, fn->name, strlen(fn->name));
     }
     hash = profile_hash_bool(hash, fn->is_hot);
     hash = profile_hash_bool(hash, fn->is_cold);
     hash = profile_hash_bool(hash, fn->should_inline);
-    hash = profile_hash_u64(hash, avg_bucket);
+    hash = profile_hash_u64(hash, time_class);
   }
 
   for (int i = 0; i < profile->branch_count; i++) {
     const ProfileBranch *br = &profile->branches[i];
-    uint64_t ratio_bucket = (uint64_t)(br->taken_ratio * 10000.0 + 0.5);
+    uint64_t branch_class =
+        profile_quantize_branch_class(br->taken_ratio, br->is_predictable);
     if (br->location) {
       hash = profile_hash_bytes(hash, br->location, strlen(br->location));
     }
-    hash = profile_hash_u64(hash, ratio_bucket);
+    hash = profile_hash_u64(hash, branch_class);
     hash = profile_hash_bool(hash, br->is_predictable);
   }
 
   for (int i = 0; i < profile->loop_count; i++) {
     const ProfileLoop *lp = &profile->loops[i];
-    uint64_t avg_bucket = (uint64_t)(lp->avg_iterations * 100.0 + 0.5);
+    uint64_t loop_class = profile_quantize_loop_class(lp->avg_iterations);
     if (lp->location) {
       hash = profile_hash_bytes(hash, lp->location, strlen(lp->location));
     }
-    hash = profile_hash_u64(hash, avg_bucket);
+    hash = profile_hash_u64(hash, loop_class);
     hash = profile_hash_bool(hash, lp->should_unroll);
     hash = profile_hash_u64(hash, (uint64_t)lp->suggested_unroll_factor);
   }

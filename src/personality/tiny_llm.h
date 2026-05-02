@@ -253,6 +253,20 @@ char *tiny_llm_analyze_and_comment(TinyLLM *llm, const char *code,
                                     int line_count, int optimization_count,
                                     bool has_errors, bool has_warnings);
 
+/*
+ * Generate a deterministic optimization summary for compiler reporting.
+ * This is intended for high-signal explanations, not playful freeform text.
+ */
+char *tiny_llm_summarize_optimization(TinyLLM *llm, const char *phase,
+                                      int total_mutations,
+                                      int hot_specializations,
+                                      int cold_specializations,
+                                      int cold_blocks_outlined,
+                                      int loops_restructured,
+                                      int blocks_reordered,
+                                      int branch_weights_applied,
+                                      double estimated_speedup);
+
 /* Learn from compilation result (self-improving) */
 void tiny_llm_learn_outcome(TinyLLM *llm, const char *code_hash,
                              bool success, double compile_time_ms,

@@ -1,0 +1,30 @@
+proc shared(int x) gives int {
+  give x + 1;
+}
+
+proc hot_loop_a() gives int {
+  auto total = 0;
+  for int i in range(1, 3001) {
+    total = total + shared(i);
+  }
+  give total;
+}
+
+proc hot_loop_b() gives int {
+  auto total = 0;
+  for int i in range(1, 3001) {
+    total = total + shared(i + 10);
+  }
+  give total;
+}
+
+proc cold_once() gives int {
+  give shared(9);
+}
+
+proc main() gives int {
+  hot_loop_a();
+  hot_loop_b();
+  cold_once();
+  give 0;
+}

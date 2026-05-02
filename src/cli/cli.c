@@ -48,6 +48,13 @@ static void qisc_profile_paths_from_source(const char *path, char *profile_path,
                                            size_t profile_path_size,
                                            char *runtime_path,
                                            size_t runtime_path_size);
+static void qisc_llvm_profile_paths_from_source(const char *path,
+                                                char *profraw_path,
+                                                size_t profraw_path_size,
+                                                char *profdata_path,
+                                                size_t profdata_path_size,
+                                                char *ir_path,
+                                                size_t ir_path_size);
 static void qisc_tiny_llm_path_from_source(const char *path, char *out,
                                            size_t out_size);
 static int qisc_living_ir_total_mutations(const LivingIRMetrics *metrics);
@@ -57,9 +64,16 @@ static void qisc_tiny_llm_report_living_ir(const char *path,
                                            const QiscProfile *profile,
                                            double compile_time_ms);
 static int qisc_execute_binary(const char *bin_path, const char *profile_out,
-                               bool quiet);
+                               const char *llvm_profile_out, bool quiet);
 static int qisc_merge_runtime_profile(QiscProfile *profile,
                                       const char *runtime_path);
+static int qisc_merge_llvm_profile(const char *profraw_path,
+                                   const char *profdata_path, bool quiet);
+static bool qisc_should_use_clang_ir_backend(const QiscOptions *options);
+static int qisc_emit_and_link_binary(Codegen *cg, const char *path,
+                                     QiscOptions *options, char *bin_path,
+                                     size_t bin_path_size, bool quiet,
+                                     bool *link_succeeded);
 static int qisc_run_repl(QiscOptions *options);
 static int qisc_run_notebook(const char *path, QiscOptions *options);
 static char *qisc_repl_trim_copy(const char *text);
@@ -130,6 +144,24 @@ static void qisc_profile_paths_from_source(const char *path, char *profile_path,
   }
 }
 
+static void qisc_llvm_profile_paths_from_source(const char *path,
+                                                char *profraw_path,
+                                                size_t profraw_path_size,
+                                                char *profdata_path,
+                                                size_t profdata_path_size,
+                                                char *ir_path,
+                                                size_t ir_path_size) {
+  if (profraw_path && profraw_path_size > 0) {
+    snprintf(profraw_path, profraw_path_size, "%s.llvm.profraw", path);
+  }
+  if (profdata_path && profdata_path_size > 0) {
+    snprintf(profdata_path, profdata_path_size, "%s.llvm.profdata", path);
+  }
+  if (ir_path && ir_path_size > 0) {
+    snprintf(ir_path, ir_path_size, "%s.opt.ll", path);
+  }
+}
+
 static void qisc_tiny_llm_path_from_source(const char *path, char *out,
                                            size_t out_size) {
   if (!out || out_size == 0)
@@ -148,8 +180,11 @@ static int qisc_living_ir_total_mutations(const LivingIRMetrics *metrics) {
     return 0;
 
   return metrics->functions_inlined + metrics->cold_blocks_outlined +
+         metrics->hot_functions_specialized +
+         metrics->cold_functions_specialized +
+         metrics->argument_specializations +
          metrics->loops_unrolled + metrics->loops_prefetched +
-         metrics->branch_weights_applied;
+         metrics->branch_weights_applied + metrics->blocks_reordered;
 }
 
 static void qisc_living_ir_guidance(const LivingIRMetrics *metrics,
@@ -176,7 +211,32 @@ static void qisc_living_ir_guidance(const LivingIRMetrics *metrics,
     phase = "first-run";
   }
 
-  if (metrics->cold_blocks_outlined >= 2 &&
+  if (metrics->hot_functions_specialized > 0 &&
+      metrics->argument_specializations > 0 &&
+      metrics->cold_blocks_outlined == 0) {
+    snprintf(out, out_size,
+             "Living IR guidance [%s]: hot clones are now specializing stable "
+             "constant arguments; the next leverage point is dispatcher-level "
+             "specialization for richer runtime value classes.",
+             phase);
+  } else if (metrics->hot_functions_specialized > 0 &&
+      (metrics->cold_functions_specialized > 0 ||
+       metrics->cold_blocks_outlined > 0) &&
+      metrics->loops_restructured > 0 &&
+      metrics->blocks_reordered > 0) {
+    snprintf(out, out_size,
+             "Living IR guidance [%s]: the core hot-path, cold-path, loop, and "
+             "layout mutation layers are all active; further changes are now "
+             "workload-specific refinement rather than missing core behavior.",
+             phase);
+  } else if (metrics->hot_functions_specialized >= 2 &&
+      metrics->cold_blocks_outlined == 0) {
+    snprintf(out, out_size,
+             "Living IR guidance [%s]: multi-caller hot specialization is "
+             "active; the next step is real dispatcher-level cloning and "
+             "argument-pattern specialization.",
+             phase);
+  } else if (metrics->cold_blocks_outlined >= 2 &&
       metrics->cold_functions_specialized > 0) {
     snprintf(out, out_size,
              "Living IR guidance [%s]: cold descendants are being outlined and "
@@ -240,9 +300,11 @@ static void qisc_tiny_llm_report_living_ir(const char *path,
   char summary[256];
   char guidance[256];
   char *comment;
+  char *structured_comment;
   TinyLLMCodePattern patterns[3];
   int pattern_count = 0;
   int total_mutations;
+  const char *phase;
 
   if (!path || !options || !metrics)
     return;
@@ -261,15 +323,26 @@ static void qisc_tiny_llm_report_living_ir(const char *path,
     return;
 
   total_mutations = qisc_living_ir_total_mutations(metrics);
+  if (!profile) {
+    phase = "no-profile";
+  } else if (profile->has_converged) {
+    phase = "stable";
+  } else if (profile->run_count >= 2) {
+    phase = "warming";
+  } else {
+    phase = "first-run";
+  }
 
   snprintf(
       context, sizeof(context),
       "Living IR analyzed %d functions and %d loops. Inlined %d hot paths. "
-      "Outlined %d cold blocks. Unrolled %d loops. Added %d prefetch hints. "
-      "Applied %d branch weights. Estimated speedup %.2fx. Profile samples: "
-      "%d functions, %d branches, %d loops.",
+      "Outlined %d cold blocks. Specialized %d constant arguments. Unrolled "
+      "%d loops. Added %d prefetch hints. Applied %d branch weights. "
+      "Estimated speedup %.2fx. Profile samples: %d functions, %d branches, "
+      "%d loops.",
       metrics->functions_analyzed, metrics->loops_analyzed,
       metrics->functions_inlined, metrics->cold_blocks_outlined,
+      metrics->argument_specializations,
       metrics->loops_unrolled, metrics->loops_prefetched,
       metrics->branch_weights_applied, metrics->estimated_speedup,
       profile ? profile->function_count : 0, profile ? profile->branch_count : 0,
@@ -329,28 +402,40 @@ static void qisc_tiny_llm_report_living_ir(const char *path,
     break;
   }
 
+  structured_comment = tiny_llm_summarize_optimization(
+      llm, phase, total_mutations, metrics->hot_functions_specialized,
+      metrics->cold_functions_specialized, metrics->cold_blocks_outlined,
+      metrics->loops_restructured, metrics->blocks_reordered,
+      metrics->branch_weights_applied, metrics->estimated_speedup);
+
   snprintf(summary, sizeof(summary), "%d mutations, %.2fx estimate",
            total_mutations, metrics->estimated_speedup);
   qisc_living_ir_guidance(metrics, profile, guidance, sizeof(guidance));
   if (guidance[0]) {
     qisc_personality_print(options->personality, "%s\n", guidance);
   }
+  if (structured_comment && structured_comment[0]) {
+    qisc_personality_print(options->personality, "Tiny LLM analysis [%s]: %s\n",
+                           summary, structured_comment);
+  }
   if (comment && comment[0]) {
-    qisc_personality_print(options->personality, "Tiny LLM [%s]: %s\n",
+    qisc_personality_print(options->personality, "Tiny LLM aside [%s]: %s\n",
                            summary, comment);
   }
 
   tiny_llm_learn_outcome(llm, path, true, compile_time_ms, total_mutations);
   tiny_llm_save(llm, llm_path);
+  free(structured_comment);
   free(comment);
   tiny_llm_destroy(llm);
 }
 
 static int qisc_execute_binary(const char *bin_path, const char *profile_out,
-                               bool quiet) {
+                               const char *llvm_profile_out, bool quiet) {
 #ifdef _WIN32
   intptr_t status;
   char *old_profile = NULL;
+  char *old_llvm_profile = NULL;
   const char *argv[] = {bin_path, NULL};
 
   (void)quiet;
@@ -361,6 +446,14 @@ static int qisc_execute_binary(const char *bin_path, const char *profile_out,
       old_profile = strdup(existing);
     }
     _putenv_s("QISC_PROFILE_OUT", profile_out);
+  }
+
+  if (llvm_profile_out && *llvm_profile_out) {
+    const char *existing = getenv("LLVM_PROFILE_FILE");
+    if (existing) {
+      old_llvm_profile = strdup(existing);
+    }
+    _putenv_s("LLVM_PROFILE_FILE", llvm_profile_out);
   }
 
   status = _spawnv(_P_WAIT, bin_path, argv);
@@ -374,17 +467,36 @@ static int qisc_execute_binary(const char *bin_path, const char *profile_out,
     }
   }
 
+  if (llvm_profile_out && *llvm_profile_out) {
+    if (old_llvm_profile) {
+      _putenv_s("LLVM_PROFILE_FILE", old_llvm_profile);
+      free(old_llvm_profile);
+    } else {
+      _putenv_s("LLVM_PROFILE_FILE", "");
+    }
+  }
+
   return status == -1 ? 1 : 0;
 #else
   char cmd[2048];
   int status;
 
+  cmd[0] = '\0';
   if (profile_out && *profile_out) {
-    snprintf(cmd, sizeof(cmd), "QISC_PROFILE_OUT='%s' '%s'%s", profile_out,
-             bin_path, quiet ? " >/dev/null 2>/dev/null" : "");
-  } else {
-    snprintf(cmd, sizeof(cmd), "'%s'%s", bin_path,
-             quiet ? " >/dev/null 2>/dev/null" : "");
+    strncat(cmd, "QISC_PROFILE_OUT='", sizeof(cmd) - strlen(cmd) - 1);
+    strncat(cmd, profile_out, sizeof(cmd) - strlen(cmd) - 1);
+    strncat(cmd, "' ", sizeof(cmd) - strlen(cmd) - 1);
+  }
+  if (llvm_profile_out && *llvm_profile_out) {
+    strncat(cmd, "LLVM_PROFILE_FILE='", sizeof(cmd) - strlen(cmd) - 1);
+    strncat(cmd, llvm_profile_out, sizeof(cmd) - strlen(cmd) - 1);
+    strncat(cmd, "' ", sizeof(cmd) - strlen(cmd) - 1);
+  }
+  strncat(cmd, "'", sizeof(cmd) - strlen(cmd) - 1);
+  strncat(cmd, bin_path, sizeof(cmd) - strlen(cmd) - 1);
+  strncat(cmd, "'", sizeof(cmd) - strlen(cmd) - 1);
+  if (quiet) {
+    strncat(cmd, " >/dev/null 2>/dev/null", sizeof(cmd) - strlen(cmd) - 1);
   }
 
   status = system(cmd);
@@ -422,6 +534,279 @@ static int qisc_merge_runtime_profile(QiscProfile *profile,
   }
 
   return 0;
+}
+
+static int qisc_merge_llvm_profile(const char *profraw_path,
+                                   const char *profdata_path, bool quiet) {
+#ifdef _WIN32
+  (void)profraw_path;
+  (void)profdata_path;
+  (void)quiet;
+  fprintf(stderr, "LLVM PGO merge is not supported on Windows in this build\n");
+  return 1;
+#else
+  char cmd[4096];
+  char tmp_path[PATH_MAX];
+  int ret;
+  FILE *existing;
+
+  if (!profraw_path || !*profraw_path || !profdata_path || !*profdata_path) {
+    return 1;
+  }
+
+  snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", profdata_path);
+  existing = fopen(profdata_path, "r");
+  if (existing) {
+    fclose(existing);
+    snprintf(cmd, sizeof(cmd),
+             "llvm-profdata merge -output='%s' '%s' '%s'%s",
+             tmp_path, profdata_path, profraw_path,
+             quiet ? " >/dev/null 2>/dev/null" : "");
+    ret = system(cmd);
+    if (ret != 0) {
+      remove(tmp_path);
+      return 1;
+    }
+    if (rename(tmp_path, profdata_path) != 0) {
+      remove(tmp_path);
+      return 1;
+    }
+    return 0;
+  }
+
+  snprintf(cmd, sizeof(cmd),
+           "llvm-profdata merge -output='%s' '%s'%s",
+           profdata_path, profraw_path, quiet ? " >/dev/null 2>/dev/null" : "");
+  ret = system(cmd);
+  return ret == 0 ? 0 : 1;
+#endif
+}
+
+static bool qisc_should_use_clang_ir_backend(const QiscOptions *options) {
+  return options && (options->llvm_pgo_generate || options->llvm_pgo_use ||
+                     options->lto_mode != QISC_LTO_NONE);
+}
+
+static int qisc_append_runtime_lib(char *out, size_t out_size,
+                                   const char *path) {
+  int written;
+  size_t used;
+
+  if (!out || !path) return 1;
+  used = strlen(out);
+  written = snprintf(out + used, out_size - used, "%s'%s'",
+                     out[0] ? " " : "", path);
+  return (written < 0 || (size_t)written >= out_size - used) ? 1 : 0;
+}
+
+static int qisc_build_runtime_libs(bool include_profile_runtime, char *out,
+                                   size_t out_size) {
+  const char *paths[5] = {
+      "lib/qisc_error.o",
+      "lib/qisc_array.o",
+      "lib/qisc_io.o",
+      "lib/qisc_stream.o",
+      "lib/qisc_runtime.o",
+  };
+  const char *fallbacks[5] = {
+      "/home/Trushi/ai/QISC/lib/qisc_error.o",
+      "/home/Trushi/ai/QISC/lib/qisc_array.o",
+      "/home/Trushi/ai/QISC/lib/qisc_io.o",
+      "/home/Trushi/ai/QISC/lib/qisc_stream.o",
+      "/home/Trushi/ai/QISC/lib/qisc_runtime.o",
+  };
+  int count = include_profile_runtime ? 5 : 4;
+
+  if (!out || out_size == 0) return 1;
+  out[0] = '\0';
+
+  for (int i = 0; i < count; i++) {
+    const char *selected = paths[i];
+    FILE *f = fopen(paths[i], "r");
+    if (f) {
+      fclose(f);
+    } else {
+      selected = fallbacks[i];
+    }
+    if (qisc_append_runtime_lib(out, out_size, selected) != 0) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+static int qisc_link_object_binary(const char *obj_path, const char *bin_path,
+                                   const char *runtime_libs,
+                                   QiscOptions *options, bool quiet) {
+  char link_cmd[4096];
+  int ret;
+  (void)options;
+
+  snprintf(link_cmd, sizeof(link_cmd), "cc '%s' %s -o '%s' -lm%s",
+           obj_path, runtime_libs, bin_path,
+           quiet ? " >/dev/null 2>/dev/null" : "");
+  if (!quiet) {
+    printf("Linking: %s\n", link_cmd);
+  }
+  ret = system(link_cmd);
+  return ret == 0 ? 0 : 1;
+}
+
+static int qisc_link_ir_binary(const char *ir_path, const char *bin_path,
+                               const char *runtime_libs, QiscOptions *options,
+                               const char *llvm_profraw_path, bool quiet) {
+#ifdef _WIN32
+  (void)ir_path;
+  (void)bin_path;
+  (void)runtime_libs;
+  (void)options;
+  (void)llvm_profraw_path;
+  (void)quiet;
+  fprintf(stderr, "LLVM PGO/LTO link path is not supported on Windows in this build\n");
+  return 1;
+#else
+  char compile_cmd[8192];
+  char link_cmd[8192];
+  char ir_obj_path[PATH_MAX];
+  const char *lto_compile_flag = "";
+  const char *lto_link_flag = "";
+  const char *arch_flags = "";
+  const char *context_flags = "";
+  char pgo_gen_flag[PATH_MAX + 64] = "";
+  char pgo_use_flag[PATH_MAX + 64] = "";
+  int ret;
+
+  if (!ir_path || !bin_path || !runtime_libs || !options) return 1;
+
+  switch (options->lto_mode) {
+  case QISC_LTO_FULL:
+    lto_compile_flag = "-flto=full";
+    lto_link_flag = "-flto=full -fuse-ld=lld";
+    break;
+  case QISC_LTO_THIN:
+    lto_compile_flag = "-flto=thin";
+    lto_link_flag = "-flto=thin -fuse-ld=lld";
+    break;
+  case QISC_LTO_NONE:
+  default:
+    lto_compile_flag = "";
+    lto_link_flag = "";
+    break;
+  }
+
+  switch (options->context) {
+  case QISC_CONTEXT_SERVER:
+  case QISC_CONTEXT_CLI:
+  case QISC_CONTEXT_NOTEBOOK:
+    arch_flags = "-march=native -mtune=native";
+    break;
+  case QISC_CONTEXT_WEB:
+    context_flags = "-Os";
+    break;
+  case QISC_CONTEXT_EMBEDDED:
+    context_flags = "-Oz";
+    break;
+  default:
+    break;
+  }
+
+  if (options->llvm_pgo_generate && llvm_profraw_path) {
+    snprintf(pgo_gen_flag, sizeof(pgo_gen_flag),
+             "-fprofile-instr-generate");
+  }
+  if (options->llvm_pgo_use && options->llvm_profile_path) {
+    snprintf(pgo_use_flag, sizeof(pgo_use_flag),
+             "-fprofile-instr-use='%s'", options->llvm_profile_path);
+  }
+
+  snprintf(ir_obj_path, sizeof(ir_obj_path), "%s.clang.o", ir_path);
+  snprintf(compile_cmd, sizeof(compile_cmd),
+           "clang -x ir -c -O%d %s %s %s %s %s '%s' -o '%s'%s",
+           options->optimization_level,
+           arch_flags,
+           context_flags,
+           lto_compile_flag,
+           pgo_gen_flag,
+           pgo_use_flag,
+           ir_path,
+           ir_obj_path,
+           quiet ? " >/dev/null 2>/dev/null" : "");
+  snprintf(link_cmd, sizeof(link_cmd), "clang %s %s %s %s %s -o '%s' -lm%s",
+           lto_link_flag, pgo_gen_flag, pgo_use_flag, ir_obj_path, runtime_libs,
+           bin_path,
+           quiet ? " >/dev/null 2>/dev/null" : "");
+
+  if (!quiet) {
+    printf("LLVM compile: %s\n", compile_cmd);
+    printf("LLVM link: %s\n", link_cmd);
+  }
+  ret = system(compile_cmd);
+  if (ret != 0) {
+    remove(ir_obj_path);
+    return 1;
+  }
+  ret = system(link_cmd);
+  remove(ir_obj_path);
+  return ret == 0 ? 0 : 1;
+#endif
+}
+
+static int qisc_emit_and_link_binary(Codegen *cg, const char *path,
+                                     QiscOptions *options, char *bin_path,
+                                     size_t bin_path_size, bool quiet,
+                                     bool *link_succeeded) {
+  char obj_path[PATH_MAX];
+  char ir_path[PATH_MAX];
+  char llvm_profraw_path[PATH_MAX];
+  char llvm_profdata_path[PATH_MAX];
+  char runtime_libs[2048];
+  int ret;
+
+  if (link_succeeded) *link_succeeded = false;
+  if (!cg || !path || !options || !bin_path || bin_path_size == 0) return 1;
+
+  qisc_binary_path_from_source(path, bin_path, bin_path_size);
+  qisc_llvm_profile_paths_from_source(path, llvm_profraw_path,
+                                      sizeof(llvm_profraw_path),
+                                      llvm_profdata_path,
+                                      sizeof(llvm_profdata_path), ir_path,
+                                      sizeof(ir_path));
+  snprintf(obj_path, sizeof(obj_path), "%s.o", path);
+
+  if (codegen_write_object(cg, obj_path) != 0) {
+    return 1;
+  }
+
+  if (!options->converge) {
+    printf("=== Optimized LLVM IR ===\n");
+    codegen_dump_ir(cg);
+  }
+
+  if (qisc_build_runtime_libs(options->collect_profile, runtime_libs,
+                              sizeof(runtime_libs)) != 0) {
+    remove(obj_path);
+    return 1;
+  }
+
+  if (qisc_should_use_clang_ir_backend(options)) {
+    if (codegen_write_ir(cg, ir_path) != 0) {
+      remove(obj_path);
+      return 1;
+    }
+    ret = qisc_link_ir_binary(ir_path, bin_path, runtime_libs, options,
+                              options->llvm_pgo_generate ? llvm_profraw_path
+                                                         : NULL,
+                              quiet);
+    remove(ir_path);
+  } else {
+    ret = qisc_link_object_binary(obj_path, bin_path, runtime_libs, options,
+                                  quiet);
+  }
+
+  remove(obj_path);
+  if (link_succeeded) *link_succeeded = (ret == 0);
+  return ret;
 }
 
 static void repl_ast_store_init(ReplAstStore *store) {
@@ -1603,8 +1988,12 @@ QiscOptions qisc_default_options(void) {
       .collect_profile = false,
       .use_profile = false,
       .converge = false,
+      .llvm_pgo_generate = false,
+      .llvm_pgo_use = false,
       .profile_path = NULL,
+      .llvm_profile_path = NULL,
       .optimization_level = 2,
+      .lto_mode = QISC_LTO_NONE,
   };
   return opts;
 }
@@ -1629,6 +2018,10 @@ void qisc_cli_help(void) {
   printf("  --profile         Collect profile data during execution\n");
   printf("  --use-profile <f> Use profile file for optimization\n");
   printf("  --converge        Compile until convergence\n");
+  printf("  --llvm-pgo-gen    Build an instrumented binary for LLVM PGO\n");
+  printf("  --llvm-pgo-use <f> Use merged LLVM .profdata for final optimization\n");
+  printf("  --lto             Enable full LTO in the Clang/LLD link path\n");
+  printf("  --thinlto         Enable ThinLTO in the Clang/LLD link path\n");
   printf(
       "  --context <ctx>   Set context (cli|server|web|notebook|embedded)\n");
   printf("  --personality <p> Set personality "
@@ -1641,6 +2034,8 @@ void qisc_cli_help(void) {
   printf("  qisc repl\n");
   printf("  qisc notebook examples/notebook_demo.qnb\n");
   printf("  qisc build --profile app.qisc\n");
+  printf("  qisc run --llvm-pgo-gen app.qisc\n");
+  printf("  qisc build --llvm-pgo-use app.qisc.llvm.profdata --thinlto app.qisc\n");
   printf("  qisc build --converge app.qisc\n");
   printf("  qisc achievements\n");
 }
@@ -1693,6 +2088,15 @@ CliArgs qisc_cli_parse(int argc, char **argv) {
     } else if (strcmp(argv[i], "--use-profile") == 0 && i + 1 < argc) {
       args.options.use_profile = true;
       args.options.profile_path = argv[++i];
+    } else if (strcmp(argv[i], "--llvm-pgo-gen") == 0) {
+      args.options.llvm_pgo_generate = true;
+    } else if (strcmp(argv[i], "--llvm-pgo-use") == 0 && i + 1 < argc) {
+      args.options.llvm_pgo_use = true;
+      args.options.llvm_profile_path = argv[++i];
+    } else if (strcmp(argv[i], "--lto") == 0) {
+      args.options.lto_mode = QISC_LTO_FULL;
+    } else if (strcmp(argv[i], "--thinlto") == 0) {
+      args.options.lto_mode = QISC_LTO_THIN;
     } else if (strcmp(argv[i], "--converge") == 0) {
       args.options.converge = true;
     } else if (strcmp(argv[i], "--context") == 0 && i + 1 < argc) {
@@ -1741,6 +2145,16 @@ CliArgs qisc_cli_parse(int argc, char **argv) {
 /* Main CLI entry point */
 int qisc_cli_run(int argc, char **argv) {
   CliArgs args = qisc_cli_parse(argc, argv);
+
+  if (args.options.llvm_pgo_generate && args.options.llvm_pgo_use) {
+    fprintf(stderr,
+            "Error: --llvm-pgo-gen and --llvm-pgo-use cannot be used together\n");
+    return 1;
+  }
+  if (args.options.llvm_pgo_use && !args.options.llvm_profile_path) {
+    fprintf(stderr, "Error: --llvm-pgo-use requires a .profdata path\n");
+    return 1;
+  }
 
   switch (args.command) {
   case CLI_CMD_VERSION:
@@ -2024,155 +2438,59 @@ QiscResult qisc_compile_file(const char *path, QiscOptions *options) {
 
   uint64_t current_ir_hash = ir_hash_module(cg.mod);
   bool link_succeeded = false;
+  {
+    char bin_path[PATH_MAX];
+    char llvm_profraw_path[PATH_MAX];
+    char llvm_profdata_path[PATH_MAX];
+    int link_ret;
 
-  /* Dump IR to stdout (only if not converging) */
-  if (!options->converge) {
-    printf("=== LLVM IR ===\n");
-    codegen_dump_ir(&cg);
-  }
-
-  /* Write object file */
-  char obj_path[512];
-  snprintf(obj_path, sizeof(obj_path), "%s.o", path);
-  if (codegen_write_object(&cg, obj_path) == 0) {
-    /* Link to binary */
-    char bin_path[512];
-    /* Strip .qisc extension */
-    strncpy(bin_path, path, sizeof(bin_path) - 1);
-    char *dot = strrchr(bin_path, '.');
-    if (dot)
-      *dot = '\0';
-
-    char link_cmd[2048];
-    char runtime_libs[1024] = "";
-    
-    /* Always link error handling runtime for try/catch/fail support */
-    char error_path[512];
-    snprintf(error_path, sizeof(error_path), "lib/qisc_error.o");
-    FILE *ef = fopen(error_path, "r");
-    if (!ef) {
-      snprintf(error_path, sizeof(error_path), 
-               "%s/../lib/qisc_error.o", 
-               "/home/Trushi/ai/QISC");
-    } else {
-      fclose(ef);
-    }
-    snprintf(runtime_libs, sizeof(runtime_libs), "%s", error_path);
-    
-    /* Always link array runtime for length tracking */
-    char array_path[512];
-    snprintf(array_path, sizeof(array_path), "lib/qisc_array.o");
-    FILE *af = fopen(array_path, "r");
-    if (!af) {
-      snprintf(array_path, sizeof(array_path), 
-               "%s/../lib/qisc_array.o", 
-               "/home/Trushi/ai/QISC");
-    } else {
-      fclose(af);
-    }
-    {
-      char temp[1024];
-      snprintf(temp, sizeof(temp), "%s %s", runtime_libs, array_path);
-      strncpy(runtime_libs, temp, sizeof(runtime_libs) - 1);
-    }
-
-    /* Always link I/O runtime for stdin/stdout helpers */
-    char io_path[512];
-    snprintf(io_path, sizeof(io_path), "lib/qisc_io.o");
-    FILE *iof = fopen(io_path, "r");
-    if (!iof) {
-      snprintf(io_path, sizeof(io_path), "%s/../lib/qisc_io.o",
-               "/home/Trushi/ai/QISC");
-    } else {
-      fclose(iof);
-    }
-    {
-      char temp[1024];
-      snprintf(temp, sizeof(temp), "%s %s", runtime_libs, io_path);
-      strncpy(runtime_libs, temp, sizeof(runtime_libs) - 1);
-    }
-
-    /* Always link stream runtime for explicit lazy streams */
-    char stream_path[512];
-    snprintf(stream_path, sizeof(stream_path), "lib/qisc_stream.o");
-    FILE *sf = fopen(stream_path, "r");
-    if (!sf) {
-      snprintf(stream_path, sizeof(stream_path), "%s/../lib/qisc_stream.o",
-               "/home/Trushi/ai/QISC");
-    } else {
-      fclose(sf);
-    }
-    {
-      char temp[1024];
-      snprintf(temp, sizeof(temp), "%s %s", runtime_libs, stream_path);
-      strncpy(runtime_libs, temp, sizeof(runtime_libs) - 1);
-    }
-    
-    /* If profiling is enabled, also link with the profiling runtime library */
-    if (options->collect_profile) {
-      /* Get path to runtime library relative to executable */
-      char runtime_path[512];
-      snprintf(runtime_path, sizeof(runtime_path), "lib/qisc_runtime.o");
-      
-      /* Check if runtime exists in ./lib/, if not try the source tree */
-      FILE *f = fopen(runtime_path, "r");
-      if (!f) {
-        /* Fall back to source tree path */
-        snprintf(runtime_path, sizeof(runtime_path), 
-                 "%s/../lib/qisc_runtime.o", 
-                 "/home/Trushi/ai/QISC");
-      } else {
-        fclose(f);
-      }
-      
-      char temp[1024];
-      snprintf(temp, sizeof(temp), "%s %s", runtime_libs, runtime_path);
-      strncpy(runtime_libs, temp, sizeof(runtime_libs) - 1);
-    }
-    
-    snprintf(link_cmd, sizeof(link_cmd), "cc %s %s -o %s -lm", 
-             obj_path, runtime_libs, bin_path);
-    
-    if (!options->converge) {
-      printf("Linking: %s\n", link_cmd);
-    }
-    
-    int ret = system(link_cmd);
-    if (ret == 0) {
-      link_succeeded = true;
+    qisc_llvm_profile_paths_from_source(path, llvm_profraw_path,
+                                        sizeof(llvm_profraw_path),
+                                        llvm_profdata_path,
+                                        sizeof(llvm_profdata_path), NULL, 0);
+    link_ret = qisc_emit_and_link_binary(&cg, path, options, bin_path,
+                                         sizeof(bin_path), options->converge,
+                                         &link_succeeded);
+    if (link_ret == 0 && link_succeeded) {
       clock_t end_time = clock();
       double elapsed = (double)(end_time - start_time) / CLOCKS_PER_SEC;
       double elapsed_ms = elapsed * 1000.0;
-      
+
       qisc_personality_print(options->personality,
                              "Binary written to: %s (%.2fs)\n", bin_path, elapsed);
-      
-      /* Track achievements */
+
       ensure_achievements_initialized();
       achievements_record_compilation(&g_achievements, true, elapsed_ms, 0, 0);
       achievements_check(&g_achievements, options->personality);
 
       if (options->collect_profile && options->converge) {
-        if (qisc_execute_binary(bin_path, runtime_profile_path, true) == 0) {
+        if (qisc_execute_binary(bin_path, runtime_profile_path,
+                                options->llvm_pgo_generate
+                                    ? llvm_profraw_path
+                                    : NULL,
+                                true) == 0) {
           qisc_merge_runtime_profile(&profile, runtime_profile_path);
           remove(runtime_profile_path);
+          if (options->llvm_pgo_generate) {
+            qisc_merge_llvm_profile(llvm_profraw_path, llvm_profdata_path, true);
+            remove(llvm_profraw_path);
+          }
         }
       }
-    } else {
+    } else if (!link_succeeded) {
       fprintf(stderr, "Linking failed\n");
     }
-    /* Remove object file */
-    remove(obj_path);
   }
 
   /* Save profile if --profile */
+  if (!link_succeeded) {
+    codegen_free(&cg);
+    ast_free(program);
+    profile_free(&profile);
+    return QISC_ERROR_INTERNAL;
+  }
+
   if (options->collect_profile) {
-    if (!link_succeeded) {
-      codegen_free(&cg);
-      ast_free(program);
-      profile_free(&profile);
-      return QISC_ERROR_INTERNAL;
-    }
     if (!profile.source_file) {
       profile.source_file = strdup(path);
     }
@@ -2286,137 +2604,53 @@ static QiscResult qisc_compile_file_with_hash(const char *path, QiscOptions *opt
     *ir_hash = ir_hash_module(cg.mod);
   }
 
-  /* Write object file */
-  char obj_path[512];
   bool link_succeeded = false;
-  snprintf(obj_path, sizeof(obj_path), "%s.o", path);
-  if (codegen_write_object(&cg, obj_path) == 0) {
-    /* Link to binary */
-    char bin_path[512];
-    /* Strip .qisc extension */
-    strncpy(bin_path, path, sizeof(bin_path) - 1);
-    char *dot = strrchr(bin_path, '.');
-    if (dot)
-      *dot = '\0';
+  {
+    char bin_path[PATH_MAX];
+    char llvm_profraw_path[PATH_MAX];
+    char llvm_profdata_path[PATH_MAX];
+    int link_ret;
 
-    char link_cmd[2048];
-    char runtime_libs[1024] = "";
-    
-    /* Always link error handling runtime for try/catch/fail support */
-    char error_path[512];
-    snprintf(error_path, sizeof(error_path), "lib/qisc_error.o");
-    FILE *ef = fopen(error_path, "r");
-    if (!ef) {
-      snprintf(error_path, sizeof(error_path), 
-               "%s/../lib/qisc_error.o", 
-               "/home/Trushi/ai/QISC");
-    } else {
-      fclose(ef);
-    }
-    snprintf(runtime_libs, sizeof(runtime_libs), "%s", error_path);
-    
-    /* Always link array runtime for length tracking */
-    char array_path[512];
-    snprintf(array_path, sizeof(array_path), "lib/qisc_array.o");
-    FILE *af = fopen(array_path, "r");
-    if (!af) {
-      snprintf(array_path, sizeof(array_path), 
-               "%s/../lib/qisc_array.o", 
-               "/home/Trushi/ai/QISC");
-    } else {
-      fclose(af);
-    }
-    {
-      char temp[1024];
-      snprintf(temp, sizeof(temp), "%s %s", runtime_libs, array_path);
-      strncpy(runtime_libs, temp, sizeof(runtime_libs) - 1);
-    }
-
-    /* Always link I/O runtime for stdin/stdout helpers */
-    char io_path[512];
-    snprintf(io_path, sizeof(io_path), "lib/qisc_io.o");
-    FILE *iof = fopen(io_path, "r");
-    if (!iof) {
-      snprintf(io_path, sizeof(io_path), "%s/../lib/qisc_io.o",
-               "/home/Trushi/ai/QISC");
-    } else {
-      fclose(iof);
-    }
-    {
-      char temp[1024];
-      snprintf(temp, sizeof(temp), "%s %s", runtime_libs, io_path);
-      strncpy(runtime_libs, temp, sizeof(runtime_libs) - 1);
-    }
-
-    /* Always link stream runtime for explicit lazy streams */
-    char stream_path[512];
-    snprintf(stream_path, sizeof(stream_path), "lib/qisc_stream.o");
-    FILE *sf = fopen(stream_path, "r");
-    if (!sf) {
-      snprintf(stream_path, sizeof(stream_path), "%s/../lib/qisc_stream.o",
-               "/home/Trushi/ai/QISC");
-    } else {
-      fclose(sf);
-    }
-    {
-      char temp[1024];
-      snprintf(temp, sizeof(temp), "%s %s", runtime_libs, stream_path);
-      strncpy(runtime_libs, temp, sizeof(runtime_libs) - 1);
-    }
-    
-    /* If profiling is enabled, also link with the profiling runtime library */
-    if (options->collect_profile) {
-      /* Get path to runtime library relative to executable */
-      char runtime_path[512];
-      snprintf(runtime_path, sizeof(runtime_path), "lib/qisc_runtime.o");
-      
-      /* Check if runtime exists in ./lib/, if not try the source tree */
-      FILE *f = fopen(runtime_path, "r");
-      if (!f) {
-        /* Fall back to source tree path */
-        snprintf(runtime_path, sizeof(runtime_path), 
-                 "%s/../lib/qisc_runtime.o", 
-                 "/home/Trushi/ai/QISC");
-      } else {
-        fclose(f);
-      }
-      
-      char temp[1024];
-      snprintf(temp, sizeof(temp), "%s %s", runtime_libs, runtime_path);
-      strncpy(runtime_libs, temp, sizeof(runtime_libs) - 1);
-    }
-    
-    snprintf(link_cmd, sizeof(link_cmd), "cc %s %s -o %s -lm 2>/dev/null", 
-             obj_path, runtime_libs, bin_path);
-    
-    int ret = system(link_cmd);
-    if (ret == 0) {
-      link_succeeded = true;
+    qisc_llvm_profile_paths_from_source(path, llvm_profraw_path,
+                                        sizeof(llvm_profraw_path),
+                                        llvm_profdata_path,
+                                        sizeof(llvm_profdata_path), NULL, 0);
+    link_ret = qisc_emit_and_link_binary(&cg, path, options, bin_path,
+                                         sizeof(bin_path), true,
+                                         &link_succeeded);
+    if (link_ret == 0 && link_succeeded) {
       clock_t end_time = clock();
       double elapsed = (double)(end_time - start_time) / CLOCKS_PER_SEC;
-      
+
       qisc_personality_print(options->personality,
                              "  → Binary: %s (%.2fs)\n", bin_path, elapsed);
 
       if (options->collect_profile && options->converge) {
-        if (qisc_execute_binary(bin_path, runtime_profile_path, true) == 0) {
+        if (qisc_execute_binary(bin_path, runtime_profile_path,
+                                options->llvm_pgo_generate
+                                    ? llvm_profraw_path
+                                    : NULL,
+                                true) == 0) {
           qisc_merge_runtime_profile(&profile, runtime_profile_path);
           remove(runtime_profile_path);
+          if (options->llvm_pgo_generate) {
+            qisc_merge_llvm_profile(llvm_profraw_path, llvm_profdata_path, true);
+            remove(llvm_profraw_path);
+          }
         }
       }
     }
-    /* Remove object file */
-    remove(obj_path);
   }
 
   /* Save profile if --profile */
+  if (!link_succeeded) {
+    codegen_free(&cg);
+    ast_free(program);
+    profile_free(&profile);
+    return QISC_ERROR_INTERNAL;
+  }
+
   if (options->collect_profile) {
-    if (!link_succeeded) {
-      codegen_free(&cg);
-      ast_free(program);
-      profile_free(&profile);
-      return QISC_ERROR_INTERNAL;
-    }
     if (!profile.source_file) {
       profile.source_file = strdup(path);
     }
@@ -2439,7 +2673,8 @@ static QiscResult qisc_compile_file_with_hash(const char *path, QiscOptions *opt
 
 /* Run a file - compile and execute */
 int qisc_run_file(const char *path, QiscOptions *options) {
-  if (options->collect_profile || options->use_profile || options->converge) {
+  if (options->collect_profile || options->use_profile || options->converge ||
+      qisc_should_use_clang_ir_backend(options)) {
     QiscResult result = qisc_compile_file(path, options);
     if (result != QISC_OK) {
       return 1;
@@ -2448,14 +2683,23 @@ int qisc_run_file(const char *path, QiscOptions *options) {
     char bin_path[512];
     char profile_path[512];
     char runtime_profile_path[576];
+    char llvm_profraw_path[PATH_MAX];
+    char llvm_profdata_path[PATH_MAX];
     qisc_binary_path_from_source(path, bin_path, sizeof(bin_path));
     qisc_profile_paths_from_source(path, profile_path, sizeof(profile_path),
                                    runtime_profile_path,
                                    sizeof(runtime_profile_path));
+    qisc_llvm_profile_paths_from_source(path, llvm_profraw_path,
+                                        sizeof(llvm_profraw_path),
+                                        llvm_profdata_path,
+                                        sizeof(llvm_profdata_path), NULL, 0);
 
     int ret = qisc_execute_binary(bin_path,
                                   options->collect_profile
                                       ? runtime_profile_path
+                                      : NULL,
+                                  options->llvm_pgo_generate
+                                      ? llvm_profraw_path
                                       : NULL,
                                   false);
     if (ret != 0) {
@@ -2480,6 +2724,17 @@ int qisc_run_file(const char *path, QiscOptions *options) {
 
       profile_free(&profile);
       remove(runtime_profile_path);
+    }
+
+    if (options->llvm_pgo_generate) {
+      const char *profdata_path = options->llvm_profile_path
+                                      ? options->llvm_profile_path
+                                      : llvm_profdata_path;
+      if (qisc_merge_llvm_profile(llvm_profraw_path, profdata_path, false) == 0) {
+        qisc_personality_print(options->personality,
+                               "LLVM profdata saved to %s\n", profdata_path);
+      }
+      remove(llvm_profraw_path);
     }
 
     return 0;

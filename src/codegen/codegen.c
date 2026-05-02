@@ -11,8 +11,10 @@
 #include "qisc.h"
 #include <llvm-c/Analysis.h>
 #include <llvm-c/Core.h>
+#include <llvm-c/Error.h>
 #include <llvm-c/Target.h>
 #include <llvm-c/TargetMachine.h>
+#include <llvm-c/Transforms/PassBuilder.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2039,6 +2041,85 @@ static LLVMCodeGenOptLevel cg_get_context_opt_level(Codegen *cg) {
     default:
       return LLVMCodeGenLevelDefault;
   }
+}
+
+static const char *cg_get_pass_pipeline(Codegen *cg) {
+  switch (cg->pragma_opts.context) {
+    case CG_CONTEXT_SERVER:
+      return "default<O3>";
+    case CG_CONTEXT_EMBEDDED:
+      return "default<Oz>";
+    case CG_CONTEXT_NOTEBOOK:
+      return "default<O1>";
+    case CG_CONTEXT_WEB:
+      return "default<Os>";
+    case CG_CONTEXT_CLI:
+    default:
+      return "default<O2>";
+  }
+}
+
+static int cg_run_optimization_pipeline(Codegen *cg, LLVMTargetMachineRef machine) {
+  LLVMPassBuilderOptionsRef opts;
+  LLVMErrorRef err;
+  char *err_msg;
+  const char *pipeline;
+  int inliner_threshold;
+
+  if (!cg || !machine) return 1;
+
+  pipeline = cg_get_pass_pipeline(cg);
+  opts = LLVMCreatePassBuilderOptions();
+  if (!opts) {
+    cg_error(cg, "Failed to create LLVM pass builder options");
+    return 1;
+  }
+
+  LLVMPassBuilderOptionsSetVerifyEach(opts, false);
+  LLVMPassBuilderOptionsSetDebugLogging(opts, false);
+  LLVMPassBuilderOptionsSetMergeFunctions(
+      opts, cg->pragma_opts.context != CG_CONTEXT_NOTEBOOK);
+  LLVMPassBuilderOptionsSetLoopUnrolling(
+      opts, cg->pragma_opts.context != CG_CONTEXT_NOTEBOOK);
+  LLVMPassBuilderOptionsSetLoopInterleaving(
+      opts, cg->pragma_opts.context == CG_CONTEXT_SERVER ||
+                cg->pragma_opts.context == CG_CONTEXT_CLI);
+  LLVMPassBuilderOptionsSetLoopVectorization(
+      opts, cg->pragma_opts.context != CG_CONTEXT_EMBEDDED);
+  LLVMPassBuilderOptionsSetSLPVectorization(
+      opts, cg->pragma_opts.context != CG_CONTEXT_EMBEDDED);
+
+  switch (cg->pragma_opts.context) {
+    case CG_CONTEXT_SERVER:
+      inliner_threshold = 375;
+      break;
+    case CG_CONTEXT_NOTEBOOK:
+      inliner_threshold = 100;
+      break;
+    case CG_CONTEXT_EMBEDDED:
+    case CG_CONTEXT_WEB:
+      inliner_threshold = 50;
+      break;
+    case CG_CONTEXT_CLI:
+    default:
+      inliner_threshold = 225;
+      break;
+  }
+  LLVMPassBuilderOptionsSetInlinerThreshold(opts, inliner_threshold);
+
+  err = LLVMRunPasses(cg->mod, pipeline, machine, opts);
+  LLVMDisposePassBuilderOptions(opts);
+  if (err != LLVMErrorSuccess) {
+    err_msg = LLVMGetErrorMessage(err);
+    cg_error(cg, "Failed to run LLVM optimization pipeline %s: %s",
+             pipeline, err_msg ? err_msg : "unknown error");
+    if (err_msg) {
+      LLVMDisposeErrorMessage(err_msg);
+    }
+    return 1;
+  }
+
+  return 0;
 }
 
 void codegen_set_syntax_mode(Codegen *cg, SyntaxProfile *profile) {
@@ -6432,36 +6513,52 @@ int codegen_write_object(Codegen *cg, const char *path) {
 
   /* Get context-specific optimization level */
   LLVMCodeGenOptLevel opt_level = cg_get_context_opt_level(cg);
-  
-  /* Get context-specific CPU features */
+
+  /* Native contexts should use the host CPU/feature set.
+   * Portable contexts intentionally stay on generic codegen. */
+  char *host_cpu = NULL;
+  char *host_features = NULL;
+  const char *cpu_name = "generic";
   const char *cpu_features = "";
   switch (cg->pragma_opts.context) {
     case CG_CONTEXT_SERVER:
-      /* Server: enable all available features for throughput */
-      cpu_features = "+sse4.2,+avx";
+    case CG_CONTEXT_CLI:
+    case CG_CONTEXT_NOTEBOOK:
+      host_cpu = LLVMGetHostCPUName();
+      host_features = LLVMGetHostCPUFeatures();
+      if (host_cpu && host_cpu[0] != '\0') {
+        cpu_name = host_cpu;
+      }
+      if (host_features && host_features[0] != '\0') {
+        cpu_features = host_features;
+      }
       break;
     case CG_CONTEXT_EMBEDDED:
-      /* Embedded: minimal features for portability */
-      cpu_features = "";
-      break;
     case CG_CONTEXT_WEB:
-      /* Web: WASM-compatible features */
+      cpu_name = "generic";
       cpu_features = "";
       break;
     default:
-      cpu_features = "";
       break;
   }
 
   LLVMTargetMachineRef machine = LLVMCreateTargetMachine(
-      target, triple, "generic", cpu_features, opt_level, LLVMRelocPIC,
+      target, triple, cpu_name, cpu_features, opt_level, LLVMRelocPIC,
       LLVMCodeModelDefault);
+  if (host_cpu) LLVMDisposeMessage(host_cpu);
+  if (host_features) LLVMDisposeMessage(host_features);
 
   LLVMTargetDataRef data_layout = LLVMCreateTargetDataLayout(machine);
   char *layout_str = LLVMCopyStringRepOfTargetData(data_layout);
   LLVMSetDataLayout(cg->mod, layout_str);
   LLVMDisposeMessage(layout_str);
   LLVMDisposeTargetData(data_layout);
+
+  if (cg_run_optimization_pipeline(cg, machine) != 0) {
+    LLVMDisposeTargetMachine(machine);
+    LLVMDisposeMessage(triple);
+    return 1;
+  }
 
   if (LLVMTargetMachineEmitToFile(machine, cg->mod, (char *)path,
                                   LLVMObjectFile, &error)) {
